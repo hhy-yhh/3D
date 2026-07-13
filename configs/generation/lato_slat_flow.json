@@ -52,8 +52,7 @@
                     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
                 ]
             },
-            "pretrained_slat_dec": null,
-            "_comment": "pretrained_slat_dec not needed for LATO pipeline; set to null"
+            "pretrained_slat_dec": null
         }
     },
     "trainer": {

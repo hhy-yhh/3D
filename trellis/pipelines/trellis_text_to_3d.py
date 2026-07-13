@@ -113,12 +113,32 @@ class TrellisTextTo3DPipeline(Pipeline):
         """
         Decode structured latent using LATO VoxelVAE.
         This is the LATO-enhanced decode path.
+
+        Converts TRELLIS SparseTensor → LATO SparseTensor before calling
+        LATO's VoxelVAE.decode(), since the two libraries use different
+        sparse tensor implementations.
         """
         ret = {}
         if 'lato_vae' in self.models:
+            # Convert TRELLIS SparseTensor → LATO SparseTensor
+            # (they are different classes from different packages)
+            try:
+                from lato.modules.sparse import SparseTensor as LATOSparseTensor
+            except ImportError:
+                # LATO not installed; try direct pass (may fail)
+                LATOSparseTensor = None
+
+            if LATOSparseTensor is not None:
+                lato_slat = LATOSparseTensor(
+                    feats=slat.feats.contiguous(),
+                    coords=slat.coords.contiguous(),
+                )
+            else:
+                lato_slat = slat
+
             # LATO decode: training=False for inference branch
             decoded = self.models['lato_vae'].decode(
-                slat,
+                lato_slat,
                 training=False,
                 inference_threshold=0.2
             )
