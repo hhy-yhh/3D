@@ -76,7 +76,12 @@ except Exception:
                 out_sq = out_sq.squeeze(0)
             while out_sq.dim() > src_sq.dim() and out_sq.shape[-1] == 1:
                 out_sq = out_sq.squeeze(-1)
-            if out_sq.dim() == src_sq.dim() and dim_norm != 0 and dim_norm < out_sq.dim():
+            # 如果 squeeze 后维度仍不匹配（非 singleton 维度），直接基于 src_sq 重建 out
+            if out_sq.dim() != src_sq.dim():
+                out_shape = list(src_sq.shape)
+                out_shape[0] = dim_size
+                out_sq = src_sq.new_zeros(out_shape)
+            elif dim_norm != 0 and dim_norm < out_sq.dim():
                 out_sq = out_sq.transpose(0, dim_norm)
         else:
             out_sq = None
@@ -127,12 +132,13 @@ except Exception:
             out_sq = out_sq.transpose(0, dim_norm)
 
         # ---- 6. 匹配原始 out 形状 ----
-        if out is not None and out_sq.shape != out.shape:
-            out_sq = out_sq.reshape(out.shape)
+        if out is not None:
+            if out_sq.shape != out.shape:
+                out_sq = out_sq.reshape(out.shape)
             out.copy_(out_sq)
             return out
-
-        return out_sq
+        else:
+            return out_sq
 
     _torch_scatter = types.ModuleType("torch_scatter")
     _torch_scatter.scatter_mean = _scatter_mean_native
@@ -343,18 +349,19 @@ def main():
             active_feats = voxel_encoder(pts_batched, coords_4d, res=opt.resolution)
 
             # 4d. VAE encode → 16-dim latent
-            # flash_attn 只支持 fp16/bf16，需要显式转换
-            vae = vae.half()
-            sparse_in = LATOSparseTensor(feats=active_feats.half(), coords=coords_4d)
+            sparse_in = LATOSparseTensor(feats=active_feats, coords=coords_4d)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 latent, _ = vae.encode(sparse_in, sample_posterior=False)
 
             # 4d. 保存
+            # 注意：autocast 下 latent.feats 是 fp16，需先转 float32 再 numpy()
+            latent_feats = latent.feats.float().cpu().numpy().astype(np.float16)
+            latent_coords = latent.coords.cpu().numpy().astype(np.int32)
             np.savez_compressed(
                 os.path.join(latent_dir, f"{key}.npz"),
-                coords=latent.coords.cpu().numpy().astype(np.int32),
-                feats=latent.feats.cpu().numpy().astype(np.float16),
+                coords=latent_coords,
+                feats=latent_feats,
             )
 
             metadata.at[idx, latent_col] = True
@@ -362,12 +369,19 @@ def main():
                 metadata.at[idx, "num_voxels"] = len(latent.coords)
             success += 1
 
+            # 定期清理 CUDA 缓存，防止碎片化
+            torch.cuda.empty_cache()
+
         except Exception as e:
             tqdm.write(f"[ERROR] {key}: {e}")
             traceback.print_exc()
             error += 1
 
-    # ── 5. 保存 metadata ──
+        # 每 10 个处理（成功或失败）增量保存一次 metadata
+        if (success + error) % 10 == 0:
+            metadata.to_csv(os.path.join(opt.output_dir, "metadata.csv"), index=False)
+
+    # ── 5. 最终保存 metadata ──
     metadata.to_csv(os.path.join(opt.output_dir, "metadata.csv"), index=False)
 
     print(f"\n{'='*60}")
