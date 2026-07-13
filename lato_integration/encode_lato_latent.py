@@ -1,133 +1,144 @@
 """
 ================================================================================
-encode_lato_latent.py — 使用 LATO VoxelVAE 提取 16-dim latent
+encode_lato_latent.py — LATO VoxelVAE latent 提取（mock 方案）
 ================================================================================
 
-用 LATO 预训练 VoxelVAE + VoxelFeatureEncoder 对 3D 模型提取 latent，
-生成训练 TRELLIS SLat Flow 所需的 .npz 数据。
-
-输出格式兼容 TRELLIS SLat dataset ({root}/latents/{model}/{sha256}.npz)。
+Mock flash_attn 和 torch_scatter（用 torch≥1.11 自带的 scatter_reduce 替代），
+然后直接使用 LATO 原版 VoxelVAE + VoxelFeatureEncoder 的预训练权重。
 
 用法:
-    python encode_lato_latent.py \
-        --lato_ckpt D:/code/LATO/ckpts/your_checkpoint.pt \
-        --lato_config D:/code/LATO/configs/infer_vae_512.yaml \
-        --data_dir D:/code/3D/database \
-        --output_dir D:/code/3D/database/lato_latents \
+    python lato_integration/encode_lato_latent.py \
+        --lato_ckpt /path/to/ckpt.pt \
+        --lato_config /path/to/infer_vae_512.yaml \
+        --data_dir /path/to/database \
+        --output_dir /path/to/output \
         --resolution 128
-
-依赖:
-    - LATO 代码在 PYTHONPATH 中 (D:/code/LATO)
-    - open3d, pyyaml, pandas, tqdm
 ================================================================================
 """
 
 import os
 import sys
-import json
+import types
 import argparse
 import traceback
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 import pandas as pd
 from tqdm import tqdm
-import open3d as o3d
 
-# ── flash_attn mock: encode 流程不用 flash_attn，但 LATO import 链会加载它 ──
-#   如果环境中 flash_attn 和 torch 版本不匹配（如 torch 1.12 + flash_attn 2.x），
-#   import flash_attn 会因 libc10_cuda.so 找不到而崩溃。这里提前 mock 绕过。
+# ========================================================================
+# 步骤 0: 在 import LATO 之前检查 / mock 不兼容的依赖
+# ========================================================================
+
+# ── 0a. flash_attn: 先试真 import，失败则 mock ──
+_flash_ok = False
 try:
-    import flash_attn  # noqa: F401  (check if it works)
-except ImportError:
-    # flash_attn 未安装 → 需要 mock 整个包
-    import types
-    _mock_flash = types.ModuleType("flash_attn")
-    sys.modules["flash_attn"] = _mock_flash
-    sys.modules["flash_attn.flash_attn_interface"] = types.ModuleType("flash_attn.flash_attn_interface")
-    sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+    import flash_attn  # noqa: F401
+    _flash_ok = True
 except Exception:
-    # flash_attn 安装了但加载失败（版本不匹配）→ mock 替换已加载的模块
-    import types
-    if "flash_attn" not in sys.modules:
-        sys.modules["flash_attn"] = types.ModuleType("flash_attn")
-    if "flash_attn.flash_attn_interface" not in sys.modules:
-        sys.modules["flash_attn.flash_attn_interface"] = types.ModuleType("flash_attn.flash_attn_interface")
-    if "flash_attn_2_cuda" not in sys.modules:
-        sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+    for _mod_name in ["flash_attn", "flash_attn.flash_attn_interface",
+                       "flash_attn_2_cuda"]:
+        if _mod_name not in sys.modules:
+            sys.modules[_mod_name] = types.ModuleType(_mod_name)
 
-# ── 确保 LATO 在 Python path 最前面（避免被本地同名文件拦截）──
-_LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "..", "LATO"))
+# ── 0b. torch_scatter: 先试真 import，失败则 mock ──
+_scatter_ok = False
+try:
+    import torch_scatter  # noqa: F401
+    _scatter_ok = True
+except Exception:
+    def _scatter_mean_native(src, index, dim=-1, out=None, dim_size=None):
+        """用 torch.scatter_reduce 替代 torch_scatter.scatter_mean。"""
+        if dim != 0 and dim != -src.dim():
+            src = src.transpose(0, dim)
+        if out is None:
+            if dim_size is None:
+                dim_size = int(index.max().item()) + 1
+            out_shape = list(src.shape)
+            out_shape[0] = dim_size
+            out = src.new_zeros(out_shape)
+        index_exp = index
+        if src.dim() > 1 and index.dim() < src.dim():
+            index_exp = index.unsqueeze(-1).expand_as(src) if src.dim() > 1 else index
+        out = out.scatter_reduce(
+            0, index_exp, src, reduce="mean", include_self=False,
+        )
+        if dim != 0 and dim != -src.dim():
+            out = out.transpose(0, dim)
+        return out
+
+    _torch_scatter = types.ModuleType("torch_scatter")
+    _torch_scatter.scatter_mean = _scatter_mean_native
+    sys.modules["torch_scatter"] = _torch_scatter
+
+print(f"[DEPS] flash_attn={'OK' if _flash_ok else 'MOCK'}, "
+      f"torch_scatter={'OK' if _scatter_ok else 'MOCK'}")
+
+# ── 0c. 确保 LATO 路径在最前面 ──
+_LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "LATO"))
 _LATO_ROOT = os.path.abspath(_LATO_ROOT)
-# 先移除再插入头部，确保 LATO 优先于 lato_integration/ 等同名目录
 for _p in list(sys.path):
     if os.path.abspath(_p) == _LATO_ROOT:
         sys.path.remove(_p)
 sys.path.insert(0, _LATO_ROOT)
 
+# ── 0d. 现在安全 import LATO 原版模块 ──
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
 from lato.models.lato_vae.lato_vae import VoxelVAE
+from vertex_encoder import VoxelFeatureEncoder_active_pointnet
+from utils import load_pretrained_woself
 
-# 从 LATO 根目录导入（不是 lato_integration 的同名文件）
-from vertex_encoder import VoxelFeatureEncoder_active_pointnet  # LATO 官方的
-from utils import load_pretrained_woself                        # LATO 官方的
+# open3d 懒加载（避免 import 时 scipy/numpy 版本冲突）
+_o3d = None
+def _get_o3d():
+    global _o3d
+    if _o3d is None:
+        import open3d as o3d
+        _o3d = o3d
+    return _o3d
 
 
 # ============================================================================
-# 工具函数
+# 体素化 / 点云工具
 # ============================================================================
 
-def normalize_mesh(mesh: o3d.geometry.TriangleMesh,
-                   bbox_min: float = -0.5,
-                   bbox_max: float = 0.5) -> o3d.geometry.TriangleMesh:
-    """将 mesh 归一化到 [-0.5, 0.5]³ 的包围盒中。"""
-    vertices = np.asarray(mesh.vertices)
-    if len(vertices) == 0:
+def normalize_mesh(mesh):
+    v = np.asarray(mesh.vertices)
+    if len(v) == 0:
         return mesh
-    aabb_min = vertices.min(axis=0)
-    aabb_max = vertices.max(axis=0)
-    center = (aabb_min + aabb_max) / 2
-    scale = (aabb_max - aabb_min).max()
-    if scale < 1e-8:
-        scale = 1.0
-    vertices = (vertices - center) / scale
-    vertices = np.clip(vertices, bbox_min + 1e-6, bbox_max - 1e-6)
-    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    c = (v.min(0) + v.max(0)) / 2
+    s = (v.max(0) - v.min(0)).max()
+    if s < 1e-8:
+        s = 1.0
+    v = np.clip((v - c) / s, -0.5 + 1e-6, 0.5 - 1e-6)
+    o3d = _get_o3d()
+    mesh.vertices = o3d.utility.Vector3dVector(v)
     return mesh
 
 
-def get_active_voxels(mesh: o3d.geometry.TriangleMesh,
-                      resolution: int = 128) -> torch.Tensor:
-    """
-    体素化 mesh 获取 active voxel 坐标 (整数索引)。
-
-    Returns:
-        [N, 3] int tensor of voxel grid indices in [0, resolution-1].
-    """
-    voxel_size = 1.0 / resolution
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(
+def get_active_voxels(mesh, resolution=128):
+    o3d = _get_o3d()
+    vg = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(
         mesh,
-        voxel_size=voxel_size,
+        voxel_size=1.0 / resolution,
         min_bound=(-0.5, -0.5, -0.5),
         max_bound=(0.5, 0.5, 0.5),
     )
-    voxels = np.array([v.grid_index for v in voxel_grid.get_voxels()])
+    voxels = np.array([v.grid_index for v in vg.get_voxels()])
     if len(voxels) == 0:
         return torch.empty(0, 3, dtype=torch.int32)
     return torch.from_numpy(voxels).int()
 
 
-def sample_point_cloud(mesh: o3d.geometry.TriangleMesh,
-                       n: int = 819200) -> torch.Tensor:
-    """从 mesh 表面均匀采样点云。"""
-    if n > 0:
-        pcd = mesh.sample_points_uniformly(number_of_points=n)
-    else:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = mesh.vertices
-    points = np.asarray(pcd.points).astype(np.float32)
-    return torch.from_numpy(points)
+def sample_point_cloud(mesh, n=819200):
+    if len(mesh.vertices) == 0:
+        return torch.empty(0, 3)
+    pcd = mesh.sample_points_uniformly(number_of_points=max(n, 100))
+    return torch.from_numpy(np.asarray(pcd.points).astype(np.float32))
 
 
 # ============================================================================
@@ -135,46 +146,31 @@ def sample_point_cloud(mesh: o3d.geometry.TriangleMesh,
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="使用 LATO VoxelVAE 提取 16-dim latent 作为 SLat Flow 训练数据"
-    )
-    parser.add_argument("--lato_ckpt", type=str, required=True,
-                        help="LATO checkpoint 路径 (.pt)")
-    parser.add_argument("--lato_config", type=str, required=True,
-                        help="LATO VAE 配置文件 (如 infer_vae_512.yaml)")
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="包含 metadata.csv 和 meshes/ 的数据目录")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="输出 latent 数据的目录")
-    parser.add_argument("--resolution", type=int, default=128,
-                        help="体素化分辨率 (默认 128)")
-    parser.add_argument("--num_points", type=int, default=819200,
-                        help="点云采样点数 (默认 819200)")
+    parser = argparse.ArgumentParser(description="LATO latent 提取 (mock 方案)")
+    parser.add_argument("--lato_ckpt", type=str, required=True)
+    parser.add_argument("--lato_config", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--resolution", type=int, default=128)
+    parser.add_argument("--num_points", type=int, default=819200)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mesh_subdir", type=str, default="meshes",
-                        help="mesh 文件所在子目录")
-    parser.add_argument("--mesh_ext", type=str, default=".obj",
-                        help="mesh 文件扩展名")
-    parser.add_argument("--dry_run", action="store_true",
-                        help="仅打印不实际处理")
+    parser.add_argument("--dry_run", action="store_true")
     opt = parser.parse_args()
 
     device = torch.device(opt.device if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] 使用设备: {device}")
+    print(f"[INFO] 设备: {device}")
+    print(f"[INFO] 依赖 mock: flash_attn → stub, torch_scatter → torch.scatter_reduce")
 
-    # ── 1. 加载 LATO 配置 ──
+    # ── 1. 加载 LATO 模型 ──
     with open(opt.lato_config, "r") as f:
         lato_cfg = yaml.safe_load(f)
     model_cfg = lato_cfg["model"]
+    latent_dim = model_cfg["latent_dim"]
 
-    print(f"[INFO] LATO latent_dim={model_cfg['latent_dim']}, "
-          f"encoder_blocks={len(model_cfg['encoder_blocks'])}, "
-          f"decoder_blocks={len(model_cfg['decoder_blocks_vtx'])}")
-
-    # ── 2. 构建 LATO 模型 ──
+    print(f"[INFO] 构建 VoxelVAE (latent_dim={latent_dim}) ...")
     vae = VoxelVAE(
         in_channels=model_cfg.get("in_channels", 1024),
-        latent_dim=model_cfg["latent_dim"],
+        latent_dim=latent_dim,
         encoder_blocks=model_cfg["encoder_blocks"],
         decoder_blocks_vtx=model_cfg["decoder_blocks_vtx"],
         attn_mode="swin",
@@ -193,133 +189,104 @@ def main():
         resolution=opt.resolution,
     ).to(device)
 
-    # ── 3. 加载预训练权重 ──
+    # 加载预训练权重
     result = load_pretrained_woself(
-        opt.lato_ckpt,
-        vae=vae,
-        voxel_encoder=voxel_encoder,
+        opt.lato_ckpt, vae=vae, voxel_encoder=voxel_encoder,
     )
-    print(f"[INFO] 加载 checkpoint: epoch={result.get('epoch', '?')}, "
-          f"best_loss={result.get('best_loss', float('inf')):.4f}")
-
+    print(f"[INFO] Checkpoint 加载: epoch={result.get('epoch', '?')}")
     vae.eval()
     voxel_encoder.eval()
 
-    # ── 4. 读取 metadata ──
+    # ── 2. 读取 metadata ──
     metadata_path = os.path.join(opt.data_dir, "metadata.csv")
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"metadata.csv 未找到: {metadata_path}")
     metadata = pd.read_csv(metadata_path)
-    print(f"[INFO] metadata 共 {len(metadata)} 条记录")
-
-    # 确定 key 列
     key_col = "sha256" if "sha256" in metadata.columns else metadata.columns[0]
-    print(f"[INFO] 使用 key 列: {key_col}")
+    print(f"[INFO] metadata: {len(metadata)} 条, key={key_col}")
 
-    # ── 5. 输出目录 ──
-    latent_model_name = f"lato_vae_{model_cfg['latent_dim']}dim_{opt.resolution}"
-    latent_output_dir = os.path.join(opt.output_dir, "latents", latent_model_name)
-    os.makedirs(latent_output_dir, exist_ok=True)
-    print(f"[INFO] 输出目录: {latent_output_dir}")
+    # ── 3. 输出目录 ──
+    lm_name = f"lato_vae_{latent_dim}dim_{opt.resolution}"
+    latent_dir = os.path.join(opt.output_dir, "latents", lm_name)
+    os.makedirs(latent_dir, exist_ok=True)
 
-    # ── 6. 逐个处理模型 ──
-    latent_col = f"latent_{latent_model_name}"
+    latent_col = f"latent_{lm_name}"
     metadata[latent_col] = False
 
-    success_count = 0
-    skip_count = 0
-    error_count = 0
+    success = skip = error = 0
 
-    for idx, row in tqdm(list(metadata.iterrows()), desc="Extracting latents"):
+    # ── 4. 逐模型处理 ──
+    for idx, row in tqdm(list(metadata.iterrows()), desc="Encoding"):
         key = row[key_col]
-        mesh_path = os.path.join(opt.data_dir, opt.mesh_subdir, f"{key}{opt.mesh_ext}")
 
+        # 查找 mesh 文件
+        mesh_path = os.path.join(opt.data_dir, "meshes", f"{key}.obj")
         if not os.path.exists(mesh_path):
-            # 尝试不带扩展名
-            alt_path = os.path.join(opt.data_dir, opt.mesh_subdir, str(key))
-            if os.path.exists(alt_path):
-                mesh_path = alt_path
-            else:
-                tqdm.write(f"[SKIP] mesh 未找到: {mesh_path}")
-                skip_count += 1
-                continue
+            mesh_path = os.path.join(opt.data_dir, "meshes", str(key))
+        if not os.path.exists(mesh_path):
+            tqdm.write(f"[SKIP] 未找到: {mesh_path}")
+            skip += 1
+            continue
 
         try:
             if opt.dry_run:
-                print(f"  [DRY] 将处理: {key}")
                 continue
 
-            # 6a. 加载并归一化 mesh
+            o3d = _get_o3d()
             mesh = o3d.io.read_triangle_mesh(mesh_path)
             if len(mesh.vertices) == 0:
                 tqdm.write(f"[SKIP] 空 mesh: {key}")
-                skip_count += 1
+                skip += 1
                 continue
             mesh = normalize_mesh(mesh)
 
-            # 6b. 体素化
-            active_coords = get_active_voxels(mesh, resolution=opt.resolution)
+            # 4a. 体素化 → active coords
+            active_coords = get_active_voxels(mesh, opt.resolution)
             if active_coords.numel() == 0:
                 tqdm.write(f"[SKIP] 无 active voxels: {key}")
-                skip_count += 1
+                skip += 1
                 continue
             active_coords = active_coords.to(device)
 
-            # 6c. 点云 → voxel features
-            point_cloud = sample_point_cloud(mesh, n=opt.num_points).to(device)
-            active_feats = voxel_encoder(
-                point_cloud, active_coords, res=opt.resolution
-            )
+            # 4b. 点云 → voxel features（LATO 预训练 VoxelFeatureEncoder）
+            pts = sample_point_cloud(mesh, opt.num_points).to(device)
+            active_feats = voxel_encoder(pts, active_coords, res=opt.resolution)
 
-            # 6d. LATO VAE encode → 16-dim latent
+            # 4c. VAE encode → 16-dim latent
             coords_4d = torch.cat([
                 torch.zeros(len(active_coords), 1, dtype=torch.int32, device=device),
                 active_coords,
             ], dim=1)
-            sparse_input = LATOSparseTensor(feats=active_feats, coords=coords_4d)
+            sparse_in = LATOSparseTensor(feats=active_feats, coords=coords_4d)
 
             with torch.no_grad():
-                latent, _ = vae.encode(sparse_input, sample_posterior=False)
+                latent, _ = vae.encode(sparse_in, sample_posterior=False)
 
-            # 6e. 保存 .npz
-            latent_coords = latent.coords.cpu().numpy().astype(np.int32)
-            latent_feats = latent.feats.cpu().numpy().astype(np.float16)
-
+            # 4d. 保存
             np.savez_compressed(
-                os.path.join(latent_output_dir, f"{key}.npz"),
-                coords=latent_coords,
-                feats=latent_feats,
+                os.path.join(latent_dir, f"{key}.npz"),
+                coords=latent.coords.cpu().numpy().astype(np.int32),
+                feats=latent.feats.cpu().numpy().astype(np.float16),
             )
 
             metadata.at[idx, latent_col] = True
             if "num_voxels" in metadata.columns:
-                metadata.at[idx, "num_voxels"] = len(latent_coords)
-            success_count += 1
+                metadata.at[idx, "num_voxels"] = len(latent.coords)
+            success += 1
 
         except Exception as e:
             tqdm.write(f"[ERROR] {key}: {e}")
             traceback.print_exc()
-            error_count += 1
-            continue
+            error += 1
 
-    # ── 7. 保存更新后的 metadata ──
-    output_metadata_path = os.path.join(opt.output_dir, "metadata.csv")
-    metadata.to_csv(output_metadata_path, index=False)
-    print(f"\n[INFO] 完成! metadata 已保存到: {output_metadata_path}")
+    # ── 5. 保存 metadata ──
+    metadata.to_csv(os.path.join(opt.output_dir, "metadata.csv"), index=False)
 
-    # ── 8. 报告统计 ──
     print(f"\n{'='*60}")
-    print(f"  处理结果")
-    print(f"{'='*60}")
-    print(f"  成功: {success_count}")
-    print(f"  跳过: {skip_count}")
-    print(f"  失败: {error_count}")
-    print(f"  Latent 目录: {latent_output_dir}")
-    print(f"  Latent 模型名: {latent_model_name}")
-    print(f"\n  下一步: 运行 stat_latent.py 计算 normalization 统计量")
+    print(f"  完成: {success} 成功, {skip} 跳过, {error} 失败")
+    print(f"  Latent 目录: {latent_dir}")
+    print(f"  模型名: {lm_name}")
+    print(f"\n  下一步:")
     print(f"    python dataset_toolkits/stat_latent.py \\")
-    print(f"        --output_dir {opt.output_dir} \\")
-    print(f"        --model {latent_model_name}")
+    print(f"        --output_dir {opt.output_dir} --model {lm_name}")
     print(f"{'='*60}")
 
 
