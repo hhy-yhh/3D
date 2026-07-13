@@ -343,7 +343,9 @@ def main():
             active_feats = voxel_encoder(pts_batched, coords_4d, res=opt.resolution)
 
             # 4d. VAE encode → 16-dim latent
-            sparse_in = LATOSparseTensor(feats=active_feats, coords=coords_4d)
+            # flash_attn 只支持 fp16/bf16，需要显式转换
+            vae = vae.half()
+            sparse_in = LATOSparseTensor(feats=active_feats.half(), coords=coords_4d)
 
             with torch.no_grad():
                 latent, _ = vae.encode(sparse_in, sample_posterior=False)
