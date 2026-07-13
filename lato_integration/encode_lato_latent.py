@@ -63,8 +63,10 @@ except Exception:
             out_shape[0] = dim_size
             out = src.new_zeros(out_shape)
         index_exp = index
-        if src.dim() > 1 and index.dim() < src.dim():
-            index_exp = index.unsqueeze(-1).expand_as(src) if src.dim() > 1 else index
+        if src.dim() > 1 and index_exp.shape != src.shape:
+            while index_exp.dim() < src.dim():
+                index_exp = index_exp.unsqueeze(-1)
+            index_exp = index_exp.expand_as(src)
         out = out.scatter_reduce(
             0, index_exp, src, reduce="mean", include_self=False,
         )
