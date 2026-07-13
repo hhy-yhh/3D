@@ -270,7 +270,7 @@ def main():
         pe_mode="ape",
         using_subdivide=True,
         using_attn=model_cfg.get("using_attn", False),
-    ).to(device)
+    )  # 先留在 CPU，encode 时临时移到 GPU（节省显存）
 
     voxel_encoder = VoxelFeatureEncoder_active_pointnet(
         in_channels=3,
@@ -348,11 +348,20 @@ def main():
             pts_batched = pts.unsqueeze(0)  # [P, 3] → [1, P, 3]
             active_feats = voxel_encoder(pts_batched, coords_4d, res=opt.resolution)
 
+            # 释放中间张量
+            del pts, pts_batched
+
             # 4d. VAE encode → 16-dim latent
+            # VAE 很大（~20 GiB @ fp32），只在 encode 时临时移到 GPU
+            vae.to(device)
             sparse_in = LATOSparseTensor(feats=active_feats, coords=coords_4d)
 
             with torch.no_grad(), torch.cuda.amp.autocast():
                 latent, _ = vae.encode(sparse_in, sample_posterior=False)
+
+            # VAE 移回 CPU，释放 GPU 显存给下一轮
+            vae.cpu()
+            torch.cuda.empty_cache()
 
             # 4d. 保存
             # 注意：autocast 下 latent.feats 是 fp16，需先转 float32 再 numpy()
@@ -376,6 +385,10 @@ def main():
             tqdm.write(f"[ERROR] {key}: {e}")
             traceback.print_exc()
             error += 1
+            # 出错时确保 VAE 回到 CPU，避免下轮 OOM
+            if next(vae.parameters()).device.type != 'cpu':
+                vae.cpu()
+            torch.cuda.empty_cache()
 
         # 每 10 个处理（成功或失败）增量保存一次 metadata
         if (success + error) % 10 == 0:
