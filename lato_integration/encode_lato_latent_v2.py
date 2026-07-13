@@ -27,7 +27,6 @@ import argparse
 import traceback
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 import pandas as pd
 from tqdm import tqdm
@@ -232,9 +231,10 @@ def main():
     print(f"[INFO] 构建模型 (官方架构: in=15, hidden=256, blocks=5, latent={latent_dim}) ...")
     vae, voxel_encoder = make_models(config, opt.lato_ckpt, device)
 
+    gpu_info = (f", GPU 已用: {torch.cuda.memory_allocated()/1024**3:.1f} GiB"
+                if is_cuda else "")
     print(f"[INFO] VAE 设备: {next(vae.parameters()).device}, "
-          f"voxel_encoder 设备: {next(voxel_encoder.parameters()).device}, "
-          f"GPU 已用: {torch.cuda.memory_allocated()/1024**3:.1f} GiB")
+          f"voxel_encoder 设备: {next(voxel_encoder.parameters()).device}{gpu_info}")
 
     # ── 2. 读取 metadata ──
     metadata_path = os.path.join(opt.data_dir, "metadata.csv")
@@ -322,13 +322,15 @@ def main():
                 feats=latent_feats,
             )
 
+            num_vox = len(latent_coords)
+
             # 清理 GPU
             del active_feats, sparse_in, latent, latent_feats, latent_coords, voxels, coords_4d
             torch.cuda.empty_cache()
 
             metadata.at[idx, latent_col] = True
             if "num_voxels" in metadata.columns:
-                metadata.at[idx, "num_voxels"] = len(latent_coords)
+                metadata.at[idx, "num_voxels"] = num_vox
             success += 1
 
         except Exception as e:
