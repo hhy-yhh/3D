@@ -142,6 +142,28 @@ def sample_point_cloud(mesh, n=819200):
 
 
 # ============================================================================
+# 查找 mesh 文件（支持多种扩展名）
+# ============================================================================
+
+def find_mesh_file(data_dir, key):
+    """查找 mesh 文件，支持 .obj, .ply, .stl 扩展名"""
+    base_path = os.path.join(data_dir, "meshes", key)
+
+    # 尝试带扩展名的
+    extensions = ['.obj', '.ply', '.stl']
+    for ext in extensions:
+        path = base_path + ext
+        if os.path.exists(path):
+            return path
+
+    # 尝试不带扩展名的
+    if os.path.exists(base_path):
+        return base_path
+
+    return None
+
+
+# ============================================================================
 # 主流程
 # ============================================================================
 
@@ -217,12 +239,10 @@ def main():
     for idx, row in tqdm(list(metadata.iterrows()), desc="Encoding"):
         key = row[key_col]
 
-        # 查找 mesh 文件
-        mesh_path = os.path.join(opt.data_dir, "meshes", f"{key}.obj")
-        if not os.path.exists(mesh_path):
-            mesh_path = os.path.join(opt.data_dir, "meshes", str(key))
-        if not os.path.exists(mesh_path):
-            tqdm.write(f"[SKIP] 未找到: {mesh_path}")
+        # 查找 mesh 文件（支持 .obj, .ply, .stl）
+        mesh_path = find_mesh_file(opt.data_dir, key)
+        if mesh_path is None:
+            tqdm.write(f"[SKIP] 未找到: {key} (尝试了 .obj, .ply, .stl)")
             skip += 1
             continue
 
@@ -246,15 +266,19 @@ def main():
                 continue
             active_coords = active_coords.to(device)
 
-            # 4b. 点云 → voxel features（LATO 预训练 VoxelFeatureEncoder）
-            pts = sample_point_cloud(mesh, opt.num_points).to(device)
-            active_feats = voxel_encoder(pts, active_coords, res=opt.resolution)
-
-            # 4c. VAE encode → 16-dim latent
+            # 4b. 构造带 batch 维度的 coords（LATO 需要 [N, 4] 格式）
             coords_4d = torch.cat([
                 torch.zeros(len(active_coords), 1, dtype=torch.int32, device=device),
                 active_coords,
             ], dim=1)
+
+            # 4c. 点云 → voxel features（LATO 预训练 VoxelFeatureEncoder）
+            #     voxel_encoder 期望: p=[B,Np,3], sparse_coords=[N,4]
+            pts = sample_point_cloud(mesh, opt.num_points).to(device)
+            pts_batched = pts.unsqueeze(0)  # [P, 3] → [1, P, 3]
+            active_feats = voxel_encoder(pts_batched, coords_4d, res=opt.resolution)
+
+            # 4d. VAE encode → 16-dim latent
             sparse_in = LATOSparseTensor(feats=active_feats, coords=coords_4d)
 
             with torch.no_grad():
