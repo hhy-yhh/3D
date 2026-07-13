@@ -54,6 +54,8 @@ except Exception:
         """用 torch.scatter_reduce 替代 torch_scatter.scatter_mean。"""
         if dim != 0 and dim != -src.dim():
             src = src.transpose(0, dim)
+            if out is not None:
+                out = out.transpose(0, dim)
         if out is None:
             if dim_size is None:
                 dim_size = int(index.max().item()) + 1
