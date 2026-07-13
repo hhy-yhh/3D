@@ -22,14 +22,105 @@ encode_lato_latent_v2.py — 基于 LATO 官方代码，批量提取 VoxelVAE la
 
 import os
 import sys
+import types
 import argparse
 import traceback
-
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 import pandas as pd
 from tqdm import tqdm
+
+# ========================================================================
+# Mock torch_scatter（其预编译 .so 与 PyTorch 2.4 不兼容）
+# 必须在 import LATO 之前执行
+# ========================================================================
+if "torch_scatter" not in sys.modules:
+    def _scatter_mean_native(src, index, dim=-1, out=None, dim_size=None):
+        """torch_scatter.scatter_mean 的纯 PyTorch 实现。"""
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+
+        # 1. 去除尾部/头部 singleton 维度
+        src_sq = src
+        while src_sq.dim() > 1 and src_sq.shape[-1] == 1:
+            src_sq = src_sq.squeeze(-1)
+        idx_sq = index
+        while idx_sq.dim() > 0 and idx_sq.shape[0] == 1:
+            idx_sq = idx_sq.squeeze(0)
+
+        dim_norm = dim if dim >= 0 else src_sq.dim() + dim
+
+        # 2. 把 scatter 维度移到 dim 0
+        if dim_norm != 0 and dim_norm < src_sq.dim():
+            src_sq = src_sq.transpose(0, dim_norm)
+        if out is not None:
+            out_sq = out
+            while out_sq.dim() > src_sq.dim() and out_sq.shape[0] == 1:
+                out_sq = out_sq.squeeze(0)
+            while out_sq.dim() > src_sq.dim() and out_sq.shape[-1] == 1:
+                out_sq = out_sq.squeeze(-1)
+            if out_sq.dim() != src_sq.dim():
+                out_shape = list(src_sq.shape)
+                out_shape[0] = dim_size
+                out_sq = src_sq.new_zeros(out_shape)
+            elif dim_norm != 0 and dim_norm < out_sq.dim():
+                out_sq = out_sq.transpose(0, dim_norm)
+        else:
+            out_sq = None
+
+        # 3. 对齐 index 到 src_sq
+        idx_exp = idx_sq
+        if idx_exp.dim() < src_sq.dim():
+            idx_exp = idx_exp.view(*idx_exp.shape,
+                                   *([1] * (src_sq.dim() - idx_exp.dim())))
+        if idx_exp.shape != src_sq.shape:
+            idx_nonsing = [d for d in range(idx_exp.dim())
+                           if idx_exp.shape[d] > 1]
+            for d_idx in idx_nonsing:
+                for d_src in range(src_sq.dim()):
+                    if d_src == d_idx:
+                        continue
+                    if src_sq.shape[d_src] == idx_exp.shape[d_idx]:
+                        perm = list(range(idx_exp.dim()))
+                        perm[d_idx], perm[d_src] = perm[d_src], perm[d_idx]
+                        idx_exp = idx_exp.permute(*perm)
+                        break
+            idx_exp = idx_exp.expand_as(src_sq)
+
+        # 4. scatter_reduce on dim 0
+        if out_sq is None:
+            out_shape = list(src_sq.shape)
+            out_shape[0] = dim_size
+            out_sq = src_sq.new_zeros(out_shape)
+
+        out_sq = out_sq.scatter_reduce(
+            0, idx_exp, src_sq, reduce="sum", include_self=False)
+        ones = torch.ones(1, device=src_sq.device, dtype=src_sq.dtype)
+        ones = ones.expand_as(src_sq)
+        count = src_sq.new_zeros(out_sq.shape)
+        count = count.scatter_reduce(
+            0, idx_exp, ones, reduce="sum", include_self=False)
+        count = count.clamp_min(1)
+        out_sq = out_sq / count
+
+        # 5. 恢复维度
+        if dim_norm != 0 and dim_norm < src_sq.dim():
+            out_sq = out_sq.transpose(0, dim_norm)
+
+        # 6. 写回 out
+        if out is not None:
+            if out_sq.shape != out.shape:
+                out_sq = out_sq.reshape(out.shape)
+            out.copy_(out_sq)
+            return out
+        else:
+            return out_sq
+
+    _torch_scatter = types.ModuleType("torch_scatter")
+    _torch_scatter.scatter_mean = _scatter_mean_native
+    sys.modules["torch_scatter"] = _torch_scatter
 
 # ── 确保 LATO 在 sys.path 最前面 ──
 _LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(
