@@ -57,16 +57,21 @@ except Exception:
     if "flash_attn_2_cuda" not in sys.modules:
         sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
 
-# ── 确保 LATO 在 Python path 中 ──
+# ── 确保 LATO 在 Python path 最前面（避免被本地同名文件拦截）──
 _LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "..", "LATO"))
 _LATO_ROOT = os.path.abspath(_LATO_ROOT)
-if _LATO_ROOT not in sys.path:
-    sys.path.insert(0, _LATO_ROOT)
+# 先移除再插入头部，确保 LATO 优先于 lato_integration/ 等同名目录
+for _p in list(sys.path):
+    if os.path.abspath(_p) == _LATO_ROOT:
+        sys.path.remove(_p)
+sys.path.insert(0, _LATO_ROOT)
 
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
 from lato.models.lato_vae.lato_vae import VoxelVAE
-from vertex_encoder import VoxelFeatureEncoder_active_pointnet
-from utils import load_pretrained_woself
+
+# 从 LATO 根目录导入（不是 lato_integration 的同名文件）
+from vertex_encoder import VoxelFeatureEncoder_active_pointnet  # LATO 官方的
+from utils import load_pretrained_woself                        # LATO 官方的
 
 
 # ============================================================================
