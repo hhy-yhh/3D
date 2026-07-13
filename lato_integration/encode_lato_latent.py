@@ -35,6 +35,28 @@ import pandas as pd
 from tqdm import tqdm
 import open3d as o3d
 
+# ── flash_attn mock: encode 流程不用 flash_attn，但 LATO import 链会加载它 ──
+#   如果环境中 flash_attn 和 torch 版本不匹配（如 torch 1.12 + flash_attn 2.x），
+#   import flash_attn 会因 libc10_cuda.so 找不到而崩溃。这里提前 mock 绕过。
+try:
+    import flash_attn  # noqa: F401  (check if it works)
+except ImportError:
+    # flash_attn 未安装 → 需要 mock 整个包
+    import types
+    _mock_flash = types.ModuleType("flash_attn")
+    sys.modules["flash_attn"] = _mock_flash
+    sys.modules["flash_attn.flash_attn_interface"] = types.ModuleType("flash_attn.flash_attn_interface")
+    sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+except Exception:
+    # flash_attn 安装了但加载失败（版本不匹配）→ mock 替换已加载的模块
+    import types
+    if "flash_attn" not in sys.modules:
+        sys.modules["flash_attn"] = types.ModuleType("flash_attn")
+    if "flash_attn.flash_attn_interface" not in sys.modules:
+        sys.modules["flash_attn.flash_attn_interface"] = types.ModuleType("flash_attn.flash_attn_interface")
+    if "flash_attn_2_cuda" not in sys.modules:
+        sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+
 # ── 确保 LATO 在 Python path 中 ──
 _LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "..", "LATO"))
 _LATO_ROOT = os.path.abspath(_LATO_ROOT)
