@@ -51,28 +51,88 @@ try:
     _scatter_ok = True
 except Exception:
     def _scatter_mean_native(src, index, dim=-1, out=None, dim_size=None):
-        """用 torch.scatter_reduce 替代 torch_scatter.scatter_mean。"""
-        if dim != 0 and dim != -src.dim():
-            src = src.transpose(0, dim)
-            if out is not None:
-                out = out.transpose(0, dim)
-        if out is None:
-            if dim_size is None:
-                dim_size = int(index.max().item()) + 1
-            out_shape = list(src.shape)
+        """用 scatter_add + 计数除法 替代 torch_scatter.scatter_mean。
+        避免 scatter_reduce 对 index/src 形状必须完全一致的严格限制。"""
+        if dim_size is None:
+            dim_size = int(index.max().item()) + 1
+
+        # ---- 1. 规范化形状：去掉 src 尾部和 index 头部的多余 singleton ----
+        src_sq = src
+        while src_sq.dim() > 1 and src_sq.shape[-1] == 1:
+            src_sq = src_sq.squeeze(-1)
+        idx_sq = index
+        while idx_sq.dim() > 0 and idx_sq.shape[0] == 1:
+            idx_sq = idx_sq.squeeze(0)
+
+        dim_norm = dim if dim >= 0 else src_sq.dim() + dim
+
+        # ---- 2. 把 scatter 维度移到 dim 0 ----
+        if dim_norm != 0 and dim_norm < src_sq.dim():
+            src_sq = src_sq.transpose(0, dim_norm)
+        if out is not None:
+            out_sq = out
+            # 去掉头部和尾部的 singleton dims，使其与 src_sq 维度对齐
+            while out_sq.dim() > src_sq.dim() and out_sq.shape[0] == 1:
+                out_sq = out_sq.squeeze(0)
+            while out_sq.dim() > src_sq.dim() and out_sq.shape[-1] == 1:
+                out_sq = out_sq.squeeze(-1)
+            if out_sq.dim() == src_sq.dim() and dim_norm != 0 and dim_norm < out_sq.dim():
+                out_sq = out_sq.transpose(0, dim_norm)
+        else:
+            out_sq = None
+
+        # ---- 3. 对齐 index 形状到 src_sq ----
+        # 在常见 LATO 场景中 idx_sq 是 [N]，src_sq 是 [N, C]
+        idx_exp = idx_sq
+        if idx_exp.dim() < src_sq.dim():
+            # 补齐尾部维度
+            idx_exp = idx_exp.view(*idx_exp.shape,
+                                   *([1] * (src_sq.dim() - idx_exp.dim())))
+        if idx_exp.shape != src_sq.shape:
+            # 对齐非 singleton 维度：index 的非 singleton 维度
+            # 必须与 src 对应维度位置一致
+            idx_nonsing = [d for d in range(idx_exp.dim())
+                           if idx_exp.shape[d] > 1]
+            for d_idx in idx_nonsing:
+                for d_src in range(src_sq.dim()):
+                    if d_src == d_idx:
+                        continue
+                    if src_sq.shape[d_src] == idx_exp.shape[d_idx]:
+                        # 交换 index 的维度使得其对齐 src
+                        perm = list(range(idx_exp.dim()))
+                        perm[d_idx], perm[d_src] = perm[d_src], perm[d_idx]
+                        idx_exp = idx_exp.permute(*perm)
+                        break
+            idx_exp = idx_exp.expand_as(src_sq)
+
+        # ---- 4. scatter_reduce on dim 0 (scatter_add + divide) ----
+        if out_sq is None:
+            out_shape = list(src_sq.shape)
             out_shape[0] = dim_size
-            out = src.new_zeros(out_shape)
-        index_exp = index
-        if src.dim() > 1 and index_exp.shape != src.shape:
-            while index_exp.dim() < src.dim():
-                index_exp = index_exp.unsqueeze(-1)
-            index_exp = index_exp.expand_as(src)
-        out = out.scatter_reduce(
-            0, index_exp, src, reduce="mean", include_self=False,
-        )
-        if dim != 0 and dim != -src.dim():
-            out = out.transpose(0, dim)
-        return out
+            out_sq = src_sq.new_zeros(out_shape)
+
+        # scatter_reduce 需要 index 和 src 形状完全一致
+        out_sq = out_sq.scatter_reduce(
+            0, idx_exp, src_sq, reduce="sum", include_self=False)
+        ones = torch.ones(1, device=src_sq.device, dtype=src_sq.dtype)
+        ones = ones.expand_as(src_sq)
+        count = src_sq.new_zeros(out_sq.shape)
+        count = count.scatter_reduce(
+            0, idx_exp, ones, reduce="sum", include_self=False)
+        count = count.clamp_min(1)
+        out_sq = out_sq / count
+
+        # ---- 5. 恢复维度顺序 ----
+        if dim_norm != 0 and dim_norm < src_sq.dim():
+            out_sq = out_sq.transpose(0, dim_norm)
+
+        # ---- 6. 匹配原始 out 形状 ----
+        if out is not None and out_sq.shape != out.shape:
+            out_sq = out_sq.reshape(out.shape)
+            out.copy_(out_sq)
+            return out
+
+        return out_sq
 
     _torch_scatter = types.ModuleType("torch_scatter")
     _torch_scatter.scatter_mean = _scatter_mean_native
