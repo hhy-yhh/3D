@@ -286,8 +286,12 @@ def main():
         opt.lato_ckpt, vae=vae, voxel_encoder=voxel_encoder,
     )
     print(f"[INFO] Checkpoint 加载: epoch={result.get('epoch', '?')}")
+    # 强制 VAE 留在 CPU，encode 时才临时移 GPU
+    vae.cpu()
     vae.eval()
     voxel_encoder.eval()
+    print(f"[INFO] VAE 设备: {next(vae.parameters()).device}, "
+          f"显存占用: {torch.cuda.memory_allocated()/1024**3:.1f} GiB")
 
     # ── 2. 读取 metadata ──
     metadata_path = os.path.join(opt.data_dir, "metadata.csv")
@@ -378,7 +382,8 @@ def main():
                 metadata.at[idx, "num_voxels"] = len(latent.coords)
             success += 1
 
-            # 定期清理 CUDA 缓存，防止碎片化
+            # 显式释放 GPU 张量，防止累积
+            del active_feats, sparse_in, latent, latent_feats, latent_coords
             torch.cuda.empty_cache()
 
         except Exception as e:
