@@ -42,7 +42,7 @@ _TRELLIS_ROOT = os.environ.get(
 )
 _LATO_ROOT = os.environ.get(
     "LATO_ROOT",
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "LATO"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "LATO"),
 )
 _TRELLIS_ROOT = os.path.abspath(_TRELLIS_ROOT)
 _LATO_ROOT = os.path.abspath(_LATO_ROOT)
@@ -287,6 +287,12 @@ def main():
     ).to(device)
 
     slat_ckpt = torch.load(opt.slat_ckpt, map_location=device, weights_only=True)
+    # 兼容完整 checkpoint（含 model/state_dict 包装）和裸 state_dict
+    if isinstance(slat_ckpt, dict):
+        if 'state_dict' in slat_ckpt:
+            slat_ckpt = slat_ckpt['state_dict']
+        elif 'model' in slat_ckpt:
+            slat_ckpt = slat_ckpt['model']
     new_slat_flow.load_state_dict(slat_ckpt)
     new_slat_flow.eval()
     print(f"  SLat Flow: LATOSLatFlowModel (128-res, 16-dim)")

@@ -123,7 +123,7 @@ if "torch_scatter" not in sys.modules:
 
 # ── 确保 LATO 在 sys.path 最前面 ──
 _LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "LATO"))
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "LATO"))
 _LATO_ROOT = os.path.abspath(_LATO_ROOT)
 for _p in list(sys.path):
     if os.path.abspath(_p) == _LATO_ROOT:

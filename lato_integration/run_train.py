@@ -61,7 +61,14 @@ def resolve_model(name, args):
         cls = MODEL_REPLACEMENTS[name]
         print(f"[LATO] 使用增强模型: {cls.__name__} (替代 {name})")
         import inspect
-        valid_params = set(inspect.signature(cls.__init__).parameters.keys())
+        sig_params = inspect.signature(cls.__init__).parameters
+        has_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+        )
+        if has_kwargs:
+            # **kwargs 存在，全部参数透传，不过滤
+            return cls(**args).cuda()
+        valid_params = set(sig_params.keys())
         filtered_args = {k: v for k, v in args.items() if k in valid_params}
         skipped = set(args.keys()) - valid_params
         if skipped:

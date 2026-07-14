@@ -230,7 +230,7 @@ class TrellisTextTo3DPipeline(Pipeline):
         
         # 2. Upsample coords from 64 to 128 for LATO compatibility
         #    This is the key addition for LATO integration
-        coords = coords * 2
+        coords[:, 1:] = coords[:, 1:] * 2
         
         # 3. Generate SLAT using LATO-compatible flow model
         slat = self.sample_slat(cond, coords, slat_sampler_params)
