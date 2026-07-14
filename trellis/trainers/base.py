@@ -354,9 +354,9 @@ class Trainer:
             print('\nStarting training...')
             self.snapshot_dataset()
         if self.step == 0:
-            self.snapshot(suffix='init')
+            self.snapshot(suffix='init', batch_size=1, num_samples=4)
         else: # resume
-            self.snapshot(suffix=f'resume_step{self.step:07d}')
+            self.snapshot(suffix=f'resume_step{self.step:07d}', batch_size=1, num_samples=4)
 
         log = []
         time_last_print = 0.0
