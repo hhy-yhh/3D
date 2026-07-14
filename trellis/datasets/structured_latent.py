@@ -157,6 +157,10 @@ class SLat(SLatVisMixin, StandardDatasetBase):
     def get_instance(self, root, instance):
         data = np.load(os.path.join(root, 'latents', self.latent_model, f'{instance}.npz'))
         coords = torch.tensor(data['coords']).int()
+        # LATO latent coords 格式为 [N,4] (batch+xyz)，需要剥离 batch 列
+        # 使其与 TRELLIS 原版 [N,3] (xyz) 格式一致
+        if coords.shape[1] == 4:
+            coords = coords[:, 1:]
         feats = torch.tensor(data['feats']).float()
         if self.normalization is not None:
             feats = (feats - self.mean) / self.std
