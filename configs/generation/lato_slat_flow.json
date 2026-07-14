@@ -73,13 +73,6 @@
             ],
             "fp16_mode": "inflat_all",
             "fp16_scale_growth": 0.001,
-            "elastic": {
-                "name": "LinearMemoryController",
-                "args": {
-                    "target_ratio": 0.75,
-                    "max_mem_ratio_start": 0.5
-                }
-            },
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {
