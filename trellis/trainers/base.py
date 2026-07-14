@@ -354,9 +354,11 @@ class Trainer:
             print('\nStarting training...')
             self.snapshot_dataset()
         if self.step == 0:
-            self.snapshot(suffix='init', batch_size=1, num_samples=4)
+            # Skip init snapshot (random weights, not useful; avoids OOM/multi-GPU hang)
+            pass
         else: # resume
-            self.snapshot(suffix=f'resume_step{self.step:07d}', batch_size=1, num_samples=4)
+            # Skip resume snapshot to avoid OOM
+            pass
 
         log = []
         time_last_print = 0.0
