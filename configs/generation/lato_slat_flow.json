@@ -28,7 +28,7 @@
         "args": {
             "latent_model": "lato_vae_16dim_128",
             "min_aesthetic_score": 4.5,
-            "max_num_voxels": 12288,
+            "max_num_voxels": 16384,
             "normalization": {
                 "mean": [
                     -2.1687545776367188,
