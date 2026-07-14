@@ -38,7 +38,7 @@ import yaml
 # ── 设置路径 ──
 _TRELLIS_ROOT = os.environ.get(
     "TRELLIS_ROOT",
-    os.path.join(os.path.dirname(__file__), "..", "trellis"),
+    os.path.join(os.path.dirname(__file__), ".."),
 )
 _LATO_ROOT = os.environ.get(
     "LATO_ROOT",
@@ -360,6 +360,7 @@ def main():
 
     # 添加 LATO VAE
     pipeline.models["lato_vae"] = lato_vae
+    pipeline.lato_inference_threshold = opt.lato_threshold
 
     # 移除不需要的原版 decoder（节省显存）
     for key in ["slat_decoder_mesh", "slat_decoder_gs", "slat_decoder_rf"]:

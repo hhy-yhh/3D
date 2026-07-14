@@ -137,10 +137,11 @@ class TrellisTextTo3DPipeline(Pipeline):
                 lato_slat = slat
 
             # LATO decode: training=False for inference branch
+            threshold = getattr(self, 'lato_inference_threshold', 0.2)
             decoded = self.models['lato_vae'].decode(
                 lato_slat,
                 training=False,
-                inference_threshold=0.2
+                inference_threshold=threshold
             )
             ret['lato_decoded'] = decoded
         else:

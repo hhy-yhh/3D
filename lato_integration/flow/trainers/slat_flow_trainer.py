@@ -107,9 +107,16 @@ class EnhancedSLatFlowTrainer(SparseFlowMatchingTrainer):
 
         # ---- LATO 辅助损失 2: Latent 一致性损失 ----
         if self.lambda_latent_consistency > 0:
+            # 将 per-sample t [B] 扩展为 per-voxel t [N_total, 1]
+            # 使用 SparseTensor 的 layout 来对齐 batch → voxel 映射
+            t_voxel = torch.zeros(
+                pred.feats.shape[0], 1,
+                device=pred.device, dtype=pred.feats.dtype
+            )
+            for i, slc in enumerate(pred.layout):
+                t_voxel[slc] = t[i]
             # 从预测 velocity 恢复 x_0_pred
-            t_expanded = t.view(-1, 1).to(x_0.device)
-            x_0_pred_feats = x_t.feats - t_expanded * pred.feats
+            x_0_pred_feats = x_t.feats - t_voxel * pred.feats
 
             # MSE between predicted latent and VAE encoder output
             # 这迫使 flow 分布在 VAE posterior 附近 (类似 LATO 的 KL 约束)
