@@ -29,6 +29,9 @@ class SLatVisMixin:
     def _loading_slat_dec(self):
         if self.slat_dec is not None:
             return
+        if self.pretrained_slat_dec is None and self.slat_dec_path is None:
+            # 无可用的 SLat decoder（如 LATO 训练场景），跳过可视化
+            return
         if self.slat_dec_path is not None:
             cfg = json.load(open(os.path.join(self.slat_dec_path, 'config.json'), 'r'))
             decoder = getattr(models, cfg['models']['decoder']['name'])(**cfg['models']['decoder']['args'])
@@ -56,6 +59,10 @@ class SLatVisMixin:
 
     @torch.no_grad()
     def visualize_sample(self, x_0: Union[SparseTensor, dict]):
+        self._loading_slat_dec()
+        if self.slat_dec is None:
+            # LATO 训练等场景无可用的 SLat decoder，跳过可视化
+            return {}
         x_0 = x_0 if isinstance(x_0, SparseTensor) else x_0['x_0']
         reps = self.decode_latent(x_0.cuda())
         
