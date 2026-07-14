@@ -98,7 +98,7 @@ class EnhancedSLatFlowTrainer(SparseFlowMatchingTrainer):
         # ---- LATO 辅助损失 1: 辅助 VAE 解码损失 ----
         if (
             self.aux_decode_every > 0
-            and self.global_step % self.aux_decode_every == 0
+            and self.step % self.aux_decode_every == 0
         ):
             aux_loss = self._compute_aux_decode_loss(x_0, x_t, pred, t, **kwargs)
             if aux_loss is not None:
