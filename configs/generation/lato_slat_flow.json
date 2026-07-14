@@ -6,7 +6,7 @@
                 "resolution": 128,
                 "in_channels": 16,
                 "out_channels": 16,
-                "model_channels": 512,
+                "model_channels": 384,
                 "cond_channels": 768,
                 "num_blocks": 12,
                 "num_heads": 8,
@@ -27,7 +27,7 @@
         "args": {
             "latent_model": "lato_vae_16dim_128",
             "min_aesthetic_score": 4.5,
-            "max_num_voxels": 16384,
+            "max_num_voxels": 8192,
             "normalization": {
                 "mean": [
                     -2.1687545776367188,
@@ -59,8 +59,8 @@
         "name": "TextConditionedSparseFlowMatchingCFGTrainer",
         "args": {
             "max_steps": 1000000,
-            "batch_size_per_gpu": 2,
-            "batch_split": 2,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
