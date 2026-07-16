@@ -1,33 +1,35 @@
 """
 ================================================================================
-inference_lato.py — TRELLIS + LATO 文本转 3D 推理脚本
+inference_lato.py — TRELLIS + LATO 文本转 3D 推理脚本（v3：支持自定义 SS Flow）
 ================================================================================
 
 完整推理管线:
-  1. TRELLIS SS Flow + SS Decoder → occupancy coords (res 64)
-  2. coords × 2 → res 128
-  3. LATO SLat Flow (16-dim, 128-res) → structured latent
-  4. LATO VoxelVAE.decode() → vertex hierarchy
-  5. ConnectionHead → 边预测 → 三角面片化 → Mesh 导出
+  1. SS Flow（刹车卡钳训练）→ dense SS latent (16³×8)
+  2. SS Decoder（冻结）→ occupancy coords (res 64)
+  3. coords × 2 → res 128
+  4. SLat Flow（刹车卡钳训练, 16-dim, 128-res）→ structured latent
+  5. LATO VoxelVAE.decode() → vertex hierarchy
+  6. ConnectionHead → 边预测 → 三角面片化 → Mesh 导出
 
 用法:
     python lato_integration/inference_lato.py \
-        --trellis_pretrained microsoft/TRELLIS-text-base \
+        --ss_ckpt outputs/lato_ss_flow/ckpts/denoiser_step1000000.pt \
         --slat_ckpt outputs/lato_slat_flow/ckpts/denoiser_step1000000.pt \
-        --lato_ckpt D:/code/LATO/ckpts/your_checkpoint.pt \
-        --lato_config D:/code/LATO/configs/infer_vae_512.yaml \
-        --prompt "a brake caliper with 4 pistons" \
+        --lato_ckpt /path/to/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+        --lato_config /path/to/LATO/configs/infer_vae_512.yaml \
+        --prompt "A brake caliper fixing interaxis 94.31 inner pad 98.47 pistons_num 4" \
         --output output_mesh.obj
 
 依赖:
-    - TRELLIS (D:/code/TRELLIS_linux/3D/trellis)
-    - LATO (D:/code/LATO)
+    - TRELLIS (trellis)
+    - LATO (lato)
     - networkx, trimesh, open3d
 ================================================================================
 """
 
 import os
 import sys
+import json
 import argparse
 import traceback
 
@@ -54,6 +56,9 @@ for _p in [_TRELLIS_ROOT, _LATO_ROOT]:
 # ── TRELLIS imports ──
 from trellis.pipelines.trellis_text_to_3d import TrellisTextTo3DPipeline
 from trellis.models.lato_slat_flow import LATOSLatFlowModel
+
+# ── LATO integration imports ──
+from lato_integration.flow.ss_flow import EnhancedSSFlowModel
 
 # ── LATO imports ──
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
@@ -108,20 +113,16 @@ def predict_edges_batched(
     if N < 2:
         return []
 
-    # 使用 KNN 生成候选边（基于空间距离）
-    # 简化: 对每个顶点找最近邻，连接阈值内顶点对
     import open3d as o3d
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(vertex_coords.cpu().numpy())
 
-    # 构建 KDTree 查找邻居
     pcd_tree = o3d.geometry.KDTreeFlann(pcd)
 
     edges = []
     all_edge_candidates = set()
 
-    # 对每个顶点找 k 个最近邻
     k = min(32, N)
     for i in range(N):
         [_, idx, _] = pcd_tree.search_knn_vector_3d(
@@ -210,20 +211,33 @@ def edges_to_mesh(vertex_coords: np.ndarray, edges: list) -> "trimesh.Trimesh":
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TRELLIS + LATO 文本转 3D 推理"
+        description="TRELLIS + LATO 文本转 3D 推理（v3：自定义 SS + SLat Flow）"
     )
-    # 模型路径
-    parser.add_argument("--trellis_pretrained", type=str,
-                        default="microsoft/TRELLIS-text-base",
-                        help="TRELLIS 预训练 pipeline 路径")
+
+    # ── 🆕 SS Flow（刹车卡钳训练）──
+    parser.add_argument("--ss_ckpt", type=str, required=True,
+                        help="训练的 LATO SS Flow checkpoint 路径")
+    parser.add_argument("--ss_stats", type=str, default=None,
+                        help="SS normalization stats JSON（可选，SS Flow 默认 identity）")
+
+    # ── SLat Flow（刹车卡钳训练）──
     parser.add_argument("--slat_ckpt", type=str, required=True,
                         help="训练的 LATO SLat Flow checkpoint 路径")
+    parser.add_argument("--slat_stats", type=str, default=None,
+                        help="SLat normalization stats JSON（16-dim，由 stat_latent.py 生成）")
+
+    # ── LATO VAE（冻结预训练）──
     parser.add_argument("--lato_ckpt", type=str, required=True,
                         help="LATO checkpoint 路径 (.pt)")
     parser.add_argument("--lato_config", type=str, required=True,
                         help="LATO VAE 配置文件路径 (yaml)")
 
-    # 推理参数
+    # ── TRELLIS 预训练部件（SS Decoder + Samplers）──
+    parser.add_argument("--trellis_pretrained", type=str,
+                        default="microsoft/TRELLIS-text-base",
+                        help="TRELLIS 预训练 pipeline（用于 SS Decoder + sampler 配置）")
+
+    # ── 推理参数 ──
     parser.add_argument("--prompt", type=str, required=True,
                         help="文本描述")
     parser.add_argument("--output", type=str, default="output_mesh.obj",
@@ -236,19 +250,13 @@ def main():
     parser.add_argument("--cfg_strength", type=float, default=5.0,
                         help="CFG 强度")
 
-    # LATO 参数
+    # ── LATO decode 参数 ──
     parser.add_argument("--lato_threshold", type=float, default=0.2,
                         help="LATO VoxelVAE decode 的 inference_threshold")
     parser.add_argument("--edge_threshold", type=float, default=0.45,
                         help="ConnectionHead 边概率阈值")
 
-    # SLat 归一化统计量（16-dim LATO latent 的 mean/std）
-    parser.add_argument("--slat_stats", type=str, default=None,
-                        help="SLat normalization stats JSON 文件路径 "
-                             "(16-dim, 由 stat_latent.py 生成). "
-                             "如果不指定，使用零均值/单位方差。")
-
-    # 设备 & 精度
+    # ── 设备 & 精度 ──
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use_fp16", action="store_true", default=True,
                         help="使用 FP16 推理")
@@ -258,25 +266,56 @@ def main():
     print(f"[INFO] 设备: {device}")
 
     # ================================================================
-    # 1. 加载 TRELLIS SS 管线（预训练权重）
+    # 1. 加载 TRELLIS SS 管线（SS Decoder + Samplers，预训练权重）
     # ================================================================
-    print("[1/5] 加载 TRELLIS SS pipeline ...")
+    print("[1/6] 加载 TRELLIS 管线骨架（SS Decoder + Samplers）...")
     pipeline = TrellisTextTo3DPipeline.from_pretrained(opt.trellis_pretrained)
-    print(f"  SS Flow: {type(pipeline.models['sparse_structure_flow_model']).__name__}")
-    print(f"  SS Decoder: {type(pipeline.models['sparse_structure_decoder']).__name__}")
+    print(f"  SS Decoder: {type(pipeline.models['sparse_structure_decoder']).__name__} (冻结)")
 
     # ================================================================
-    # 2. 加载训练的 LATO SLat Flow
+    # 2. 🆕 加载训练的 SS Flow（刹车卡钳）
     # ================================================================
-    print("[2/5] 加载 LATO SLat Flow ...")
+    print("[2/6] 加载训练的 SS Flow（刹车卡钳）...")
+    ss_flow = EnhancedSSFlowModel(
+        resolution=16,
+        in_channels=8,
+        out_channels=8,
+        model_channels=512,
+        cond_channels=768,
+        num_blocks=24,
+        num_heads=16,
+        mlp_ratio=4,
+        patch_size=1,
+        pe_mode="ape",
+        qk_rms_norm=True,
+        use_fp16=opt.use_fp16,
+    ).to(device)
+
+    ss_ckpt = torch.load(opt.ss_ckpt, map_location=device, weights_only=True)
+    if isinstance(ss_ckpt, dict):
+        if 'state_dict' in ss_ckpt:
+            ss_ckpt = ss_ckpt['state_dict']
+        elif 'model' in ss_ckpt:
+            ss_ckpt = ss_ckpt['model']
+    ss_flow.load_state_dict(ss_ckpt)
+    ss_flow.eval()
+    print(f"  SS Flow: EnhancedSSFlowModel (512ch, 24 blocks, 16 heads)")
+
+    # 替换管线中的 SS Flow
+    pipeline.models["sparse_structure_flow_model"] = ss_flow
+
+    # ================================================================
+    # 3. 加载训练的 SLat Flow（刹车卡钳）
+    # ================================================================
+    print("[3/6] 加载训练的 SLat Flow（刹车卡钳）...")
     new_slat_flow = LATOSLatFlowModel(
         resolution=128,
         in_channels=16,
         out_channels=16,
-        model_channels=768,
+        model_channels=384,
         cond_channels=768,
         num_blocks=12,
-        num_heads=12,
+        num_heads=8,
         mlp_ratio=4,
         patch_size=2,
         num_io_res_blocks=2,
@@ -287,7 +326,6 @@ def main():
     ).to(device)
 
     slat_ckpt = torch.load(opt.slat_ckpt, map_location=device, weights_only=True)
-    # 兼容完整 checkpoint（含 model/state_dict 包装）和裸 state_dict
     if isinstance(slat_ckpt, dict):
         if 'state_dict' in slat_ckpt:
             slat_ckpt = slat_ckpt['state_dict']
@@ -295,12 +333,14 @@ def main():
             slat_ckpt = slat_ckpt['model']
     new_slat_flow.load_state_dict(slat_ckpt)
     new_slat_flow.eval()
-    print(f"  SLat Flow: LATOSLatFlowModel (128-res, 16-dim)")
+    print(f"  SLat Flow: LATOSLatFlowModel (384ch, 128-res, 16-dim)")
+
+    pipeline.models["slat_flow_model"] = new_slat_flow
 
     # ================================================================
-    # 3. 加载 LATO VoxelVAE + ConnectionHead（预训练权重）
+    # 4. 加载 LATO VoxelVAE + ConnectionHead（冻结预训练）
     # ================================================================
-    print("[3/5] 加载 LATO VoxelVAE ...")
+    print("[4/6] 加载 LATO VoxelVAE ...")
     with open(opt.lato_config, "r") as f:
         lato_cfg = yaml.safe_load(f)
     model_cfg = lato_cfg["model"]
@@ -334,35 +374,42 @@ def main():
     connection_head.eval()
 
     # ================================================================
-    # 4. 组装管线
+    # 5. 组装管线（normalization + LATO VAE）
     # ================================================================
-    print("[4/5] 组装管线 ...")
+    print("[5/6] 组装管线 ...")
 
-    # 替换 SLat Flow
-    pipeline.models["slat_flow_model"] = new_slat_flow
-
-    # 覆盖 slat_normalization 为 16-dim LATO 统计量
-    # （原版 TRELLIS 是 8-dim，与 LATO 16-dim 不兼容）
-    if opt.slat_stats is not None and os.path.exists(opt.slat_stats):
-        import json
-        with open(opt.slat_stats, "r") as f:
-            stats = json.load(f)
-        pipeline.slat_normalization = stats
-        print(f"  SLat normalization (16-dim): mean={len(stats['mean'])} values, "
-              f"std={len(stats['std'])} values")
+    # ── SS normalization（默认 identity）──
+    if opt.ss_stats is not None and os.path.exists(opt.ss_stats):
+        with open(opt.ss_stats, "r") as f:
+            ss_stats = json.load(f)
+        pipeline.ss_normalization = ss_stats
+        print(f"  SS normalization: mean={ss_stats['mean']}, std={ss_stats['std']}")
     else:
-        # 使用零均值/单位方差作为后备
+        pipeline.ss_normalization = {
+            "mean": [0.0] * 8,
+            "std": [1.0] * 8,
+        }
+        print("  SS normalization: identity (mean=0, std=1)")
+
+    # ── SLat normalization ──
+    if opt.slat_stats is not None and os.path.exists(opt.slat_stats):
+        with open(opt.slat_stats, "r") as f:
+            slat_stats = json.load(f)
+        pipeline.slat_normalization = slat_stats
+        print(f"  SLat normalization (16-dim): mean={len(slat_stats['mean'])} values, "
+              f"std={len(slat_stats['std'])} values")
+    else:
         pipeline.slat_normalization = {
             "mean": [0.0] * 16,
             "std": [1.0] * 16,
         }
-        print("  SLat normalization: using identity (mean=0, std=1)")
+        print("  SLat normalization: identity (mean=0, std=1)")
 
-    # 添加 LATO VAE
+    # ── LATO VAE ──
     pipeline.models["lato_vae"] = lato_vae
     pipeline.lato_inference_threshold = opt.lato_threshold
 
-    # 移除不需要的原版 decoder（节省显存）
+    # ── 移除不需要的原版 decoder（节省显存）──
     for key in ["slat_decoder_mesh", "slat_decoder_gs", "slat_decoder_rf"]:
         pipeline.models.pop(key, None)
 
@@ -370,9 +417,9 @@ def main():
     print("  管线已就绪")
 
     # ================================================================
-    # 5. 推理
+    # 6. 推理
     # ================================================================
-    print(f"[5/5] 推理: \"{opt.prompt}\" ...")
+    print(f"[6/6] 推理: \"{opt.prompt}\" ...")
     print(f"  seed={opt.seed}, ss_steps={opt.ss_steps}, "
           f"slat_steps={opt.slat_steps}, cfg={opt.cfg_strength}")
 
@@ -392,7 +439,7 @@ def main():
         )
 
     # ================================================================
-    # 6. 后处理：LATO decode → mesh
+    # 7. 后处理：LATO decode → mesh
     # ================================================================
     print("\n[后处理] 提取 mesh ...")
 
