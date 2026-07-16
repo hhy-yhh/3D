@@ -15,7 +15,7 @@
                 "pe_mode": "ape",
                 "qk_rms_norm": true,
                 "use_fp16": true,
-                "use_checkpoint": true
+                "use_checkpoint": false
             }
         }
     },
@@ -34,7 +34,7 @@
         "name": "TextConditionedFlowMatchingCFGTrainer",
         "args": {
             "max_steps": 1000000,
-            "batch_size_per_gpu": 2,
+            "batch_size_per_gpu": 4,
             "batch_split": 1,
             "optimizer": {
                 "name": "AdamW",
