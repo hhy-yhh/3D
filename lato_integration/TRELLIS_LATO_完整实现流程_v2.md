@@ -1,8 +1,9 @@
-# TRELLIS + LATO 文本转3D — 完整实现流程 v4
+# TRELLIS + LATO 文本转3D — 完整实现流程 v5
 
 > **目标：** TRELLIS 文本转3D 管线中，将 Sparse VAE Encoder/Decoder 替换为 LATO 的 VoxelVAE，**SS Flow 和 SLat Flow 均在刹车卡钳数据集上从零训练**，最后用 Chamfer Distance / Hausdorff Distance / Normal Consistency 评估。
 
 **更新记录：**
+- 2026-07-17：**v5 更新** — 推理脚本重构：从 config JSON 读取模型参数、自动发现最新 ckpt（`--ss_dir`/`--slat_dir`）、新增 `--mode ss_only` 快速验证、兼容多种 ckpt 格式
 - 2026-07-16：**v4 更新** — 新增步骤6（批量评估 + 3D 指标），推理脚本支持 `--ss_ckpt`
 - 2026-07-16：**v3 更新** — 新增 SS Flow 训练步骤，训练模型数从 1 个变为 2 个
 - 2026-07-14（下午）：修复 4 个训练启动 bug，验证单卡 RTX 4090 24GB 可运行
@@ -213,12 +214,23 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ---
 
-## 步骤5：单条推理验证
+## 步骤5：单条推理验证（v5）
+
+### 5a. 完整推理（SS + SLat + LATO → mesh）
 
 ```bash
+# 方式一：自动发现最新 checkpoint（推荐）
 python lato_integration/inference_lato.py \
-    --ss_ckpt outputs/lato_ss_flow/ckpts/denoiser_step1000000.pt \
-    --slat_ckpt outputs/lato_slat_flow/ckpts/denoiser_step1000000.pt \
+    --ss_dir outputs/lato_ss_flow \
+    --slat_dir outputs/lato_slat_flow \
+    --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents/latents/lato_vae_16dim_128/stats.json \
+    --prompt "A brake caliper fixing interaxis 94.31 inner pad 98.47 pistons_num 4" \
+    --seed 42 --output output_caliper.obj
+
+# 方式二：指定具体 checkpoint（测试中间效果）
+python lato_integration/inference_lato.py \
+    --ss_ckpt outputs/lato_ss_flow/ckpts/denoiser_step0500000.pt \
+    --slat_ckpt outputs/lato_slat_flow/ckpts/denoiser_step0200000.pt \
     --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents/latents/lato_vae_16dim_128/stats.json \
@@ -226,22 +238,68 @@ python lato_integration/inference_lato.py \
     --seed 42 --output output_caliper.obj
 ```
 
-**参数说明：**
+> **注意：** `--lato_ckpt` 和 `--lato_config` 有自动默认值（基于 `LATO_ROOT` 环境变量），如果路径与默认一致可省略。
+
+### 5b. SS-only 模式（快速验证 SS Flow，不跑 SLat/LATO）
+
+训练中即可使用，不需要 SLat Flow 训练完成：
+
+```bash
+# 自动找最新 ckpt
+python lato_integration/inference_lato.py \
+    --mode ss_only \
+    --ss_dir outputs/lato_ss_flow \
+    --prompt "A brake caliper"
+
+# 指定中间步数对比收敛效果
+python lato_integration/inference_lato.py \
+    --mode ss_only \
+    --ss_ckpt outputs/lato_ss_flow/ckpts/denoiser_step0100000.pt \
+    --prompt "A brake caliper"
+```
+
+SS-only 输出：active voxels 数量 + bbox 范围（判断 SS Flow 生成的稀疏结构是否合理）。
+
+### 5c. 常用调参
+
+```bash
+# 边太少（mesh 有洞）→ 降低边阈值
+--edge_threshold 0.3
+
+# 边太多（噪声面过多）→ 提高边阈值
+--edge_threshold 0.5
+
+# VoxelVAE decode 保留更多/更少顶点
+--lato_threshold 0.1   # 更多顶点
+--lato_threshold 0.3   # 更少顶点
+```
+
+**全部参数说明：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--ss_ckpt` | **必填** | 训练的 SS Flow checkpoint |
-| `--slat_ckpt` | **必填** | 训练的 SLat Flow checkpoint |
-| `--lato_ckpt` | **必填** | LATO VAE checkpoint |
-| `--lato_config` | **必填** | LATO VAE yaml |
-| `--ss_stats` | 空（identity） | SS normalization |
-| `--slat_stats` | 空（identity） | SLat normalization |
-| `--prompt` | **必填** | 文本描述 |
+| `--mode` | `full` | `full`=完整管线, `ss_only`=仅 SS Flow |
+| `--ss_dir` | 无 | SS Flow 训练输出目录，自动发现 `ckpts/` 下最新 |
+| `--ss_ckpt` | 无 | 指定 SS Flow checkpoint 路径（优先于 `--ss_dir`） |
+| `--slat_dir` | 无 | SLat Flow 训练输出目录，自动发现最新 |
+| `--slat_ckpt` | 无 | 指定 SLat Flow checkpoint 路径（优先于 `--slat_dir`） |
+| `--ss_config` | `configs/generation/lato_ss_flow.json` | SS Flow 训练 config（读取模型参数） |
+| `--slat_config` | `configs/generation/lato_slat_flow.json` | SLat Flow 训练 config（读取模型参数） |
+| `--lato_ckpt` | `$LATO_ROOT/checkpoints/128to512/vae/vae_128to512.pt` | LATO VAE checkpoint |
+| `--lato_config` | `$LATO_ROOT/configs/infer_vae_512.yaml` | LATO VAE yaml |
+| `--trellis_pretrained` | `microsoft/TRELLIS-text-base` | TRELLIS 预训练管线 |
+| `--ss_stats` | identity | SS normalization stats JSON |
+| `--slat_stats` | identity | SLat normalization stats JSON（16-dim） |
+| `--prompt` | 刹车卡钳示例 | 文本描述 |
+| `--output` | `output_mesh.obj` | 输出 mesh 路径 |
+| `--seed` | 42 | 随机种子 |
 | `--ss_steps` | 20 | SS Flow 采样步数 |
 | `--slat_steps` | 20 | SLat Flow 采样步数 |
 | `--cfg_strength` | 5.0 | CFG 强度 |
-| `--lato_threshold` | 0.2 | VoxelVAE decode 阈值 |
-| `--edge_threshold` | 0.45 | ConnectionHead 边阈值 |
+| `--lato_threshold` | 0.2 | VoxelVAE decode inference_threshold |
+| `--edge_threshold` | 0.45 | ConnectionHead 边概率阈值 |
+| `--k_neighbors` | 32 | KDTree 最近邻数（影响候选边数量） |
+| `--no_fp16` | false | 禁用 FP16（调试用） |
 
 ---
 
@@ -303,13 +361,13 @@ python lato_integration/evaluate_3d_metrics.py \
 | `lato_integration/flow/trainers/ss_flow_trainer.py` | SS Flow 训练器 | ✅ |
 | `lato_integration/flow/trainers/slat_flow_trainer.py` | SLat Flow 训练器 | ✅ |
 | `lato_integration/encode_lato_latent_v2.py` | LATO latent 提取 | ✅ |
-| `lato_integration/inference_lato.py` | 单条推理 | ✅ v4 |
+| `lato_integration/inference_lato.py` | 单条推理（v5：自动发现 ckpt + ss_only 模式） | ✅ v5 |
 | `lato_integration/evaluate_3d_metrics.py` | 🆕 批量评估 | ✅ |
 | `dataset_toolkits/stat_latent.py` | SLat normalization | ✅ |
 
 ---
 
-## v4 当前状态
+## v5 当前状态
 
 | 步骤 | 状态 | 说明 |
 |------|------|------|
@@ -320,7 +378,7 @@ python lato_integration/evaluate_3d_metrics.py \
 | 3b. SS stats | ⏭️ | identity |
 | 4a. 训练 SS Flow | 🔄 | 单卡 512ch，目标 1M 步 |
 | 4b. 训练 SLat Flow | 🔄 | 单卡 384ch，续训中 |
-| 5. 单条推理 | ⏳ | 两个都训完后 |
+| 5. 单条推理 | ⏳ | v5 脚本已就绪，训练中可 `--mode ss_only` 验证 SS Flow |
 | 6. 批量评估 | ⏳ | 推理验证通过后 |
 
 ---
