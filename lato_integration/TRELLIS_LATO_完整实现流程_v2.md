@@ -344,6 +344,113 @@ python lato_integration/evaluate_3d_metrics.py \
 
 ---
 
+## 原版 TRELLIS vs 你的 LATO 管线：逐阶段对比
+
+### 总览
+
+```
+原版 TRELLIS (microsoft/TRELLIS-text-base):
+  Text → CLIP → SS Flow → SS Decoder → SLat Flow → SLat Decoder(×3) → GS/RF/Mesh
+
+你的 LATO 管线:
+  Text → CLIP → SS Flow(重训) → SS Decoder(冻结) → ×2坐标 → SLat Flow(重训) → LATO VoxelVAE → ConnectionHead → Mesh
+```
+
+共 **5 个差异阶段**。
+
+### 阶段 1：Text → CLIP 编码
+
+| | 原版 | 你的 |
+|------|------|------|
+| 模型 | `openai/clip-vit-large-patch14` | **完全相同** |
+| 输出 | `[B, 77, 768]` | `[B, 77, 768]` |
+| 训练状态 | 冻结 | 冻结 |
+
+**无差异。**
+
+### 阶段 2：SS Flow — 稀疏结构生成
+
+| | 原版 TRELLIS | 你的 LATO |
+|------|------|------|
+| 模型类 | `SparseStructureFlowModel` | `EnhancedSSFlowModel`（继承前者，预留 Swin/IO 扩展） |
+| 架构 | Dense 3D DiT, full attention on 4096 tokens | **相同**（训练配置未启用 Swin/IO blocks） |
+| 输入 | noise `[B,8,16,16,16]` | 同 |
+| 输出 | velocity → denoised latent `[B,8,16,16,16]` | 同 |
+| 参数量 | `model_channels=512`, 24 blocks, 16 heads | **512ch, 24 blocks, 16 heads** |
+| 训练数据 | ObjaverseXL (~10M 3D 模型) | **刹车卡钳 234 条** |
+| 权重来源 | 官方预训练 | **从零训练**，目标 1M 步 |
+
+**核心逻辑相同，差异在于训练数据领域专精。**
+
+### 阶段 3：SS Decoder — occupancy 解码
+
+| | 原版 | 你的 |
+|------|------|------|
+| 模型 | `SparseStructureDecoder`（3D CNN） | **完全相同，冻结** |
+| 输入 | SS latent `[B,8,16,16,16]` | 同 |
+| 输出 | occupancy logits → coords at res 64 | 同 |
+
+**无差异。** SS Decoder 只做 `logits > 0` 阈值化，不涉及几何质量，无需重训。
+
+### 阶段 4：坐标上采样（🆕 新增）
+
+```
+coords[:, 1:] = coords[:, 1:] * 2   # res 64 → 128
+```
+
+| | 原版 | 你的 |
+|------|------|------|
+| SLat 坐标分辨率 | **res 64**（不变） | **res 128**（×2） |
+| 原因 | SLat Flow 原生 res=64 | LATO VoxelVAE 原生 res=128 |
+
+### 阶段 5：SLat Flow — 结构化潜空间生成（差异最大）
+
+| | 原版 TRELLIS (xlarge) | 你的 LATO |
+|------|------|------|
+| 模型类 | `SLatFlowModel` | `LATOSLatFlowModel`（仅改默认值：res=128, ch=16） |
+| 分辨率 | **64** | **128** |
+| Latent 维度 | **8** | **16** |
+| 模型大小 | **1024ch, 24 blocks** | **384ch, 12 blocks** |
+| IO blocks | `[256, 512]`（2 层不同通道） | `[128]`（1 层×2 次） |
+| Attention | Full attention | Full attention |
+| 数据类型 | Sparse Tensor（仅 active voxels） | 同（上限 16384 voxels） |
+| Normalization | 通用 3D 数据集统计量 | **刹车卡钳 16-dim 统计量** |
+| 训练数据 | ObjaverseXL (~10M) | **刹车卡钳 234 条** |
+| 权重来源 | 官方预训练 | **从零训练**，目标 1M 步 |
+
+**模型更小但分辨率更高。** 因为 res=128 下 active voxels 更多，但 384ch/12blocks 降低了每个 voxel 的计算量。latent dim 8→16 是为了匹配 LATO VoxelVAE 的输入。
+
+### 阶段 6：解码器 → Mesh（完全替换）
+
+| 对比维度 | 原版 TRELLIS | 你的 LATO |
+|------|------|------|
+| 解码器 | 3 个独立 Sparse Transformer decoder（GS/RF/Mesh） | **1 个 LATO VoxelVAE** + ConnectionHead |
+| 架构 | Sparse Transformer × N blocks | 多级 subdivision decoder + cross-attention |
+| Cross-attention | 无 | ✅ decoder ↔ latent |
+| Occupancy pruning | 无 | ✅ 每级过滤非表面体素 |
+| Mesh 方式 | FlexiCubes（隐式曲面 → 显式 mesh） | **显式顶点 → ConnectionHead 边预测 → 三角面片化** |
+| 输出类型 | GS + RF + Mesh（3 种） | **仅 Mesh** |
+| 训练状态 | 预训练冻结 | 冻结（LATO 预训练权重） |
+
+**这是最大的差异。** LATO VoxelVAE 用显式拓扑预测取代了 TRELLIS 的隐式解码，几何质量更好，但也意味着你只能出 Mesh，不支持 Gaussian Splats 和 Radiance Field。
+
+### 训练/推理状态总表
+
+```
+                    训练时                    推理时
+─────────────────────────────────────────────────────
+CLIP               冻结                      冻结
+SS Flow            从零训练 🔄               加载你的 ckpt
+SS Decoder         冻结                      冻结（TRELLIS 预训练）
+SLat Flow          从零训练 🔄               加载你的 ckpt
+LATO VoxelVAE      —（不参与训练）            冻结（LATO 预训练）
+ConnectionHead     —（不参与训练）            冻结（LATO 预训练）
+```
+
+> **注意：** LATO VoxelVAE 和 ConnectionHead 只在推理时加载，训练阶段完全不涉及。你只需要训练 SS Flow 和 SLat Flow 两个模型。
+
+---
+
 ## 文件清单
 
 | 文件 | 作用 | 状态 |
@@ -417,3 +524,7 @@ python lato_integration/evaluate_3d_metrics.py \
 ### Q: LATO checkpoint 加载失败
 
 确保 `latent_dim: 16, in_channels: 1024`，checkpoint 路径正确。
+
+### Q: 推理时需要训练 LATO VAE 吗？
+
+**不需要。** LATO VoxelVAE + ConnectionHead 是预训练好的冻结权重（`vae_128to512.pt`），推理时直接加载。你的管线只需要训练 **SS Flow** 和 **SLat Flow** 两个模型。LATO VAE 在整个流程中始终是冻结的，既不参与训练也不参与梯度回传。
