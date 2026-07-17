@@ -14,25 +14,106 @@
 ## 架构概览
 
 ```
-原版 TRELLIS:
-  Text → CLIP → SS Flow → SS Decoder → SLat Flow → SLat Decoder → Mesh/GS/RF
+                    原版 TRELLIS                        你的 LATO 管线                    对应目标
+                   ════════════                       ═══════════════                   ════════
 
-LATO 替换后:
-  Text → CLIP → SS Flow(刹车卡钳训练) → SS Decoder(原版冻结) → coords[:,1:]×2
-                 ↑ 新训练                        ↑ 不变              ↓
-                                          SLat Flow(16-dim/128-res, 新训练)
-                                                 ↓
-                                          LATO VoxelVAE.decode()
-                                                 ↓
-                                          ConnectionHead → Mesh
+  Text ──→ CLIP ──→ SS Flow ──→ SS Decoder           (不变) (不变)  (🆕重训)  (不变)
+                                    │                    │       │       │       │
+                                    │                Text ─→ CLIP ─→ SS Flow ─→ SS Decoder   ① 刹车卡钳形状适配
+                                    │                                        │
+                                    ▼                                        ▼
+                               SLat Flow                              coords ×2                ② 适配 LATO res=128
+                         (res=64, dim=8, 1024ch)               (res=64 → 128 上采样)
+                                    │                                        │
+                                    │                                        ▼
+                                    │                              SLat Flow (🆕重训)           ③ 刹车卡钳纹理适配
+                                    │                         (res=128, dim=16, 384ch)         + 匹配 LATO latent 维度
+                                    │                                        │
+                                    ▼                                        ▼
+                          ┌─── SLat Decoder ───┐                   LATO VoxelVAE               ④ 更高质量的几何解码
+                          │  GS  │  RF  │ Mesh │                   .decode()                   (cross-attn + pruning)
+                          └───────────────────┘                        │
+                               3 种输出                           ConnectionHead               ⑤ 显式拓扑预测
+                                                                   (边预测 → 三角面片)
+                                                                        │
+                                                                        ▼
+                                                                      Mesh                     ⑥ 仅需 mesh 输出
+                                                                     (.obj)
 ```
 
-**关键改动：**
-- SS Flow：**在刹车卡钳数据上从零训练**，架构 `SparseStructureFlowModel`（→ `EnhancedSSFlowModel`）
-- SS Decoder：**完全不动**（冻结，TRELLIS 预训练权重）
-- SLat Flow：架构 `LATOSLatFlowModel`，`resolution=128, in/out_channels=16`，**从零训练**
-- Decoder：**替换**为 LATO VoxelVAE + ConnectionHead（冻结，LATO 预训练权重）
-- 需训练 **2 个** 新模型，各约 1M 步，**可并行训练**
+## 代码逐行核查：改动 ↔ 目标 ↔ LATO 模块对应
+
+### 推理全链路追踪（`pipeline.run()` → mesh.obj）
+
+```
+TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
+│
+├─[1] sample_sparse_structure()        # :86
+│   ├─ self.models['sparse_structure_flow_model']    ← 🆕 你的 SS Flow ckpt
+│   └─ self.models['sparse_structure_decoder']       ← TRELLIS 预训练 (冻结)
+│
+├─[2] coords[:, 1:] = coords[:, 1:] * 2              # :234  🆕 桥梁
+│
+├─[3] sample_slat()                    # :180
+│   ├─ self.models['slat_flow_model']                ← 🆕 你的 SLat Flow ckpt
+│   └─ self.slat_normalization                        ← 🆕 刹车卡钳 stats.json
+│
+└─[4] decode_slat()                    # :153
+    └─ 'lato_vae' in self.models? ──Yes──→ decode_slat_lato()  # :109
+        │
+        ├─ TRELLIS SparseTensor → LATO SparseTensor   # :131-135
+        ├─ self.models['lato_vae'].decode()            # :141  ← LATO VoxelVAE
+        └─ return {'lato_decoded': ...}
+
+── 推理脚本后处理 (inference_lato.py) ──
+│
+├─[5] decoded[-1]['vertex']                           ← 取最后一级顶点
+├─[6] predict_edges_batched(connection_head, ...)      ← LATO ConnectionHead
+└─[7] edges_to_mesh() → trimesh → .obj                ← NetworkX 公共邻居法
+```
+
+### 7 处改动 × 对应关系
+
+| # | 代码证据 | 改动内容 | 对应目标 | 对应 LATO 模块 |
+|---|---------|---------|---------|---------------|
+| 1 | `inference_lato.py:510` `pipeline.models["sparse_structure_flow_model"] = ss_flow` | SS Flow 替换为你训练的权重 | 刹车卡钳形状先验 | `EnhancedSSFlowModel`（`lato_integration/flow/ss_flow.py`，通过 `run_train.py:38` 映射） |
+| 2 | `trellis_text_to_3d.py:105` `decoder = self.models['sparse_structure_decoder']` | SS Decoder 保持 TRELLIS 预训练冻结 | 复用官方 occupancy 解码 | 无改动（TRELLIS `SparseStructureDecoder`） |
+| 3 | `trellis_text_to_3d.py:234` `coords[:, 1:] = coords[:, 1:] * 2` | 坐标 res 64→128 | 桥接 TRELLIS 和 LATO 分辨率差异 | 无对应模块（纯坐标变换） |
+| 4 | `inference_lato.py` 中 `pipeline.models["slat_flow_model"] = slat_flow` | SLat Flow 替换为你训练的权重（res=128, dim=16） | 刹车卡钳潜空间分布 + 匹配 LATO VAE 输入 | `LATOSLatFlowModel`（`trellis/models/lato_slat_flow.py`，仅改 3 个默认值） |
+| 5 | `trellis_text_to_3d.py:141-145` `self.models['lato_vae'].decode(lato_slat, ...)` | TRELLIS decoder 替换为 LATO VoxelVAE | 高质量几何解码（cross-attn + pruning） | LATO `VoxelVAE.decode()` |
+| 6 | `inference_lato.py:477-483` `connection_head(torch.cat([batch_u, batch_v]))` | 顶点对 → 边概率双向打分 | 显式拓扑预测，替代 FlexiCubes | LATO `ConnectionHead`（`vertex_encoder.py`） |
+| 7 | `inference_lato.py:488-491` `edges_to_mesh(vertex_coords, edges)` | 边 → 三角面 NetworkX 公共邻居法 | 显式 mesh 构建 | 无对应模块（纯几何算法） |
+
+### 目标符合性判定
+
+```
+目标: "将 Sparse VAE Encoder/Decoder 替换为 LATO 的 VoxelVAE，
+       SS Flow 和 SLat Flow 均在刹车卡钳数据集上从零训练，
+       最后用 CD/HD/NC 评估"
+
+  ✅ Decoder 替换为 LATO VoxelVAE    — trellis_text_to_3d.py:141
+  ✅ SS Flow 刹车卡钳从零训练         — inference_lato.py:496-510
+  ✅ SLat Flow 刹车卡钳从零训练       — 同上 SLat 部分
+  ✅ coords×2 桥接分辨率差异          — trellis_text_to_3d.py:234
+  ✅ ConnectionHead 显式拓扑          — inference_lato.py:477
+  ✅ CD/HD/NC 评估                   — evaluate_3d_metrics.py
+
+  ⚠️ SS Flow 架构增强 (Swin/IO)     — 代码预留，未激活 (pass/num=0)
+  ⚠️ SLat Flow 架构增强 (Swin/PE)   — 代码预留，未使用 EnhancedSLatFlowModel
+```
+
+**结论：核心目标全部达成。** 架构增强是预留扩展点，不影响目标功能。当前管线 = TRELLIS 的 SS 管线 + 刹车卡钳训练的 SS/SLat Flow + LATO VoxelVAE 解码器。
+
+### 训练/推理角色
+
+```
+  CLIP ──────────── 冻结 ─ 只做文本编码
+  SS Flow ───────── 🆕训 ─ 唯一需要训练的模型之一
+  SS Decoder ────── 冻结 ─ 仅做 occupancy 阈值化，不涉及几何质量
+  SLat Flow ─────── 🆕训 ─ 唯一需要训练的模型之二
+  LATO VoxelVAE ─── 冻结 ─ 预训练几何解码器，训练和推理都不更新
+  ConnectionHead ── 冻结 ─ 预训练边预测器，含在 LATO ckpt 中
+```
 
 ---
 
