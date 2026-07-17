@@ -67,9 +67,10 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 
 ── 推理脚本后处理 (inference_lato.py) ──
 │
-├─[5] decoded[-1]['vertex']                           ← 取最后一级顶点
+├─[5] decoded[-1].get('vertex')          # :693       ← 取最后一级顶点
 ├─[6] predict_edges_batched(connection_head, ...)      ← LATO ConnectionHead
-└─[7] edges_to_mesh() → trimesh → .obj                ← NetworkX 公共邻居法
+│       # 函数定义 :241, 调用 :726, cat 操作 :291
+└─[7] edges_to_mesh() → trimesh → .obj  # 定义 :307, 调用 :741  ← NetworkX 公共邻居法
 ```
 
 ### 7 处改动 × 对应关系
@@ -79,10 +80,10 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 | 1 | `inference_lato.py:510` `pipeline.models["sparse_structure_flow_model"] = ss_flow` | SS Flow 替换为你训练的权重 | 刹车卡钳形状先验 | `EnhancedSSFlowModel`（`lato_integration/flow/ss_flow.py`，通过 `run_train.py:38` 映射） |
 | 2 | `trellis_text_to_3d.py:105` `decoder = self.models['sparse_structure_decoder']` | SS Decoder 保持 TRELLIS 预训练冻结 | 复用官方 occupancy 解码 | 无改动（TRELLIS `SparseStructureDecoder`） |
 | 3 | `trellis_text_to_3d.py:234` `coords[:, 1:] = coords[:, 1:] * 2` | 坐标 res 64→128 | 桥接 TRELLIS 和 LATO 分辨率差异 | 无对应模块（纯坐标变换） |
-| 4 | `inference_lato.py` 中 `pipeline.models["slat_flow_model"] = slat_flow` | SLat Flow 替换为你训练的权重（res=128, dim=16） | 刹车卡钳潜空间分布 + 匹配 LATO VAE 输入 | `LATOSLatFlowModel`（`trellis/models/lato_slat_flow.py`，仅改 3 个默认值） |
+| 4 | `inference_lato.py:542` `pipeline.models["slat_flow_model"] = slat_flow` | SLat Flow 替换为你训练的权重（res=128, dim=16） | 刹车卡钳潜空间分布 + 匹配 LATO VAE 输入 | `LATOSLatFlowModel`（`trellis/models/lato_slat_flow.py`，仅改 3 个默认值） |
 | 5 | `trellis_text_to_3d.py:141-145` `self.models['lato_vae'].decode(lato_slat, ...)` | TRELLIS decoder 替换为 LATO VoxelVAE | 高质量几何解码（cross-attn + pruning） | LATO `VoxelVAE.decode()` |
-| 6 | `inference_lato.py:477-483` `connection_head(torch.cat([batch_u, batch_v]))` | 顶点对 → 边概率双向打分 | 显式拓扑预测，替代 FlexiCubes | LATO `ConnectionHead`（`vertex_encoder.py`） |
-| 7 | `inference_lato.py:488-491` `edges_to_mesh(vertex_coords, edges)` | 边 → 三角面 NetworkX 公共邻居法 | 显式 mesh 构建 | 无对应模块（纯几何算法） |
+| 6 | `inference_lato.py:291-292` `connection_head(torch.cat([batch_u, batch_v]))` / 调用 `:726-733` | 顶点对 → 边概率双向打分 | 显式拓扑预测，替代 FlexiCubes | LATO `ConnectionHead`（`vertex_encoder.py`） |
+| 7 | `inference_lato.py:307-338` `edges_to_mesh(vertex_coords, edges)` / 调用 `:741` | 边 → 三角面 NetworkX 公共邻居法 | 显式 mesh 构建 | 无对应模块（纯几何算法） |
 
 ### 目标符合性判定
 
@@ -311,11 +312,11 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
 | 配置 | 512ch × 24 blocks × 16 heads, cond=768 |
 | 数据 | `TextConditionedSparseStructureLatent`, 234 条 |
 | 输入/输出 | CLIP text → dense 16³×8 |
-| batch_size | 2 per GPU |
+| batch_size | 4 per GPU（配置值；OOM 时可降至 2 或 1） |
 | 步数 | 1,000,000 |
 | 速度 | ~15,000 steps/h（单卡 4090），ETA ~2.8 天 |
 
-**OOM 降级方案：** `model_channels: 512→384` → `batch_size: 2→1`
+**OOM 降级方案：** `model_channels: 512→384` → `batch_size: 4→2→1`
 
 ---
 
@@ -501,13 +502,15 @@ python lato_integration/evaluate_3d_metrics.py \
 
 | | 原版 TRELLIS | 你的 LATO |
 |------|------|------|
-| 模型类 | `SparseStructureFlowModel` | `EnhancedSSFlowModel`（继承前者，预留 Swin/IO 扩展） |
-| 架构 | Dense 3D DiT, full attention on 4096 tokens | **相同**（训练配置未启用 Swin/IO blocks） |
+| 模型类 | `SparseStructureFlowModel` | `EnhancedSSFlowModel`（继承前者，预留 Swin/IO 扩展；通过 `run_train.py:38` 映射） |
+| 架构 | Dense 3D DiT, full attention on 4096 tokens | **相同**（训练配置未启用 Swin/IO blocks；`num_io_res_blocks=0`） |
 | 输入 | noise `[B,8,16,16,16]` | 同 |
 | 输出 | velocity → denoised latent `[B,8,16,16,16]` | 同 |
 | 参数量 | `model_channels=512`, 24 blocks, 16 heads | **512ch, 24 blocks, 16 heads** |
+| batch_size | — | 4 per GPU |
 | 训练数据 | ObjaverseXL (~10M 3D 模型) | **刹车卡钳 234 条** |
 | 权重来源 | 官方预训练 | **从零训练**，目标 1M 步 |
+| 训练器 | 原版 `FlowMatchingCFGTrainer` | **原版 TRELLIS trainer**（`TextConditionedFlowMatchingCFGTrainer` 未在 `run_train.py` TRAINER_REPLACEMENTS 中映射，fallback 到原版） |
 
 **核心逻辑相同，差异在于训练数据领域专精。**
 
