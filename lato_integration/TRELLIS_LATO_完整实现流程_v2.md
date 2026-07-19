@@ -105,6 +105,69 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 
 **结论：核心目标全部达成。** 架构增强是预留扩展点，不影响目标功能。当前管线 = TRELLIS 的 SS 管线 + 刹车卡钳训练的 SS/SLat Flow + LATO VoxelVAE 解码器。
 
+---
+
+## 效果预期分析：LATO 增强版 vs 原版 TRELLIS
+
+### 理论上不应该更好
+
+核心矛盾很简单：
+
+```
+原版 TRELLIS:  ~10M 条训练数据  →  Flow 模型学到丰富的 3D 形状先验
+你的 LATO 管线: 234 条训练数据  →  Flow 模型只见过刹车卡钳
+```
+
+### 瓶颈不在 Decoder，在 Flow
+
+```
+输入 Text ──→ [SS Flow] ──→ [SLat Flow] ──→ [Decoder] ──→ Mesh
+                  ↑                ↑              ↑
+              🆕你训练的       🆕你训练的      LATO 冻结（真正增强的地方）
+              234条数据       234条数据
+```
+
+**Decoder 再好，也只能解码 Flow 给它的 latent。** 如果 Flow 产出了低质量 latent，LATO VoxelVAE 救不回来。
+
+### 具体弱点逐条分析
+
+| 弱点 | 原版 TRELLIS | 你的 LATO 管线 | 影响 |
+|------|-------------|---------------|------|
+| **训练数据量** | ~10M | **234**（差 4 个数量级） | 🔴 致命 |
+| **SLat Flow 容量** | 1024ch × 24 blocks | **384ch × 12 blocks**（~1/3 参数量） | 🟡 中等 |
+| **训推不一致** | 训练时 SLat 也见过 SS 预测值 | 训练时 SLat 只看 GT latent，推理时吃 SS 预测值→**没见过的分布** | 🔴 累积误差 |
+| **Decoder 质量** | FlexiCubes 隐式等值面（有机形状偏向） | LATO cross-attn + pruning + 显式边预测 | 🟢 增强 |
+
+### 唯一可能赢的场景
+
+刹车卡钳是**机械零件**，形状空间小、规律性强，如果 234 条覆盖了主要变体，且 LATO 的显式拓扑对**锐利边缘+平面**的还原优于 FlexiCubes（FlexiCubes 天生偏向光滑有机形状），那 CD/HD 可能更好。
+
+但这是小概率事件。
+
+### 如果效果不好，在哪里？
+
+按可能性从高到低：
+
+1. **CD/HD 数值比原版差**（最可能）— Flow 模型欠拟合，产出的 latent 不能准确表达刹车卡钳形状，234 条数据不足以学到完整的条件分布 P(shape | text)
+2. **生成形状"像但细节不对"** — 大体轮廓对（刹车卡钳形状简单），但活塞孔、固定耳等细节位置偏移，因为 SLat Flow 在 128³ 稀疏空间里只见过 234 种 voxel 排列
+3. **多样性差** — 不同 prompt 生成的形状趋同，小数据 + CFG 引导导致模型只会"安全模式"
+4. **特定样本崩坏** — 测试集中某些参数组合在训练集中没出现过 → 外推失败
+
+### 结论
+
+**大概率 CD/HD 比原版 TRELLIS 差，根本原因是 234 条数据喂不饱两个 Flow 模型。** 但这不代表工作没意义——证明了管线可行，下一步扩充数据就能真正发挥 LATO decoder 的优势。
+
+### 评估函数正确性验证
+
+| 函数 | 公式 | 实现 | 判定 |
+|------|------|------|:--:|
+| `chamfer_distance` | CD = 1/\|P\| Σ min\|p-q\|² + 1/\|Q\| Σ min\|q-p\|² | `KDTree.query`(L2) → `**2` → `.mean()` 双向 | ✅ |
+| `hausdorff_distance` | d_H = max{max_p min_q\|p-q\|, max_q min_p\|q-p\|} | `KDTree.query`(L2) → `.max()` 双向取 max | ✅ |
+| `normal_consistency` | NC = 1/\|P\| Σ \|n_p · n_nearest\| | `KDTree.query(k=1)` → `np.abs(dot)` → `.mean()` | ✅ |
+| 归一化 | 统一到 GT bbox 对角线尺度 | `np.linalg.norm(bbox_diag)` 同时缩放 pred 和 gt | ✅ |
+
+> 小瑕疵：`normal_consistency` 签名参数 `k=10` 实际未使用，query 硬编码 `k=1`。不影响正确性（NC 标准做法就是 k=1）。
+
 ### 训练/推理角色
 
 ```
