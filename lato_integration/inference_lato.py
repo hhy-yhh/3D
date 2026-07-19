@@ -85,7 +85,11 @@ from lato_integration.flow.ss_flow import EnhancedSSFlowModel
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
 from lato.models.lato_vae.lato_vae import VoxelVAE
 from vertex_encoder import ConnectionHead as LATOConnectionHead
-from utils import load_pretrained_woself
+import importlib.util
+_spec=importlib.util.spec_from_file_location("lato_utils","/data/huanghaoyang/3D/LATO/utils.py")
+_lato_utils=importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lato_utils)
+load_pretrained_woself=_lato_utils.load_pretrained_woself
 
 
 # ============================================================================

@@ -58,7 +58,13 @@ from trellis.models.lato_slat_flow import LATOSLatFlowModel
 from lato_integration.flow.ss_flow import EnhancedSSFlowModel
 from lato.models.lato_vae.lato_vae import VoxelVAE
 from vertex_encoder import ConnectionHead as LATOConnectionHead
-from utils import load_pretrained_woself
+if "utils" in sys.modules:
+    del sys.modules["utils"]
+import importlib.util
+_spec = importlib.util.spec_from_file_location("lato_utils", "/data/huanghaoyang/3D/LATO/utils.py")
+_lato_utils = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lato_utils)
+load_pretrained_woself = _lato_utils.load_pretrained_woself
 
 
 # ============================================================================
@@ -221,7 +227,7 @@ def load_pipeline(opt, device):
     pipeline.lato_inference_threshold = opt.lato_threshold
     for key in ["slat_decoder_mesh", "slat_decoder_gs", "slat_decoder_rf"]:
         pipeline.models.pop(key, None)
-    pipeline = pipeline.to(device)
+    pipeline.to(device)
 
     return pipeline, connection_head, model_cfg
 
@@ -326,7 +332,7 @@ def main():
     # ── 预加载 GT mesh ──
     print("\n预加载 GT mesh ...")
     gt_meshes = {}
-    sha256_col = "sha256" if "sha256" in test_samples[0] else None
+    sha256_col = "file_identifier" if "sha256" in test_samples[0] else None
     for sample in tqdm(test_samples, desc="Loading GT"):
         sha = sample[sha256_col] if sha256_col else sample.get("file_identifier", sample.get("ID"))
         gt_path = os.path.join(opt.gt_meshes, f"{sha}.stl")
@@ -371,7 +377,7 @@ def main():
 
         try:
             with torch.no_grad():
-                outputs = pipeline.run(
+                            outputs = pipeline.run(
                     prompt,
                     seed=opt.seed,
                     sparse_structure_sampler_params={
