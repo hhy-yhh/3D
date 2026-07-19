@@ -226,9 +226,7 @@ def load_pipeline(opt, device):
         using_subdivide=True,
         using_attn=model_cfg.get("using_attn", False),
     ).to(device)
-    print(f"[DEBUG] Creating ConnectionHead with channels=1024")
-    connection_head = LATOConnectionHead(channels=1024, out_channels=1).to(device)
-    print(f"[DEBUG] mlp.0.weight shape: {connection_head.mlp[0].weight.shape}")
+    connection_head = LATOConnectionHead(channels=512, out_channels=1).to(device)
     load_pretrained_woself(opt.lato_ckpt, vae=lato_vae, connection_head=connection_head)
     lato_vae.eval()
     connection_head.eval()
