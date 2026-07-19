@@ -143,8 +143,16 @@ def compute_all_metrics(
 ) -> dict:
     """计算全部三个指标。"""
     # 采样
-    pred_pts, pred_norms = sample_points_and_normals(pred_mesh, n_points)
-    gt_pts, gt_norms = sample_points_and_normals(gt_mesh, n_points)
+    pred_pts_raw, pred_norms = sample_points_and_normals(pred_mesh, n_points)
+    gt_pts_raw, gt_norms = sample_points_and_normals(gt_mesh, n_points)
+
+    # 归一化到同一尺度：用 GT bbox 对角线统一缩放
+    gt_scale = np.linalg.norm(gt_pts_raw.max(axis=0) - gt_pts_raw.min(axis=0))
+    if gt_scale > 0:
+        pred_pts = pred_pts_raw / gt_scale
+        gt_pts = gt_pts_raw / gt_scale
+    else:
+        pred_pts, gt_pts = pred_pts_raw, gt_pts_raw
 
     cd = chamfer_distance(pred_pts, gt_pts)
     hd = hausdorff_distance(pred_pts, gt_pts)
