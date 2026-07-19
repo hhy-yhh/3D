@@ -244,7 +244,7 @@ def load_pipeline(opt, device):
 # Mesh 后处理（从 pipeline 输出提取）
 # ============================================================================
 
-def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_threshold=0.45):
+def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_threshold=0.45, k_neighbors=32):
     """从 pipeline.run() 输出提取 trimesh 对象。"""
     from lato_integration.inference_lato import predict_edges_batched, edges_to_mesh
 
@@ -270,7 +270,7 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_t
 
     edges = predict_edges_batched(
         connection_head, vertex_feats.float(), vertex_coords_3d.float(),
-        threshold=edge_threshold, device=device,
+        threshold=edge_threshold, device=device, k_neighbors=k_neighbors,
     )
 
     if len(edges) == 0:
@@ -312,6 +312,8 @@ def main():
     parser.add_argument("--cfg_strength", type=float, default=5.0)
     parser.add_argument("--lato_threshold", type=float, default=0.2)
     parser.add_argument("--edge_threshold", type=float, default=0.45)
+    parser.add_argument("--k_neighbors", type=int, default=32,
+                        help="KDTree 最近邻数，越小面越少")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use_fp16", action="store_true", default=True)
     parser.add_argument("--limit", type=int, default=0,
@@ -402,7 +404,7 @@ def main():
                 )
 
             pred_mesh = extract_mesh_from_output(
-                outputs, connection_head, model_cfg, device, opt.edge_threshold
+                outputs, connection_head, model_cfg, device, opt.edge_threshold, opt.k_neighbors
             )
 
             if pred_mesh is None:
