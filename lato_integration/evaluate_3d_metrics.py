@@ -316,6 +316,8 @@ def main():
     parser.add_argument("--use_fp16", action="store_true", default=True)
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
+    parser.add_argument("--save_meshes", action="store_true", default=False,
+                        help="保存生成的 mesh 文件到 output_dir/meshes/")
     opt = parser.parse_args()
 
     device = torch.device(opt.device if torch.cuda.is_available() else "cpu")
@@ -407,6 +409,22 @@ def main():
                 failures.append({"sha": sha, "error": "Mesh extraction failed"})
                 continue
 
+            # 保存生成 mesh
+            if opt.save_meshes:
+                mesh_dir = os.path.join(opt.output_dir, "meshes")
+                os.makedirs(mesh_dir, exist_ok=True)
+                mesh_path = os.path.join(mesh_dir, f"{sha}.obj")
+                pred_mesh.export(mesh_path)
+                # 也保存顶点+面信息到 JSON 目录（方便对照）
+                meta_path = os.path.join(mesh_dir, f"{sha}.json")
+                with open(meta_path, "w") as f:
+                    json.dump({
+                        "sha": sha,
+                        "prompt": prompt,
+                        "num_vertices": len(pred_mesh.vertices),
+                        "num_faces": len(pred_mesh.faces),
+                    }, f, indent=2)
+
             gt_mesh = gt_meshes[sha]
             metrics = compute_all_metrics(pred_mesh, gt_mesh, opt.n_points)
 
@@ -476,6 +494,9 @@ def main():
             json.dump(summary, f, indent=2)
         print(f"\n  详细结果: {results_path}")
         print(f"  汇总: {summary_path}")
+        if opt.save_meshes:
+            mesh_dir = os.path.join(opt.output_dir, "meshes")
+            print(f"  生成 mesh: {mesh_dir}/ ({len(results)} 个 .obj)")
 
     if failures:
         failures_path = os.path.join(opt.output_dir, "failures.json")
