@@ -46,6 +46,7 @@ TRAINER_REPLACEMENTS = {
     # === Flow 训练器 ===
     "FlowMatchingTrainer": lato_flow_trainers.EnhancedSSFlowTrainer,
     "FlowMatchingCFGTrainer": lato_flow_trainers.EnhancedSSFlowCFGTrainer,
+    "TextConditionedFlowMatchingCFGTrainer": lato_flow_trainers.TextConditionedEnhancedSSFlowCFGTrainer,
     "SparseFlowMatchingTrainer": lato_flow_trainers.EnhancedSLatFlowTrainer,
     "SparseFlowMatchingCFGTrainer": lato_flow_trainers.EnhancedSLatFlowCFGTrainer,
     "TextConditionedSparseFlowMatchingCFGTrainer": lato_flow_trainers.TextConditionedEnhancedSLatFlowCFGTrainer,
