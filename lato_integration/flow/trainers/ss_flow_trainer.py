@@ -108,10 +108,12 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             x_0_pred = self._reconstruct_x0(x_t, pred, t)
 
             # LatoStructureHead: 16³ → 128³ occupancy
-            occ_logits = self.training_models['structure_head'](x_0_pred)
-            occ_bce = F.binary_cross_entropy_with_logits(
-                occ_logits, ss_occupancy_128.float(), reduction='mean'
-            )
+            # 🔧 使用 autocast (fp16) 节省显存 — 128³ 激活值巨大（~2GB @ fp32/B=4）
+            with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
+                occ_logits = self.training_models['structure_head'](x_0_pred)
+                occ_bce = F.binary_cross_entropy_with_logits(
+                    occ_logits, ss_occupancy_128.float(), reduction='mean'
+                )
             terms["occ_bce_128"] = occ_bce
             terms["loss"] = terms["loss"] + self.lambda_occupancy * occ_bce
 
