@@ -104,7 +104,7 @@ class BasicTrainer(Trainer):
         elif self.fp16_mode == 'inflat_all':
             self.master_params = make_master_params(self.model_params)
             self.fp16_scale_growth = self.fp16_scale_growth
-            self.log_scale = 20.0
+            self.log_scale = 12.0  # 从零训练安全值，每步+0.001 自动爬升
             self._consecutive_nan = 0
         elif self.fp16_mode is None:
             self.master_params = self.model_params
@@ -399,8 +399,8 @@ class BasicTrainer(Trainer):
                     self.master_params[0].grad.mul_(1.0 / (2 ** self.log_scale))
                 self.optimizer.step()
                 master_params_to_model_params(self.model_params, self.master_params)
-                # 🔧 上限 18.0 — 防止 log_scale 无限增长导致溢出
-                self.log_scale = min(self.log_scale + self.fp16_scale_growth, 18.0)
+                # 🔧 上限 20.0 — 防止 log_scale 无限增长导致溢出
+                self.log_scale = min(self.log_scale + self.fp16_scale_growth, 20.0)
             else:
                 self._consecutive_nan += 1
                 # 🔧 NaN 抢救
