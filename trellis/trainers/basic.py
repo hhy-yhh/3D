@@ -399,16 +399,20 @@ class BasicTrainer(Trainer):
                     self.master_params[0].grad.mul_(1.0 / (2 ** self.log_scale))
                 self.optimizer.step()
                 master_params_to_model_params(self.model_params, self.master_params)
-                self.log_scale += self.fp16_scale_growth
+                # 🔧 上限 18.0 — 防止 log_scale 无限增长导致溢出
+                self.log_scale = min(self.log_scale + self.fp16_scale_growth, 18.0)
             else:
                 self._consecutive_nan += 1
-                # 🔧 NaN 抢救：连续 NaN 超过阈值时强制降低 log_scale
-                if self._consecutive_nan >= 10:
-                    self.log_scale = max(self.log_scale - 5, -10.0)
-                    print(f'\n\033[93mWarning: {self._consecutive_nan} consecutive NaN steps. '
-                          f'Force log_scale to {self.log_scale:.1f}.\033[0m')
+                # 🔧 NaN 抢救
+                if self._consecutive_nan < 5:
+                    self.log_scale -= 3                       # 少量 NaN: 快速降
+                elif self._consecutive_nan < 15:
+                    self.log_scale = max(self.log_scale - 5, 0)  # 持续 NaN: 强制降
                 else:
-                    self.log_scale -= 1
+                    self.log_scale = 14.0                     # 顽固 NaN: 重置到安全值
+                    self._consecutive_nan = 0
+                print(f'\n\033[93mWarning: {self._consecutive_nan} consecutive NaN steps. '
+                      f'log_scale={self.log_scale:.1f}.\033[0m')
         else:
             prev_scale = 1.0
             if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
