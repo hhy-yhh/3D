@@ -311,9 +311,12 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
 | 训练目标 | LATO coords → occupancy@128³ dense grid |
 | 损失 | Flow Matching MSE + Occupancy BCE@128³ (λ=0.1) |
 | 配置 | 512ch × 24 blocks × 16 heads |
-| batch_size | 4 per GPU |
+| batch_size | 2 per GPU, split=1 |
 | 步数 | 1,000,000 |
-| 预计时间 | ~3 天（单卡 RTX 4090） |
+| 预计时间 | ~4.5 天（单卡 RTX 4090） |
+| 显存 | ~20 GB（B=2 + checkpoint + autocast） |
+
+> **⚠️ 从零启动的 NaN 问题**：`log_scale=20` 将 loss 放大 2^20≈1M 倍，fp16 梯度溢出 → NaN 死循环。已在 `trellis/trainers/basic.py` 加入连续 NaN 抢救逻辑（10 步后强制降 log_scale），详见[已知 Bug 修复清单](#已知-bug-修复清单v3)。
 
 ---
 
@@ -521,3 +524,93 @@ LATO VoxelVAE 的 decoder 是端到端的：输入 sparse latent → 输出 mesh
 ### Q: 推理时需要训练 LATO VAE 吗？
 
 **不需要。** LATO VoxelVAE + ConnectionHead 是预训练好的冻结权重，整个流程中始终冻结。
+
+---
+
+## 已知 Bug 修复清单（v3）
+
+### Bug 1: None grad 崩溃 — `model_grads_to_master_grads`
+
+**现象**：
+```
+AttributeError: 'NoneType' object has no attribute 'data'
+  at model_grads_to_master_grads (utils.py:51)
+```
+
+**根因**：`LatoSSFlowTrainer` 中 `structure_head` 条件性参与 forward（由 `aux_decode_every` 和 `lambda_occupancy` 控制），不参与时 `.grad=None`，但 `model_params` 包含所有模型的参数。
+
+**修复**（3 处）：
+
+| 文件 | 修改 |
+|------|------|
+| `trellis/trainers/utils.py:51` | `param.grad is None` 时用 `torch.zeros_like(param.data)` 替代 |
+| `trellis/trainers/basic.py:394,405` | NaN 检测跳过 `grad is None` 的参数 |
+
+### Bug 2: `LatoStructureHead` 缺少 `convert_to_fp16/32`
+
+**现象**：`fp16_mode='inflat_all'` 时 resume checkpoint → `AttributeError: 'LatoStructureHead' object has no attribute 'convert_to_fp16'`
+
+**根因**：TRELLIS trainer 对每个 model 调用 `convert_to_fp16()`，但 `LatoStructureHead` 是纯 `nn.Module`。
+
+**修复**：`lato_integration/structure_head.py` 添加空实现兼容方法。
+
+### Bug 3: 数据集不返回 `ss_occupancy_128`
+
+**现象**：`structure_head` 永远不参与训练，`ss_occupancy_128 is None` → `should_decode=False`。
+
+**根因**：`SparseStructureLatent.get_instance()` 只返回 `{'x_0': z}`，缺少 occupancy 字段。
+
+**修复**：新建 `lato_integration/datasets.py` — `TextConditionedLatoSSStructureLatent` 额外加载 `ss_occupancy_128/*.npz`。
+
+### Bug 4: Trainer 映射缺失
+
+**现象**：
+```
+TypeError: EnhancedSSFlowModel.forward() got an unexpected keyword argument 'ss_occupancy_128'
+```
+
+**根因**：`TRAINER_REPLACEMENTS` 缺少 `TextConditionedFlowMatchingCFGTrainer` 映射，fallback 到原始 TRELLIS trainer，后者不认识 `ss_occupancy_128`。
+
+**修复**：`lato_integration/run_train.py` 添加 `"TextConditionedFlowMatchingCFGTrainer": TextConditionedEnhancedSSFlowCFGTrainer`。
+
+### Bug 5: 128³ OOM
+
+**现象**：`torch.OutOfMemoryError` at `structure_head.py:109 (stage3 upsample)`，尝试分配 4 GB。
+
+**根因**：stage3 激活值 `[B, 64, 128, 128, 128]` @ fp32, B=4 ≈ 4 GB 连续显存，加上 denoiser 已占 ~20 GB → 超出 23.55 GB。
+
+**修复**（组合方案）：
+
+| 措施 | 位置 |
+|------|------|
+| `torch.autocast` 包裹 structure_head 前向（fp16 计算） | `ss_flow_trainer.py` |
+| `torch.utils.checkpoint` — stage3 不存中间激活 | `structure_head.py` |
+| `batch_size_per_gpu: 2` + 梯度累积 | `lato_ss_flow_v3.json` |
+| IO ResBlocks 残差连接 shape 检查 | `flow/ss_flow.py` |
+
+### Bug 6: 从零训练 NaN 死循环 + 日志崩溃
+
+**现象**：
+```
+AssertionError: input must be a non-empty list of dictionaries
+  at dict_reduce (general_utils.py:59)
+```
+
+**根因链**：
+
+```
+log_scale=20.0（硬编码）
+  → loss × 2^20 ≈ 1,000,000× 放大
+  → fp16 梯度最大值=65504，溢出 → NaN
+  → NaN → optimizer.step() 跳过
+  → 模型卡在随机初始化，下步继续 NaN
+  → 原逻辑每步只 log_scale -= 1，需 500+ 步才能降到安全值
+  → 500 步全部 NaN → log_show 过滤后空列表 → dict_reduce 崩溃
+```
+
+**修复**：
+
+| 文件 | 修改 |
+|------|------|
+| `trellis/trainers/basic.py` | 新增 `_consecutive_nan` 计数器；连续 NaN ≥ 10 步时强制 `log_scale -= 5`（原为 -1），最快 15-20 步内恢复 |
+| `trellis/trainers/base.py` | `log_show` 过滤后为空时用最后一条日志作为 fallback，避免 `dict_reduce` 崩溃 |
