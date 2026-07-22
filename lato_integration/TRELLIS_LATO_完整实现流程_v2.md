@@ -133,14 +133,18 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 | 操作 | 文件 | 说明 |
 |------|------|------|
 | 🆕 新建 | `lato_integration/structure_head.py` | `LatoStructureHead` — 3D CNN 16³→128³，替代 SS Decoder |
-| ✏️ 重写 | `lato_integration/__init__.py` | 移除 TRELLIS Enc/Dec 导出，新增 LatoStructureHead |
+| 🆕 新建 | `lato_integration/datasets.py` | `TextConditionedLatoSSStructureLatent` — 加载 ss_occupancy_128 |
+| ✏️ 重写 | `lato_integration/__init__.py` | 移除 TRELLIS Enc/Dec 导出，新增 LatoStructureHead + datasets |
 | ✏️ 重写 | `lato_integration/sparse_structure_vae.py` | 改为 LatoStructureHead re-export + 废弃注释 |
 | ✏️ 重写 | `lato_integration/pipeline.py` | 新增 `sample_sparse_structure_lato()` 和 `run_lato()` |
-| ✏️ 修改 | `lato_integration/run_train.py` | MODEL_REPLACEMENTS 移除 Enc/Dec，新增 LatoStructureHead |
+| ✏️ 修改 | `lato_integration/run_train.py` | MODEL_REPLACEMENTS 移除 Enc/Dec，新增 LatoStructureHead；支持 lato_datasets |
 | ✏️ 修改 | `lato_integration/inference_lato.py` | v5→v6：LatoStructureHead 替代 SS Decoder，移除 coords×2 |
 | ✏️ 修改 | `lato_integration/evaluate_3d_metrics.py` | load_pipeline() 加载 LatoStructureHead |
 | ✏️ 修改 | `lato_integration/flow/trainers/ss_flow_trainer.py` | 新增 `LatoSSFlowTrainer`，训练目标改为 128³ occupancy |
 | ✏️ 修改 | `lato_integration/flow/trainers/__init__.py` | 新增 v3 trainer 名称导出 |
+| ✏️ 修改 | `lato_integration/flow/ss_flow.py` | 修复 IO ResBlocks 残差连接 shape 不匹配 |
+| ✏️ 修改 | `trellis/trainers/utils.py` | 修复 `model_grads_to_master_grads` None grad 处理 |
+| ✏️ 修改 | `trellis/trainers/basic.py` | 修复 `run_step` 梯度 NaN 检查跳过 None grad |
 | ✏️ 修改 | `trellis/pipelines/trellis_text_to_3d.py` | 新增 `sample_sparse_structure_lato()`，条件化 coords×2 |
 | 🔴 废弃 | `lato_integration/encoder.py` | DEPRECATED（由 LATO VoxelVAE.encode 替代） |
 | 🔴 简化 | `lato_integration/decoder_mesh.py` | 仅保留 SparsePredictionHead + EnhancedSparseSubdivideBlock3d |
@@ -271,13 +275,17 @@ if "trainer" not in cfg:
     cfg["trainer"] = {"name": "FlowMatchingCFGTrainer", "args": {}}
 cfg["trainer"]["args"]["lambda_occupancy"] = 0.1
 
+# 🔧 v3 fix: 使用 LATO 自定义数据集（加载 ss_occupancy_128）
+cfg["dataset"]["name"] = "TextConditionedLatoSSStructureLatent"
+cfg["dataset"]["args"]["occupancy_dir"] = "ss_occupancy_128"
+
 with open("configs/generation/lato_ss_flow_v3.json", "w") as f:
     json.dump(cfg, f, indent=4)
 print("Done: configs/generation/lato_ss_flow_v3.json")
 EOF
 ```
 
-> **输出**：`configs/generation/lato_ss_flow_v3.json`（在原有 SS Flow 配置基础上增加 `structure_head` 模型和 `lambda_occupancy`）
+> **输出**：`configs/generation/lato_ss_flow_v3.json`（在原有 SS Flow 配置基础上增加 `structure_head` 模型、`lambda_occupancy`，并使用 `TextConditionedLatoSSStructureLatent` 数据集）
 
 ---
 

@@ -19,6 +19,7 @@ from trellis import datasets
 from trellis.utils.dist_utils import setup_dist
 
 import lato_integration
+import lato_integration.datasets as lato_datasets
 import lato_integration.flow as lato_flow
 import lato_integration.flow.trainers as lato_flow_trainers
 
@@ -138,7 +139,13 @@ def main(local_rank, cfg):
 
     setup_rng(rank)
 
-    dataset = getattr(datasets, cfg.dataset.name)(cfg.data_dir, **cfg.dataset.args)
+    # 🔧 支持 LATO 自定义数据集（先查 lato_datasets，再 fallback 到 trellis.datasets）
+    if hasattr(lato_datasets, cfg.dataset.name):
+        dataset_cls = getattr(lato_datasets, cfg.dataset.name)
+        print(f"[LATO] 使用自定义数据集: {dataset_cls.__name__}")
+        dataset = dataset_cls(cfg.data_dir, **cfg.dataset.args)
+    else:
+        dataset = getattr(datasets, cfg.dataset.name)(cfg.data_dir, **cfg.dataset.args)
 
     model_dict = {}
     for name, model_cfg in cfg.models.items():

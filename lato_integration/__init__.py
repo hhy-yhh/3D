@@ -31,6 +31,9 @@ from .decoder_mesh import SparsePredictionHead
 # === Enhanced pipeline（保留，需更新）===
 from .pipeline import EnhancedTrellisTextTo3DPipeline
 
+# === v3: 自定义数据集（提供 ss_occupancy_128）===
+from . import datasets as datasets
+
 __all__ = [
     # Foundation
     "DiagonalGaussianDistribution",

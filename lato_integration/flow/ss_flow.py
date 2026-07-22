@@ -187,7 +187,12 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
             res = self.resolution // self.patch_size
             h_spatial = h.permute(0, 2, 1).view(B, C, res, res, res)
             for blk in self.io_blocks:
-                h_spatial = blk(h_spatial) + h_spatial  # residual
+                out = blk(h_spatial)
+                # 只有 shape 相同时才做残差连接
+                if out.shape == h_spatial.shape:
+                    h_spatial = out + h_spatial
+                else:
+                    h_spatial = out
             h = h_spatial.view(B, C, -1).permute(0, 2, 1).contiguous()
 
         # ---- Transformer blocks ----

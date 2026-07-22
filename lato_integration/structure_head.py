@@ -109,6 +109,14 @@ class LatoStructureHead(nn.Module):
         h = self.stage3(h)       # → [B, C2, 128, 128, 128]
         return self.out_conv(h)  # → [B, 1, 128, 128, 128]
 
+    def convert_to_fp16(self) -> None:
+        """兼容 TRELLIS trainer — 轻量 CNN 无需真正转换，直接返回。"""
+        pass
+
+    def convert_to_fp32(self) -> None:
+        """兼容 TRELLIS trainer — 轻量 CNN 无需真正转换，直接返回。"""
+        pass
+
 
 def coords_from_occupancy(
     logits: torch.Tensor,

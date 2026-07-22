@@ -391,7 +391,7 @@ class BasicTrainer(Trainer):
             self.scaler.update()
         elif self.fp16_mode == 'inflat_all':
             prev_scale = 2 ** self.log_scale
-            if not any(not p.grad.isfinite().all() for p in self.model_params):
+            if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
                 if self.grad_clip is None:
                     model_grads_to_master_grads(self.model_params, self.master_params)
                     self.master_params[0].grad.mul_(1.0 / (2 ** self.log_scale))
@@ -402,7 +402,7 @@ class BasicTrainer(Trainer):
                 self.log_scale -= 1
         else:
             prev_scale = 1.0
-            if not any(not p.grad.isfinite().all() for p in self.model_params):
+            if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
                 self.optimizer.step()
             else:
                 print('\n\033[93mWarning: NaN detected in gradients. Skipping update.\033[0m') 

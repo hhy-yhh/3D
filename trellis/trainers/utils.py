@@ -48,7 +48,7 @@ def model_grads_to_master_grads(model_params, master_params):
     from make_master_params().
     """
     master_params[0].grad = _flatten_dense_tensors(
-        [param.grad.data.detach().float() for param in model_params]
+        [param.grad.data.detach().float() if param.grad is not None else torch.zeros_like(param.data).float() for param in model_params]
     )
     
 
