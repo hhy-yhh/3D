@@ -19,33 +19,30 @@ from trellis import datasets
 from trellis.utils.dist_utils import setup_dist
 
 import lato_integration
-import lato_integration.trainers as lato_trainers
 import lato_integration.flow as lato_flow
 import lato_integration.flow.trainers as lato_flow_trainers
 
 
+# ===========================================================================
+# v3 MODEL_REPLACEMENTS: 仅保留 Flow 模型（中间生成部分）
+# Encoder/Decoder 全部由 LATO VoxelVAE 替代
+# ===========================================================================
 MODEL_REPLACEMENTS = {
-    "SparseStructureEncoder": lato_integration.EnhancedSparseStructureEncoder,
-    "SparseStructureDecoder": lato_integration.EnhancedSparseStructureDecoder,
-    "SLatEncoder": lato_integration.EnhancedSLatEncoder,
-    "SLatGaussianDecoder": lato_integration.EnhancedSLatGaussianDecoder,
-    "SLatRadianceFieldDecoder": lato_integration.EnhancedSLatRadianceFieldDecoder,
-    "SLatMeshDecoder": lato_integration.EnhancedSLatMeshDecoder,
-    "ElasticSLatEncoder": lato_integration.EnhancedSLatEncoder,
-    "ElasticSLatGaussianDecoder": lato_integration.EnhancedElasticSLatGaussianDecoder,
-    "ElasticSLatRadianceFieldDecoder": lato_integration.EnhancedElasticSLatRadianceFieldDecoder,
-    "ElasticSLatMeshDecoder": lato_integration.EnhancedElasticSLatMeshDecoder,
+    # === Flow 模型（TRELLIS 中间生成部分，保留）===
     "SparseStructureFlowModel": lato_flow.EnhancedSSFlowModel,
     "SLatFlowModel": lato_flow.EnhancedSLatFlowModel,
     "ElasticSLatFlowModel": lato_flow.EnhancedElasticSLatFlowModel,
     "LATOSLatFlowModel": lato_flow.LATOSLatFlowModel,
+    # === v3: LatoStructureHead — 替代 SS Decoder ===
+    "LatoStructureHead": lato_integration.LatoStructureHead,
 }
 
+# ===========================================================================
+# v3 TRAINER_REPLACEMENTS: 仅保留 Flow 训练器
+# VAE 训练器全部移除（LATO VoxelVAE 冻结预训练）
+# ===========================================================================
 TRAINER_REPLACEMENTS = {
-    "SparseStructureVaeTrainer": lato_trainers.EnhancedSparseStructureVaeTrainer,
-    "SLatVaeGaussianTrainer": lato_trainers.EnhancedSLatVaeGaussianTrainer,
-    "SLatVaeRadianceFieldDecoderTrainer": lato_trainers.EnhancedSLatVaeRadianceFieldDecoderTrainer,
-    "SLatVaeMeshDecoderTrainer": lato_trainers.EnhancedSLatVaeMeshDecoderTrainer,
+    # === Flow 训练器 ===
     "FlowMatchingTrainer": lato_flow_trainers.EnhancedSSFlowTrainer,
     "FlowMatchingCFGTrainer": lato_flow_trainers.EnhancedSSFlowCFGTrainer,
     "SparseFlowMatchingTrainer": lato_flow_trainers.EnhancedSLatFlowTrainer,

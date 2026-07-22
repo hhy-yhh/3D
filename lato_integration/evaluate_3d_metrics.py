@@ -56,6 +56,7 @@ for _p in [_TRELLIS_ROOT, _LATO_ROOT]:
 from trellis.pipelines.trellis_text_to_3d import TrellisTextTo3DPipeline
 from trellis.models.lato_slat_flow import LATOSLatFlowModel
 from lato_integration.flow.ss_flow import EnhancedSSFlowModel
+from lato_integration.structure_head import LatoStructureHead, coords_from_occupancy
 from lato.models.lato_vae.lato_vae import VoxelVAE
 from vertex_encoder import ConnectionHead as LATOConnectionHead
 if "utils" in sys.modules:
@@ -170,11 +171,13 @@ def compute_all_metrics(
 # ============================================================================
 
 def load_pipeline(opt, device):
-    """加载完整推理管线。"""
-    print("[1/4] 加载 TRELLIS 管线骨架（SS Decoder + Samplers）...")
+    """加载完整推理管线（v6: LatoStructureHead 替代 SS Decoder）。"""
+    print("[1/5] 加载 TRELLIS 管线骨架（CLIP + Samplers）...")
     pipeline = TrellisTextTo3DPipeline.from_pretrained(opt.trellis_pretrained)
+    # v6: 移除 TRELLIS SS Decoder
+    pipeline.models.pop('sparse_structure_decoder', None)
 
-    print("[2/4] 加载训练好的 SS Flow ...")
+    print("[2/5] 加载训练好的 SS Flow + LatoStructureHead ...")
     ss_flow = EnhancedSSFlowModel(
         resolution=16, in_channels=8, out_channels=8,
         model_channels=512, cond_channels=768,
@@ -184,12 +187,32 @@ def load_pipeline(opt, device):
     ).to(device)
     ss_ckpt = torch.load(opt.ss_ckpt, map_location=device, weights_only=True)
     if isinstance(ss_ckpt, dict):
-        ss_ckpt = ss_ckpt.get('state_dict', ss_ckpt.get('model', ss_ckpt))
-    ss_flow.load_state_dict(ss_ckpt)
+        ss_ckpt_state = ss_ckpt.get('state_dict', ss_ckpt.get('model', ss_ckpt))
+    else:
+        ss_ckpt_state = ss_ckpt
+    ss_flow.load_state_dict(ss_ckpt_state)
     ss_flow.eval()
     pipeline.models["sparse_structure_flow_model"] = ss_flow
 
-    print("[3/4] 加载训练好的 SLat Flow ...")
+    # v6: LatoStructureHead — 替代 SS Decoder
+    structure_head = LatoStructureHead(
+        in_channels=8, base_channels=256, num_res_blocks=1,
+    ).to(device)
+    if opt.use_fp16:
+        structure_head = structure_head.half()
+    # 尝试从 SS ckpt 提取 structure_head 权重
+    sh_prefix = "structure_head."
+    if isinstance(ss_ckpt, dict) and any(k.startswith(sh_prefix) for k in ss_ckpt_state.keys()):
+        sh_state = {k[len(sh_prefix):]: v for k, v in ss_ckpt_state.items()
+                   if k.startswith(sh_prefix)}
+        structure_head.load_state_dict(sh_state, strict=False)
+        print("  LatoStructureHead: 从 SS checkpoint 加载")
+    else:
+        print("  LatoStructureHead: 使用随机初始化（未找到预训练权重）")
+    structure_head.eval()
+    pipeline.models["lato_structure_head"] = structure_head
+
+    print("[3/5] 加载训练好的 SLat Flow ...")
     slat_flow = LATOSLatFlowModel(
         resolution=128, in_channels=16, out_channels=16,
         model_channels=384, cond_channels=768,
@@ -213,7 +236,7 @@ def load_pipeline(opt, device):
         pipeline.slat_normalization = {"mean": [0.0]*16, "std": [1.0]*16}
 
     # LATO VAE
-    print("[4/4] 加载 LATO VoxelVAE ...")
+    print("[4/5] 加载 LATO VoxelVAE ...")
     with open(opt.lato_config, "r") as f:
         lato_cfg = yaml.safe_load(f)
     model_cfg = lato_cfg["model"]
@@ -235,7 +258,10 @@ def load_pipeline(opt, device):
     pipeline.lato_inference_threshold = opt.lato_threshold
     for key in ["slat_decoder_mesh", "slat_decoder_gs", "slat_decoder_rf"]:
         pipeline.models.pop(key, None)
+
+    print("[5/5] 组装管线 ...")
     pipeline.to(device)
+    print(f"  模型: {list(pipeline.models.keys())}")
 
     return pipeline, connection_head, model_cfg
 

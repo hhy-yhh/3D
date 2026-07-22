@@ -1,68 +1,34 @@
 """
-LATO Integration for TRELLIS — Enhanced Text-to-3D Generation
+LATO Integration for TRELLIS — v3: 全 LATO Encoder/Decoder + TRELLIS Flow 生成
 
-This package integrates LATO's (ICML 2026) superior VAE encode/decode
-architecture into TRELLIS's ss_flow and slat_flow training pipelines.
+架构（v3）:
+  Encoder: LATO VoxelVAE.encode() — 替代 TRELLIS SS Encoder + SLat Encoder
+  Decoder: LATO VoxelVAE.decode() + LatoStructureHead — 替代 TRELLIS SS Decoder + SLat Decoder
+  Flow:   TRELLIS SS Flow + SLat Flow — 仅中间生成部分保留 TRELLIS
 
-Key enhancements:
-- DiagonalGaussianDistribution: Proper VAE posterior with clamped logvar
-- SparseTransformerCrossBase: Cross-attention to original latent in decoders
-- Occupancy-guided pruning: Cleaner geometry at each resolution level
-- ConnectionHead: Direct edge/topology prediction for mesh generation
+Key components:
+  - LatoStructureHead: 轻量 3D CNN，替代 SS Decoder，16³→128³ 直接输出
+  - DiagonalGaussianDistribution: FP16 安全 VAE 后验（保留给 latent consistency loss）
+  - SparseTransformerCrossBase: 交叉注意力基类（保留给可能的扩展）
+  - ConnectionHead: LATO 边预测头（推理用）
 
 Usage:
-    # === 阶段一：VAE 优化 ===
-    from lato_integration import (
-        EnhancedSLatEncoder,
-        EnhancedSLatGaussianDecoder,
-        EnhancedSLatMeshDecoder,
-        EnhancedTrellisTextTo3DPipeline,
-    )
-
-    # === 阶段二：Flow/DiT 优化 ===
+    from lato_integration import LatoStructureHead, coords_from_occupancy
     from lato_integration.flow import EnhancedSSFlowModel, EnhancedSLatFlowModel
-    from lato_integration.flow.trainers import (
-        EnhancedSSFlowTrainer,          # ss_flow: 辅助解码损失
-        EnhancedSLatFlowTrainer,        # slat_flow: 辅助解码 + latent一致性
-    )
-
-    # For training:
-    from lato_integration.trainers import EnhancedSLatVaeGaussianTrainer
-
-    # For inference:
-    pipeline = EnhancedTrellisTextTo3DPipeline.from_pretrained(path)
-    results = pipeline.run("a wooden chair with armrests")
 """
 
-# Foundation utilities
+# Foundation utilities (保留)
 from .utils import DiagonalGaussianDistribution
 from .base import SparseTransformerCrossBase
 from .vertex_encoder import ConnectionHead
 
-# Enhanced encoders
-from .sparse_structure_vae import (
-    EnhancedSparseStructureEncoder,
-    EnhancedSparseStructureDecoder,
-)
-from .encoder import EnhancedSLatEncoder
+# === v3: LatoStructureHead — 替代 TRELLIS SS Decoder ===
+from .structure_head import LatoStructureHead, coords_from_occupancy
 
-# Enhanced decoders
-from .decoder_gs import (
-    EnhancedSLatGaussianDecoder,
-    EnhancedElasticSLatGaussianDecoder,
-)
-from .decoder_rf import (
-    EnhancedSLatRadianceFieldDecoder,
-    EnhancedElasticSLatRadianceFieldDecoder,
-)
-from .decoder_mesh import (
-    EnhancedSLatMeshDecoder,
-    EnhancedElasticSLatMeshDecoder,
-    EnhancedSparseSubdivideBlock3d,
-    SparsePredictionHead,
-)
+# === 工具类（从 decoder_mesh.py 保留）===
+from .decoder_mesh import SparsePredictionHead
 
-# Enhanced pipeline
+# === Enhanced pipeline（保留，需更新）===
 from .pipeline import EnhancedTrellisTextTo3DPipeline
 
 __all__ = [
@@ -70,21 +36,31 @@ __all__ = [
     "DiagonalGaussianDistribution",
     "SparseTransformerCrossBase",
     "ConnectionHead",
-    # Encoders
-    "EnhancedSparseStructureEncoder",
-    "EnhancedSparseStructureDecoder",
-    "EnhancedSLatEncoder",
-    # Decoders - Gaussian
-    "EnhancedSLatGaussianDecoder",
-    "EnhancedElasticSLatGaussianDecoder",
-    # Decoders - Radiance Field
-    "EnhancedSLatRadianceFieldDecoder",
-    "EnhancedElasticSLatRadianceFieldDecoder",
-    # Decoders - Mesh
-    "EnhancedSLatMeshDecoder",
-    "EnhancedElasticSLatMeshDecoder",
-    "EnhancedSparseSubdivideBlock3d",
+    # v3: Structure Head
+    "LatoStructureHead",
+    "coords_from_occupancy",
+    # Utility
     "SparsePredictionHead",
     # Pipeline
     "EnhancedTrellisTextTo3DPipeline",
 ]
+
+# ========================================================================
+# 以下模块已在 v3 中废弃（由 LATO VoxelVAE 替代）：
+# ========================================================================
+#
+#   - lato_integration.encoder.EnhancedSLatEncoder
+#     → 替代: LATO VoxelVAE.encode()（encode_lato_latent_v2.py）
+#
+#   - lato_integration.sparse_structure_vae.EnhancedSparseStructureEncoder
+#     → 替代: LATO VoxelVAE.encode()（encode_lato_latent_v2.py）
+#
+#   - lato_integration.sparse_structure_vae.EnhancedSparseStructureDecoder
+#     → 替代: LatoStructureHead（structure_head.py）
+#
+#   - lato_integration.decoder_gs / decoder_rf / decoder_mesh（Decoder 类）
+#     → 替代: LATO VoxelVAE.decode()
+#
+#   - lato_integration.trainers.sparse_structure_vae / slat_vae_*
+#     → 替代: 不再训练 VAE，只训练 Flow 模型
+# ========================================================================

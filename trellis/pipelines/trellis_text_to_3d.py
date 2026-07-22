@@ -106,6 +106,34 @@ class TrellisTextTo3DPipeline(Pipeline):
         coords = torch.argwhere(decoder(z_s) > 0)[:, [0, 2, 3, 4]].int()
         return coords
 
+    def sample_sparse_structure_lato(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        sampler_params: dict = {},
+    ) -> torch.Tensor:
+        """
+        v3: Sample sparse structure using LatoStructureHead (res128 directly).
+
+        Uses SS Flow + LatoStructureHead instead of SS Decoder.
+        No coords x2 needed — output is already at res128.
+        """
+        flow_model = self.models['sparse_structure_flow_model']
+        structure_head = self.models['lato_structure_head']
+        reso = flow_model.resolution
+        noise = torch.randn(
+            num_samples, flow_model.in_channels, reso, reso, reso
+        ).to(self.device)
+        sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        z_s = self.sparse_structure_sampler.sample(
+            flow_model, noise, **cond, **sampler_params, verbose=True
+        ).samples
+
+        # LatoStructureHead: 16^3 dense -> 128^3 occupancy -> coords
+        occ_logits = structure_head(z_s)
+        coords = torch.argwhere(occ_logits > 0)[:, [0, 2, 3, 4]].int()
+        return coords
+
     def decode_slat_lato(
         self,
         slat: sp.SparseTensor,
@@ -220,23 +248,31 @@ class TrellisTextTo3DPipeline(Pipeline):
     ) -> dict:
         """
         Run the pipeline.
-        
-        LATO-enhanced: coords are upsampled from 64 to 128 for LATO SLat Flow.
+
+        v3: 如果 models 中有 lato_structure_head，使用它直接出 res128 coords（无需 ×2）。
+            否则使用传统 TRELLIS SS Decoder + coords×2。
         """
         cond = self.get_cond([prompt])
         torch.manual_seed(seed)
-        
-        # 1. Generate sparse structure (coords at resolution 64)
-        coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
-        
-        # 2. Upsample coords from 64 to 128 for LATO compatibility
-        #    This is the key addition for LATO integration
-        coords[:, 1:] = coords[:, 1:] * 2
-        
-        # 3. Generate SLAT using LATO-compatible flow model
+
+        # 1. Generate sparse structure
+        if 'lato_structure_head' in self.models:
+            # v3: LatoStructureHead 直接输出 res128
+            coords = self.sample_sparse_structure_lato(
+                cond, num_samples, sparse_structure_sampler_params
+            )
+        else:
+            # Legacy: TRELLIS SS Decoder @ res64
+            coords = self.sample_sparse_structure(
+                cond, num_samples, sparse_structure_sampler_params
+            )
+            # Upsample from 64 to 128 for LATO compatibility
+            coords[:, 1:] = coords[:, 1:] * 2
+
+        # 2. Generate SLAT
         slat = self.sample_slat(cond, coords, slat_sampler_params)
-        
-        # 4. Decode to final format
+
+        # 3. Decode
         return self.decode_slat(slat, formats)
 
     def voxelize(self, mesh: o3d.geometry.TriangleMesh) -> torch.Tensor:

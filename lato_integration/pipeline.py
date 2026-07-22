@@ -1,11 +1,13 @@
 """
-Enhanced Text-to-3D Pipeline with cross-attention decoders.
+Enhanced Text-to-3D Pipeline — v3: 全 LATO Encoder/Decoder + TRELLIS Flow
 
-Inherits from TRELLIS's TrellisTextTo3DPipeline and overrides decode_slat()
-to pass the original latent through to enhanced decoders for cross-attention.
+v3 变化:
+  - 移除 Gaussian/RadianceField decoder 路径（仅 LATO Mesh 输出）
+  - 新增 sample_sparse_structure_lato() — 使用 LatoStructureHead
+  - decode_slat() 简化：优先 LATO decode，fallback 到 TRELLIS mesh decoder
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -18,29 +20,17 @@ from trellis.modules import sparse as sp
 
 class EnhancedTrellisTextTo3DPipeline(_TrellisTextTo3DPipeline):
     """
-    Enhanced Text-to-3D Pipeline using LATO-style cross-attention decoders.
+    Enhanced Text-to-3D Pipeline — v3。
 
-    The key enhancement is in decode_slat(): the original latent (slat)
-    is passed through to each enhanced decoder, enabling cross-attention
-    from decoder features back to the original latent for better feature
-    propagation during decoding.
-
-    Usage:
-        pipeline = EnhancedTrellisTextTo3DPipeline.from_pretrained(path)
-        results = pipeline.run("a chair")
+    核心变化（v3）:
+      - sample_sparse_structure_lato(): SS Flow + LatoStructureHead → coords@128³
+      - decode_slat(): 默认使用 LATO VoxelVAE decode
+      - 不再有 GS/RF decode 路径
     """
 
     @staticmethod
     def from_pretrained(path: str) -> "EnhancedTrellisTextTo3DPipeline":
-        """
-        Load a pretrained model and wrap in enhanced pipeline.
-
-        Args:
-            path: The path to the model (local or Hugging Face).
-
-        Returns:
-            EnhancedTrellisTextTo3DPipeline instance.
-        """
+        """加载预训练模型并包装为增强管线。"""
         pipeline = _TrellisTextTo3DPipeline.from_pretrained(path)
         enhanced = EnhancedTrellisTextTo3DPipeline()
         enhanced.__dict__ = pipeline.__dict__
@@ -49,59 +39,45 @@ class EnhancedTrellisTextTo3DPipeline(_TrellisTextTo3DPipeline):
     def decode_slat(
         self,
         slat: sp.SparseTensor,
-        formats: List[str] = ['mesh', 'gaussian', 'radiance_field'],
+        formats: List[str] = ['mesh'],
     ) -> dict:
         """
-        Decode the structured latent with cross-attention support.
+        Decode structured latent — v3: 优先 LATO VoxelVAE。
 
-        Passes the original latent (slat) to each decoder so they can
-        cross-attend back to it during decoding.
-
-        Args:
-            slat: The structured latent sparse tensor.
-            formats: The formats to decode to.
-
-        Returns:
-            dict: The decoded 3D representations.
+        如果有 lato_vae → 走 LATO decode 路径。
+        否则 fallback 到 TRELLIS mesh decoder。
         """
+        # LATO decode path (preferred in v3)
+        if 'lato_vae' in self.models and 'mesh' in formats:
+            return self.decode_slat_lato(slat)
+
+        # Fallback: TRELLIS mesh decoder
         ret = {}
-        if 'mesh' in formats:
-            decoder = self.models['slat_decoder_mesh']
-            if hasattr(decoder, 'use_cross_attn') and decoder.use_cross_attn:
-                ret['mesh'] = decoder(slat, original_latent=slat)
-            else:
-                ret['mesh'] = decoder(slat)
-
-        if 'gaussian' in formats:
-            decoder = self.models['slat_decoder_gs']
-            if hasattr(decoder, 'use_cross_attn') and decoder.use_cross_attn:
-                ret['gaussian'] = decoder(slat, original_latent=slat)
-            else:
-                ret['gaussian'] = decoder(slat)
-
-        if 'radiance_field' in formats:
-            decoder = self.models['slat_decoder_rf']
-            if hasattr(decoder, 'use_cross_attn') and decoder.use_cross_attn:
-                ret['radiance_field'] = decoder(slat, original_latent=slat)
-            else:
-                ret['radiance_field'] = decoder(slat)
-
+        if 'mesh' in formats and 'slat_decoder_mesh' in self.models:
+            ret['mesh'] = self.models['slat_decoder_mesh'](slat)
         return ret
 
-    def sample_sparse_structure(
+    def sample_sparse_structure_lato(
         self,
         cond: dict,
         num_samples: int = 1,
         sampler_params: dict = {},
     ) -> torch.Tensor:
         """
-        Sample sparse structures with enhanced decoder support.
+        v3: SS Flow + LatoStructureHead → coords@128³。
 
-        Uses the enhanced SparseStructureDecoder if available.
+        替代 sample_sparse_structure()（后者使用 TRELLIS SS Decoder @ 64³）。
+        输出 coords 已经是 res128，无需 ×2。
+
+        Returns:
+            coords: [N, 4] tensor [batch_idx, x, y, z]（int）。
         """
-        # Sample occupancy latent (same as original)
+        from .structure_head import coords_from_occupancy
+
         flow_model = self.models['sparse_structure_flow_model']
-        reso = flow_model.resolution
+        structure_head = self.models['lato_structure_head']
+        reso = flow_model.resolution  # 16
+
         noise = torch.randn(
             num_samples, flow_model.in_channels, reso, reso, reso
         ).to(self.device)
@@ -110,9 +86,38 @@ class EnhancedTrellisTextTo3DPipeline(_TrellisTextTo3DPipeline):
             flow_model, noise, **cond, **sampler_params, verbose=True
         ).samples
 
-        # Decode occupancy latent with enhanced decoder
-        decoder = self.models['sparse_structure_decoder']
-        logits = decoder(z_s)
-        coords = torch.argwhere(logits > 0)[:, [0, 2, 3, 4]].int()
-
+        # LatoStructureHead: 16³ dense → 128³ occupancy → coords
+        occ_logits = structure_head(z_s)
+        coords = coords_from_occupancy(occ_logits)
         return coords
+
+    @torch.no_grad()
+    def run_lato(
+        self,
+        prompt: str,
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['mesh'],
+    ) -> dict:
+        """
+        v3 推理入口 — 使用 LatoStructureHead，无需 coords×2。
+
+        与父类 run() 的区别：
+          - sample_sparse_structure_lato() 替代 sample_sparse_structure()
+          - 无 coords ×2
+        """
+        cond = self.get_cond([prompt])
+        torch.manual_seed(seed)
+
+        # 1. SS Flow + LatoStructureHead → coords@128³（直接！）
+        coords = self.sample_sparse_structure_lato(
+            cond, num_samples, sparse_structure_sampler_params
+        )
+
+        # 2. SLat Flow → LATO latent
+        slat = self.sample_slat(cond, coords, slat_sampler_params)
+
+        # 3. Decode
+        return self.decode_slat(slat, formats)

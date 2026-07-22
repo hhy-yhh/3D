@@ -9,6 +9,12 @@ LATO-Enhanced Flow Trainers (阶段二训练优化)
 ================================================================================
 """
 from .ss_flow_trainer import (
+    # v3 names
+    LatoSSFlowTrainer,
+    LatoSSFlowCFGTrainer,
+    TextConditionedLatoSSFlowCFGTrainer,
+    ImageConditionedLatoSSFlowCFGTrainer,
+    # v2 backward compat aliases
     EnhancedSSFlowTrainer,
     EnhancedSSFlowCFGTrainer,
     TextConditionedEnhancedSSFlowCFGTrainer,

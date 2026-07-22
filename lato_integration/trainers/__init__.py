@@ -1,8 +1,9 @@
 """
-Enhanced trainers that use LATO-style VAE posterior and cross-attention decoders.
+LATO Integration Trainers — v3: 仅保留 Flow 训练器。
+
+v3 中所有 VAE 训练器已被移除（VAE 训练由 LATO VoxelVAE 预训练权重替代）。
+只保留 SS Flow 和 SLat Flow 的训练器。
 """
 
-from .sparse_structure_vae import EnhancedSparseStructureVaeTrainer
-from .slat_vae_gaussian import EnhancedSLatVaeGaussianTrainer
-from .slat_vae_rf_dec import EnhancedSLatVaeRadianceFieldDecoderTrainer
-from .slat_vae_mesh_dec import EnhancedSLatVaeMeshDecoderTrainer
+# VAE trainers removed in v3 — LATO VoxelVAE is used frozen.
+# Flow trainers are in lato_integration.flow.trainers

@@ -1,22 +1,21 @@
 """
 ================================================================================
-inference_lato.py — TRELLIS + LATO 文本转 3D 推理脚本（v5）
+inference_lato.py — TRELLIS + LATO 文本转 3D 推理脚本（v6）
 ================================================================================
 
-完整推理管线:
-  1. SS Flow（刹车卡钳训练）→ dense SS latent (16³×8)
-  2. SS Decoder（冻结 TRELLIS 预训练）→ occupancy coords (res 64)
-  3. coords × 2 → res 128
-  4. SLat Flow（刹车卡钳训练, 16-dim, 128-res）→ structured latent
-  5. LATO VoxelVAE.decode() → vertex hierarchy
-  6. ConnectionHead → 边预测 → 三角面片化 → Mesh 导出 (.obj)
+v6: 全 LATO Encoder/Decoder + TRELLIS Flow 生成
 
-v5 更新:
-  - 自动发现最新 checkpoint（--ss_dir / --slat_dir）
-  - 从训练 config JSON 读取模型参数（不再硬编码）
-  - 支持 --mode ss_only 快速验证 SS Flow
-  - 更好的 checkpoint 格式兼容（state_dict / model / 裸 dict）
-  - 更详细的错误提示
+推理管线:
+  1. SS Flow（刹车卡钳训练）→ dense SS latent (16³×8)
+  2. LatoStructureHead → occupancy@128³ → coords（直接 res128，无需 ×2！）
+  3. SLat Flow（刹车卡钳训练, 16-dim, 128-res）→ structured latent
+  4. LATO VoxelVAE.decode() → vertex hierarchy
+  5. ConnectionHead → 边预测 → 三角面片化 → Mesh 导出 (.obj)
+
+与 v5 的关键区别：
+  - SS Decoder（TRELLIS 冻结）→ 替换为 LatoStructureHead（与 SS Flow 联合训练）
+  - coords × 2（hack）→ 移除！LatoStructureHead 直接输出 res128
+  - TRELLIS SS Encoder/Decoder 完全不再使用
 
 用法:
     # 完整推理（自动找最新 ckpt）
@@ -80,6 +79,7 @@ from trellis.models.lato_slat_flow import LATOSLatFlowModel
 
 # ── LATO integration imports ──
 from lato_integration.flow.ss_flow import EnhancedSSFlowModel
+from lato_integration.structure_head import LatoStructureHead, coords_from_occupancy
 
 # ── LATO imports ──
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
@@ -232,6 +232,76 @@ def build_slat_flow_from_config(config_path: str, device: torch.device, use_fp16
         use_fp16=use_fp16,
     ).to(device)
     return model
+
+
+def build_structure_head_from_config(config_path: str, device: torch.device, use_fp16: bool = True):
+    """从训练 config JSON 构建 LatoStructureHead。
+
+    Args:
+        config_path: lato_ss_flow.json 的路径。
+        device: 计算设备。
+        use_fp16: 是否使用 FP16。
+
+    Returns:
+        LatoStructureHead 实例。
+    """
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+
+    # structure_head 配置（如果 config 中有的话，否则用默认值）
+    sh_cfg = cfg['models'].get('structure_head', None)
+    if sh_cfg is not None:
+        args = sh_cfg['args']
+    else:
+        # 默认值：从 denoiser 的 out_channels 推断 in_channels
+        denoiser_args = cfg['models']['denoiser']['args']
+        args = {
+            'in_channels': denoiser_args.get('out_channels', 8),
+            'base_channels': 256,
+            'num_res_blocks': 1,
+        }
+
+    model = LatoStructureHead(
+        in_channels=args['in_channels'],
+        base_channels=args.get('base_channels', 256),
+        num_res_blocks=args.get('num_res_blocks', 1),
+    ).to(device)
+
+    if use_fp16:
+        model = model.half()
+
+    return model
+
+
+def sample_ss_lato(
+    pipeline: TrellisTextTo3DPipeline,
+    cond: dict,
+    num_samples: int = 1,
+    sampler_params: dict = {},
+) -> torch.Tensor:
+    """
+    SS Flow 采样 + LatoStructureHead → coords@128³。
+
+    替代 pipeline.sample_sparse_structure()（后者使用 TRELLIS SS Decoder）。
+
+    Returns:
+        coords: [N, 4] tensor [batch_idx, x, y, z] at res128。
+    """
+    flow_model = pipeline.models['sparse_structure_flow_model']
+    structure_head = pipeline.models['lato_structure_head']
+    reso = flow_model.resolution  # 16
+
+    noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(pipeline.device)
+    sampler_params = {**pipeline.sparse_structure_sampler_params, **sampler_params}
+    z_s = pipeline.sparse_structure_sampler.sample(
+        flow_model, noise, **cond, **sampler_params, verbose=True
+    ).samples
+
+    # LatoStructureHead: 16³ dense → 128³ occupancy
+    occ_logits = structure_head(z_s)  # [B, 1, 128, 128, 128]
+    coords = coords_from_occupancy(occ_logits)  # [N, 4] 直接 res128！
+
+    return coords
 
 
 def trellis_to_lato_sparse(trellis_tensor) -> LATOSparseTensor:
@@ -464,7 +534,7 @@ def main():
         slat_ckpt_path = None
 
     print("=" * 70)
-    print("TRELLIS + LATO 推理（v5）")
+    print("TRELLIS + LATO 推理（v6 — 全 LATO Enc/Dec）")
     print("=" * 70)
     print(f"  模式:      {opt.mode}")
     print(f"  设备:      {device}")
@@ -478,9 +548,10 @@ def main():
     # ================================================================
     # 1. 加载 TRELLIS SS 管线骨架（SS Decoder + Samplers，预训练权重）
     # ================================================================
-    print("[1/6] 加载 TRELLIS 管线骨架（SS Decoder + Samplers）...")
+    print("[1/6] 加载 TRELLIS 管线骨架（CLIP + Samplers）...")
     pipeline = TrellisTextTo3DPipeline.from_pretrained(opt.trellis_pretrained)
-    print(f"  SS Decoder: {type(pipeline.models['sparse_structure_decoder']).__name__} (冻结)")
+    pipeline.models.pop('sparse_structure_decoder', None)
+    print("  SS Decoder: 已移除（v6 用 LatoStructureHead 替代）")
 
     # ================================================================
     # 2. 加载训练的 SS Flow
@@ -510,6 +581,31 @@ def main():
             print(f"  ⚠️ Missing keys: {len(missing)} (expected for Enhanced model)")
         if unexpected:
             print(f"  ⚠️ Unexpected keys: {len(unexpected)}")
+
+        # v6: 同时加载 LatoStructureHead
+        structure_head = build_structure_head_from_config(opt.ss_config, device, use_fp16)
+        sh_state = load_checkpoint(ss_ckpt_path, device)
+        # LatoStructureHead 的 key 以 "structure_head." 为前缀（如果联合保存）
+        # 也支持单独的 checkpoint
+        sh_prefix = "structure_head."
+        if any(k.startswith(sh_prefix) for k in sh_state.keys()):
+            sh_state = {k[len(sh_prefix):]: v for k, v in sh_state.items()
+                       if k.startswith(sh_prefix)}
+            print(f"  LatoStructureHead: 从 SS checkpoint 提取 ({len(sh_state)} keys)")
+        else:
+            # 尝试查找独立的 structure_head checkpoint
+            sh_dir = os.path.dirname(ss_ckpt_path)
+            sh_ckpt_path = os.path.join(sh_dir, "structure_head.pt")
+            if os.path.exists(sh_ckpt_path):
+                sh_state = load_checkpoint(sh_ckpt_path, device)
+                print(f"  LatoStructureHead: 从独立 checkpoint 加载")
+            else:
+                print(f"  ⚠️ LatoStructureHead: 无独立权重，使用随机初始化！")
+        missing_sh, unexpected_sh = structure_head.load_state_dict(sh_state, strict=False)
+        structure_head.eval()
+        if missing_sh:
+            print(f"  ⚠️ LatoStructureHead missing keys: {len(missing_sh)}")
+        pipeline.models["lato_structure_head"] = structure_head
 
         pipeline.models["sparse_structure_flow_model"] = ss_flow
 
@@ -637,12 +733,12 @@ def main():
           f"slat_steps={opt.slat_steps}, cfg={opt.cfg_strength}")
 
     if opt.mode == "ss_only":
-        # ── SS-only 模式：只跑 SS Flow + SS Decoder ──
+        # ── SS-only 模式：SS Flow + LatoStructureHead（v6）──
         with torch.no_grad():
             cond = pipeline.get_cond([opt.prompt])
             torch.manual_seed(opt.seed)
-            coords = pipeline.sample_sparse_structure(
-                cond,
+            coords = sample_ss_lato(
+                pipeline, cond,
                 num_samples=1,
                 sampler_params={
                     "steps": opt.ss_steps,
@@ -650,29 +746,24 @@ def main():
                 },
             )
         print(f"\n{'='*60}")
-        print(f"  SS-only 完成!")
+        print(f"  SS-only 完成! (v6: LatoStructureHead @ res128)")
         print(f"  Active voxels: {coords.shape[0]}")
         print(f"  Bbox min: {coords[:, 1:].min(dim=0).values.tolist()}")
         print(f"  Bbox max: {coords[:, 1:].max(dim=0).values.tolist()}")
         print(f"{'='*60}")
         return
 
-    # ── Full 模式 ──
+    # ── Full 模式（v6: 手动三步，跳过 coords×2）──
     try:
         with torch.no_grad():
-            outputs = pipeline.run(
-                opt.prompt,
-                seed=opt.seed,
-                sparse_structure_sampler_params={
-                    "steps": opt.ss_steps,
-                    "cfg_strength": opt.cfg_strength,
-                },
-                slat_sampler_params={
-                    "steps": opt.slat_steps,
-                    "cfg_strength": opt.cfg_strength,
-                },
-                formats=["mesh"],
-            )
+            cond = pipeline.get_cond([opt.prompt])
+            torch.manual_seed(opt.seed)
+            coords = sample_ss_lato(pipeline, cond, num_samples=1,
+                sampler_params={"steps": opt.ss_steps, "cfg_strength": opt.cfg_strength})
+            print(f"  [A] SS → coords: {coords.shape[0]} active voxels @ res128")
+            slat = pipeline.sample_slat(cond, coords,
+                sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
+            outputs = pipeline.decode_slat(slat, formats=["mesh"])
     except Exception as e:
         print(f"\n[ERROR] 推理失败: {e}")
         traceback.print_exc()
