@@ -279,6 +279,10 @@ cfg["trainer"]["args"]["lambda_occupancy"] = 0.1
 cfg["dataset"]["name"] = "TextConditionedLatoSSStructureLatent"
 cfg["dataset"]["args"]["occupancy_dir"] = "ss_occupancy_128"
 
+# 🔧 显存优化: batch_size 降到 2（128³ 激活值巨大，B=4 会 OOM）
+cfg["trainer"]["args"]["batch_size_per_gpu"] = 2
+cfg["trainer"]["args"]["batch_split"] = 2  # 梯度累积保持有效 batch=4
+
 with open("configs/generation/lato_ss_flow_v3.json", "w") as f:
     json.dump(cfg, f, indent=4)
 print("Done: configs/generation/lato_ss_flow_v3.json")
