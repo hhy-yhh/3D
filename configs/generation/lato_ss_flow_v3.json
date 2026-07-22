@@ -14,7 +14,7 @@
                 "patch_size": 1,
                 "pe_mode": "ape",
                 "qk_rms_norm": true,
-                "use_fp16": true,
+                "use_fp16": false,
                 "use_checkpoint": false
             }
         },

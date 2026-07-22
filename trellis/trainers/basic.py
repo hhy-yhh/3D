@@ -105,6 +105,7 @@ class BasicTrainer(Trainer):
             self.master_params = make_master_params(self.model_params)
             self.fp16_scale_growth = self.fp16_scale_growth
             self.log_scale = 20.0
+            self._consecutive_nan = 0
         elif self.fp16_mode is None:
             self.master_params = self.model_params
         else:
@@ -392,6 +393,7 @@ class BasicTrainer(Trainer):
         elif self.fp16_mode == 'inflat_all':
             prev_scale = 2 ** self.log_scale
             if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
+                self._consecutive_nan = 0
                 if self.grad_clip is None:
                     model_grads_to_master_grads(self.model_params, self.master_params)
                     self.master_params[0].grad.mul_(1.0 / (2 ** self.log_scale))
@@ -399,13 +401,22 @@ class BasicTrainer(Trainer):
                 master_params_to_model_params(self.model_params, self.master_params)
                 self.log_scale += self.fp16_scale_growth
             else:
-                self.log_scale -= 1
+                self._consecutive_nan += 1
+                # 🔧 NaN 抢救：连续 NaN 超过阈值时强制降低 log_scale
+                if self._consecutive_nan >= 10:
+                    self.log_scale = max(self.log_scale - 5, -10.0)
+                    print(f'\n\033[93mWarning: {self._consecutive_nan} consecutive NaN steps. '
+                          f'Force log_scale to {self.log_scale:.1f}.\033[0m')
+                else:
+                    self.log_scale -= 1
         else:
             prev_scale = 1.0
             if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
+                self._consecutive_nan = 0
                 self.optimizer.step()
             else:
-                print('\n\033[93mWarning: NaN detected in gradients. Skipping update.\033[0m') 
+                self._consecutive_nan += 1
+                print('\n\033[93mWarning: NaN detected in gradients. Skipping update.\033[0m')
         ## adjust learning rate
         if self.lr_scheduler_config is not None:
             statuses[-1]['lr'] = self.lr_scheduler.get_last_lr()[0]

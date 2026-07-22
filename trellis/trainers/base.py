@@ -424,6 +424,8 @@ class Trainer:
 
                     # show with mlflow
                     log_show = [l for _, l in log if not dict_any(l, lambda x: np.isnan(x))]
+                    if len(log_show) == 0:
+                        log_show = [log[-1][1]]  # fallback: use last entry even if NaN
                     log_show = dict_reduce(log_show, lambda x: np.mean(x))
                     log_show = dict_flatten(log_show, sep='/')
                     for key, value in log_show.items():
