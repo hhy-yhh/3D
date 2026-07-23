@@ -50,6 +50,11 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
         aux_decode_every: 每 N 步计算一次辅助损失 (0=每步, -1=禁用).
     """
 
+    # 训练专用字段 — 推理/snapshot 时不应传递给 sampler/model
+    # ss_occupancy_128: LatoStructureHead 辅助损失用 GT occupancy
+    # extrinsics / intrinsics: ImageConditioned 数据集附加的相机参数
+    _TRAIN_ONLY_KEYS = {'ss_occupancy_128', 'extrinsics', 'intrinsics'}
+
     def __init__(
         self,
         *args,
@@ -60,6 +65,15 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
         super().__init__(*args, **kwargs)
         self.lambda_occupancy = lambda_occupancy
         self.aux_decode_every = aux_decode_every
+
+    def get_inference_cond(self, cond, **kwargs):
+        """
+        构建推理条件 — 移除训练专用字段 (如 ss_occupancy_128)，
+        防止它们泄漏到 sampler → model.forward() 引发 TypeError。
+        """
+        for key in self._TRAIN_ONLY_KEYS:
+            kwargs.pop(key, None)
+        return super().get_inference_cond(cond, **kwargs)
 
     def training_losses(
         self,
@@ -139,8 +153,22 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
 
 
 class LatoSSFlowCFGTrainer(ClassifierFreeGuidanceMixin, LatoSSFlowTrainer):
-    """带 CFG 的 LATO SS Flow Trainer（v3）。"""
-    pass
+    """
+    带 CFG 的 LATO SS Flow Trainer（v3）。
+
+    🔧 注意: 必须覆盖 get_inference_cond 来剥离训练专用字段，
+    因为 ClassifierFreeGuidanceMixin.get_inference_cond() 不调用 super()，
+    会截断 MRO 链，导致 LatoSSFlowTrainer.get_inference_cond() 无法被调用。
+    """
+
+    def get_inference_cond(self, cond, **kwargs):
+        """
+        在 ClassifierFreeGuidanceMixin 打包 kwargs 之前剥离训练专用字段。
+        （ClassifierFreeGuidanceMixin 是 MRO 终端 — 不调用 super()，直接返回 dict）
+        """
+        for key in self._TRAIN_ONLY_KEYS:
+            kwargs.pop(key, None)
+        return super().get_inference_cond(cond, **kwargs)
 
 
 class TextConditionedLatoSSFlowCFGTrainer(

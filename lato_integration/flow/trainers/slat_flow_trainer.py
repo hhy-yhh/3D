@@ -53,6 +53,10 @@ class EnhancedSLatFlowTrainer(SparseFlowMatchingTrainer):
     ============================================================================
     """
 
+    # 预留：训练专用字段白名单，snapshot 时剥离
+    # 当前 SLat 数据集无额外训练字段，空集仅作防御接口
+    _TRAIN_ONLY_KEYS = set()
+
     def __init__(
         self,
         *args,
@@ -65,6 +69,15 @@ class EnhancedSLatFlowTrainer(SparseFlowMatchingTrainer):
         self.aux_decode_every = aux_decode_every
         self.lambda_aux_decode = lambda_aux_decode
         self.lambda_latent_consistency = lambda_latent_consistency
+
+    def get_inference_cond(self, cond, **kwargs):
+        """
+        构建推理条件 — 移除训练专用字段，
+        防止泄漏到 sampler → model.forward() 引发 TypeError。
+        """
+        for key in self._TRAIN_ONLY_KEYS:
+            kwargs.pop(key, None)
+        return super().get_inference_cond(cond, **kwargs)
 
     def training_losses(
         self,
@@ -208,8 +221,18 @@ class EnhancedSLatFlowTrainer(SparseFlowMatchingTrainer):
 class EnhancedSLatFlowCFGTrainer(
     ClassifierFreeGuidanceMixin, EnhancedSLatFlowTrainer
 ):
-    """带 CFG 的 Enhanced SLat Flow Trainer."""
-    pass
+    """
+    带 CFG 的 Enhanced SLat Flow Trainer.
+
+    🔧 注意: 必须覆盖 get_inference_cond 来剥离训练专用字段，
+    因为 ClassifierFreeGuidanceMixin.get_inference_cond() 不调用 super()，
+    会截断 MRO 链。
+    """
+
+    def get_inference_cond(self, cond, **kwargs):
+        for key in self._TRAIN_ONLY_KEYS:
+            kwargs.pop(key, None)
+        return super().get_inference_cond(cond, **kwargs)
 
 
 class TextConditionedEnhancedSLatFlowCFGTrainer(

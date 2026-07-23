@@ -153,7 +153,8 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
             # 输出层
             self.out_layer = nn.Linear(final_ch, out_channels * patch_size ** 3)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor,
+                **kwargs) -> torch.Tensor:
         """
         LATO-Enhanced forward pass.
 
@@ -161,6 +162,8 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
             x: [B, in_channels, H, W, D] dense input (noisy latent).
             t: [B] timestep.
             cond: [B, N_ctx, cond_channels] text/image conditioning.
+            **kwargs: 忽略额外的关键字参数（如 ss_occupancy_128），
+                      防止 sampler 传参时因签名不匹配而 TypeError。
 
         Returns:
             [B, out_channels, H, W, D] predicted velocity field.
