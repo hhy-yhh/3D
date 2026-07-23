@@ -411,8 +411,8 @@ class BasicTrainer(Trainer):
                 else:
                     self.log_scale = 14.0                     # 顽固 NaN: 重置到安全值
                     self._consecutive_nan = 0
-                print(f'\n\033[93mWarning: {self._consecutive_nan} consecutive NaN steps. '
-                      f'log_scale={self.log_scale:.1f}.\033[0m')
+                # NaN warning suppressed — recovery logic still active
+                pass
         else:
             prev_scale = 1.0
             if not any(p.grad is not None and not p.grad.isfinite().all() for p in self.model_params):
@@ -420,7 +420,8 @@ class BasicTrainer(Trainer):
                 self.optimizer.step()
             else:
                 self._consecutive_nan += 1
-                print('\n\033[93mWarning: NaN detected in gradients. Skipping update.\033[0m')
+                # NaN warning suppressed — recovery logic still active
+                pass
         ## adjust learning rate
         if self.lr_scheduler_config is not None:
             statuses[-1]['lr'] = self.lr_scheduler.get_last_lr()[0]
