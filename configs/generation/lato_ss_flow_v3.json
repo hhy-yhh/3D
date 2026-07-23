@@ -55,7 +55,7 @@
             },
             "ema_rate": [0.9999],
             "fp16_mode": "inflat_all",
-            "fp16_scale_growth": 0.001,
+            "fp16_scale_growth": 0.0003,
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {

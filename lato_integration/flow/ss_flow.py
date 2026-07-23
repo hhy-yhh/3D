@@ -201,6 +201,11 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
         # ---- Transformer blocks ----
         for block in self.blocks:
             h = block(h, t_emb, cond)
+            # fp16 安全钳：24 层连续 fp16 运算可能累积溢出
+            # 正常激活值 < 200，clamp 在 ±32000 留足余量，不会影响训练
+            if self.dtype == torch.float16:
+                h = torch.nan_to_num(h, nan=0.0, posinf=32000.0, neginf=-32000.0)
+                h = h.clamp(-32000.0, 32000.0)
 
         h = h.type(x.dtype)
         h = F.layer_norm(h, h.shape[-1:])
