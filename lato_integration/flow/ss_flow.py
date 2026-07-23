@@ -150,8 +150,8 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
                 )
                 coords = torch.stack(coords, dim=-1).reshape(-1, 3)
                 self.register_buffer("pos_emb", pos_embedder(coords))
-            # 输出层
-            self.out_layer = nn.Linear(final_ch, out_channels * patch_size ** 3)
+            # 输出层（零初始化，确保流匹配初始预测为零速度）
+            self.out_layer = zero_module(nn.Linear(final_ch, out_channels * patch_size ** 3))
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor,
                 **kwargs) -> torch.Tensor:

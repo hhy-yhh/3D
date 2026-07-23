@@ -59,7 +59,7 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
         self,
         *args,
         lambda_occupancy: float = 0.1,
-        aux_decode_every: int = 0,  # v3: 默认每步计算（轻量 head）
+        aux_decode_every: int = 0,  # 0=每步计算；NaN guard 自动跳过不稳定的步
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -121,6 +121,10 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             # 从预测的 velocity 恢复 x_0_pred
             x_0_pred = self._reconstruct_x0(x_t, pred, t)
 
+            # 🔧 clamp 防止 fp16 溢出：latent 值超出 fp16 范围 → Inf/NaN
+            # 正常 latent 在 [-10, 10] 内，clamp 到 [-50, 50] 留足余量
+            x_0_pred = x_0_pred.clamp(-50.0, 50.0)
+
             # LatoStructureHead: 16³ → 128³ occupancy
             # 🔧 使用 autocast (fp16) 节省显存 — 128³ 激活值巨大（~2GB @ fp32/B=4）
             with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
@@ -128,8 +132,10 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
                 occ_bce = F.binary_cross_entropy_with_logits(
                     occ_logits, ss_occupancy_128.float(), reduction='mean'
                 )
-            terms["occ_bce_128"] = occ_bce
-            terms["loss"] = terms["loss"] + self.lambda_occupancy * occ_bce
+            # 🔧 NaN 保护：辅助损失出 NaN 就跳过，不让它污染主损失
+            if torch.isfinite(occ_bce):
+                terms["occ_bce_128"] = occ_bce
+                terms["loss"] = terms["loss"] + self.lambda_occupancy * occ_bce
 
         # 按时间 bin 记录 loss
         mse_per_instance = torch.tensor([
