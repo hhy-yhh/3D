@@ -614,3 +614,90 @@ log_scale=20.0（硬编码）
 |------|------|
 | `trellis/trainers/basic.py` | 新增 `_consecutive_nan` 计数器；连续 NaN ≥ 10 步时强制 `log_scale -= 5`（原为 -1），最快 15-20 步内恢复 |
 | `trellis/trainers/base.py` | `log_show` 过滤后为空时用最后一条日志作为 fallback，避免 `dict_reduce` 崩溃 |
+
+### Bug 7: fp16 权重溢出 → 53 万步全部 NaN（🆕 2026-07-25 修复）
+
+**现象**：
+```
+log.txt: "mse": NaN, "loss": NaN  (持续 530k+ 步)
+checkpoint: 全部 24 层权重 NaN/Inf
+log_scale: 0 (抢救代码持续降 scale，但拦不住前向 NaN)
+```
+
+**根因链**：
+
+```
+use_fp16=True + 24层 transformer × fp16 + fp16_mode=inflat_all
+                    ↓
+fp32 master params 权重随训练漂移 → 某步超过 65504 (fp16 max)
+                    ↓
+master_params_to_model_params() 拷贝 fp32→fp16 → Inf
+  (trellis/trainers/utils.py:43 — 裸拷，无保护)
+                    ↓
+下一轮 forward: Inf 权重 → 全模型 NaN → log_scale 抢救跳过反向
+  → 但权重已是 Inf，再也回不去 → 530k 步全部白费
+```
+
+**诊断过程**：
+
+| 检查项 | 结果 |
+|--------|------|
+| SS latent 数据 (NPZ) | 干净，NaN=0 |
+| config `use_fp16` | `true` — 模型跑 fp16 |
+| config `fp16_mode` | `inflat_all` — trainer 会强制 `convert_to_fp16()` |
+| step 10000 checkpoint | 干净 |
+| step 20000+ checkpoint | 488 NaN/Inf params（全部 block 被污染） |
+
+**修复（方案 B：fp32 全精度）**：
+
+| 文件 | 修改 | 行号 |
+|------|------|------|
+| `flow/ss_flow.py` | ① `convert_to_fp16()` override — 检查 `self.use_fp16`，False 时调 `self.float()` 转 fp32 | 156-168 |
+| `flow/ss_flow.py` | ② forward 末尾输出 NaN guard — `nan_to_num` + `clamp` 兜底 | 234-236 |
+| `flow/ss_flow.py` | ③ `clamp_weights_fp16_safe()` — fp16 训练时每步钳制权重 ±65500，fp32 自动跳过 | 240-253 |
+| `flow/trainers/ss_flow_trainer.py` | ④ `run_step()` override — optimizer.step() 后调用 `clamp_weights_fp16_safe()` | 78-88 |
+| `configs/.../lato_ss_flow_v3.json` | ⑤ `"use_fp16": false` — 模型全 fp32 | — |
+
+**Resume 时 fp16→fp32 自动转换**：
+
+```
+load checkpoint (fp16 权重)
+  → load_state_dict(fp16 ckpt)          # 权重暂为 fp16
+  → model.convert_to_fp16()             # trainer 无条件调用 (basic.py:189)
+      → 我们的 override: use_fp16=False
+      → self.float()                    # 全部转 fp32
+  → optimizer state 正常恢复 (fp32)
+  → 从 step 10000 开始 fp32 训练
+```
+
+**启动命令**：
+
+```bash
+# 1. 改 config 为 fp32
+python3 -c "
+import json
+cfg = json.load(open('configs/generation/lato_ss_flow_v3.json'))
+cfg['models']['denoiser']['args']['use_fp16'] = False
+json.dump(cfg, open('configs/generation/lato_ss_flow_v3.json', 'w'), indent=2)
+print('Done: use_fp16 → False')
+"
+
+# 2. 删除被污染的 checkpoint（仅保留 step 10000）
+cd /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3/ckpts
+ls | grep -v step0010000 | xargs rm -f
+
+# 3. 从 step 10000 resume
+cd /data/huanghaoyang/3D/TRELLIS
+python lato_integration/run_train.py \
+    --config configs/generation/lato_ss_flow_v3.json \
+    --data_dir /data/huanghaoyang/3D/database_lato \
+    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3 \
+    --num_gpus 1 --auto_retry 0 --ckpt 10000
+```
+
+**验证收敛**：
+
+```bash
+tail -5 /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3/log.txt
+# mse 应从正常值开始，持续下降，不再 NaN
+```

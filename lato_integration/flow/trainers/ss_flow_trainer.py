@@ -75,6 +75,18 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             kwargs.pop(key, None)
         return super().get_inference_cond(cond, **kwargs)
 
+    def run_step(self, data_list):
+        """
+        🔧 在父类 run_step 后增加 fp16 权重安全钳制。
+        防止 fp32 master params → fp16 model params 拷贝时溢出变 Inf。
+        """
+        result = super().run_step(data_list)
+        # 钳制所有 fp16 模型权重到安全范围（< fp16 max 65504）
+        for model in self.models.values():
+            if hasattr(model, 'clamp_weights_fp16_safe'):
+                model.clamp_weights_fp16_safe()
+        return result
+
     def training_losses(
         self,
         x_0: torch.Tensor,

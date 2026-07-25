@@ -153,6 +153,20 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
             # 输出层（零初始化，确保流匹配初始预测为零速度）
             self.out_layer = zero_module(nn.Linear(final_ch, out_channels * patch_size ** 3))
 
+    def convert_to_fp16(self) -> None:
+        """
+        🔧 当 use_fp16=False 时拒绝 fp16 转换。
+
+        背景: BasicTrainer.load() 在 fp16_mode='inflat_all' 时会无条件调用
+        model.convert_to_fp16()，即使 config 中 use_fp16=False。
+        此重写检查 self.use_fp16：如果为 False，将模型转回 fp32 而非 fp16。
+        """
+        if not self.use_fp16:
+            self.float()  # 全部参数 → fp32（包括从 fp16 ckpt 加载的权重）
+            self.dtype = torch.float32
+            return
+        super().convert_to_fp16()
+
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor,
                 **kwargs) -> torch.Tensor:
         """
@@ -217,4 +231,24 @@ class EnhancedSSFlowModel(_SparseStructureFlowModel):
         )
         h = unpatchify(h, self.patch_size).contiguous()
 
+        # 🔧 fp16 输出安全钳：即使权重 Inf 也保输出有限
+        if not torch.isfinite(h).all():
+            h = torch.nan_to_num(h, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
+
         return h
+
+    def clamp_weights_fp16_safe(self, max_val: float = 65500.0) -> None:
+        """
+        🔧 将所有 fp16 权重钳制到安全范围，防止 float16 溢出变 Inf。
+
+        背景: fp32 master params → fp16 model params 拷贝时，
+        如果 fp32 值 > 65504 (fp16 max)，拷贝到 fp16 会直接变成 Inf。
+        Inf 权重一旦出现，整个 forward 全变 NaN，无法恢复。
+
+        此方法在每次 optimizer.step() 后调用，确保 fp16 权重永不超过安全上限。
+        """
+        import torch
+        with torch.no_grad():
+            for p in self.parameters():
+                if p.dtype == torch.float16:
+                    p.data.clamp_(-max_val, max_val)
