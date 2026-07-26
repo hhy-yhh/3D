@@ -357,7 +357,8 @@ def main():
     parser.add_argument("--k_neighbors", type=int, default=32,
                         help="KDTree 最近邻数，越小面越少")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--use_fp16", action="store_true", default=True)
+    parser.add_argument("--use_fp16", action="store_true", default=False,
+                    help="启用 FP16 推理（默认 FP32，与训练一致）")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
     parser.add_argument("--save_meshes", action="store_true", default=False,
