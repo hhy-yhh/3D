@@ -216,7 +216,23 @@ def load_pipeline(opt, device):
         structure_head.load_state_dict(sh_state, strict=False)
         print("  LatoStructureHead: 从 SS checkpoint 加载")
     else:
-        print("  LatoStructureHead: 使用随机初始化（未找到预训练权重）")
+        # v2: 尝试加载独立 structure_head_step*.pt（训练时单独保存）
+        import glob as _glob
+        sh_dir = os.path.dirname(opt.ss_ckpt)
+        sh_files = _glob.glob(os.path.join(sh_dir, "structure_head_step*.pt"))
+        if sh_files:
+            sh_files.sort(key=lambda p: int(''.join(c for c in os.path.basename(p).replace("structure_head_step","").replace(".pt","") if c.isdigit()) or 0))
+            sh_ckpt_path = sh_files[-1]
+            print(f"  LatoStructureHead: 从独立文件加载 ({os.path.basename(sh_ckpt_path)})")
+            sh_state = torch.load(sh_ckpt_path, map_location=device, weights_only=True)
+            if isinstance(sh_state, dict):
+                if 'denoiser' in sh_state and isinstance(sh_state['denoiser'], dict):
+                    sh_state = sh_state['denoiser']
+                elif 'state_dict' in sh_state:
+                    sh_state = sh_state['state_dict']
+            structure_head.load_state_dict(sh_state, strict=False)
+        else:
+            print("  LatoStructureHead: 使用随机初始化（未找到预训练权重）")
     structure_head.eval()
     pipeline.models["lato_structure_head"] = structure_head
 
