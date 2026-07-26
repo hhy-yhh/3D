@@ -185,12 +185,20 @@ def load_pipeline(opt, device):
         patch_size=1, pe_mode="ape", qk_rms_norm=True,
         use_fp16=opt.use_fp16,
     ).to(device)
-    ss_ckpt = torch.load(opt.ss_ckpt, map_location=device, weights_only=True)
-    if isinstance(ss_ckpt, dict):
-        ss_ckpt_state = ss_ckpt.get('state_dict', ss_ckpt.get('model', ss_ckpt))
+    ckpt_raw = torch.load(opt.ss_ckpt, map_location=device, weights_only=True)
+    # 兼容多种 ckpt 格式：裸 state_dict / {'state_dict':...} / TRELLIS misc
+    if isinstance(ckpt_raw, dict):
+        if 'denoiser' in ckpt_raw and isinstance(ckpt_raw['denoiser'], dict):
+            # TRELLIS misc 格式 — 权重在 denoiser 子 dict 中
+            ss_ckpt_state = ckpt_raw['denoiser']
+            if 'ema' in ckpt_raw and isinstance(ckpt_raw['ema'], dict) and 'denoiser' in ckpt_raw['ema']:
+                ss_ckpt_state = ckpt_raw['ema']['denoiser']
+                print("  (使用 EMA 权重)")
+        else:
+            ss_ckpt_state = ckpt_raw.get('state_dict', ckpt_raw.get('model', ckpt_raw))
     else:
-        ss_ckpt_state = ss_ckpt
-    ss_flow.load_state_dict(ss_ckpt_state)
+        ss_ckpt_state = ckpt_raw
+    ss_flow.load_state_dict(ss_ckpt_state, strict=False)
     ss_flow.eval()
     pipeline.models["sparse_structure_flow_model"] = ss_flow
 
@@ -200,9 +208,9 @@ def load_pipeline(opt, device):
     ).to(device)
     if opt.use_fp16:
         structure_head = structure_head.half()
-    # 尝试从 SS ckpt 提取 structure_head 权重
+    # 从 state_dict 提取 structure_head 权重（key 前缀 "structure_head."）
     sh_prefix = "structure_head."
-    if isinstance(ss_ckpt, dict) and any(k.startswith(sh_prefix) for k in ss_ckpt_state.keys()):
+    if any(k.startswith(sh_prefix) for k in ss_ckpt_state.keys()):
         sh_state = {k[len(sh_prefix):]: v for k, v in ss_ckpt_state.items()
                    if k.startswith(sh_prefix)}
         structure_head.load_state_dict(sh_state, strict=False)
@@ -220,10 +228,18 @@ def load_pipeline(opt, device):
         patch_size=2, num_io_res_blocks=2, io_block_channels=[128],
         pe_mode="ape", qk_rms_norm=True, use_fp16=opt.use_fp16,
     ).to(device)
-    slat_ckpt = torch.load(opt.slat_ckpt, map_location=device, weights_only=True)
-    if isinstance(slat_ckpt, dict):
-        slat_ckpt = slat_ckpt.get('state_dict', slat_ckpt.get('model', slat_ckpt))
-    slat_flow.load_state_dict(slat_ckpt)
+    slat_ckpt_raw = torch.load(opt.slat_ckpt, map_location=device, weights_only=True)
+    if isinstance(slat_ckpt_raw, dict):
+        if 'denoiser' in slat_ckpt_raw and isinstance(slat_ckpt_raw['denoiser'], dict):
+            slat_ckpt_state = slat_ckpt_raw['denoiser']
+            if 'ema' in slat_ckpt_raw and isinstance(slat_ckpt_raw['ema'], dict) and 'denoiser' in slat_ckpt_raw['ema']:
+                slat_ckpt_state = slat_ckpt_raw['ema']['denoiser']
+                print("  (使用 EMA 权重)")
+        else:
+            slat_ckpt_state = slat_ckpt_raw.get('state_dict', slat_ckpt_raw.get('model', slat_ckpt_raw))
+    else:
+        slat_ckpt_state = slat_ckpt_raw
+    slat_flow.load_state_dict(slat_ckpt_state, strict=False)
     slat_flow.eval()
     pipeline.models["slat_flow_model"] = slat_flow
 
