@@ -291,7 +291,9 @@ def sample_ss_lato(
     structure_head = pipeline.models['lato_structure_head']
     reso = flow_model.resolution  # 16
 
-    noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(pipeline.device)
+    dtype = next(flow_model.parameters()).dtype
+    noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso,
+                        dtype=dtype, device=pipeline.device)
     sampler_params = {**pipeline.sparse_structure_sampler_params, **sampler_params}
     z_s = pipeline.sparse_structure_sampler.sample(
         flow_model, noise, **cond, **sampler_params, verbose=True
