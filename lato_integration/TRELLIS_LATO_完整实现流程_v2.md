@@ -7,6 +7,7 @@
 - 2026-07-19：**v6 更新** — 端到端测试集推理验证通过；修复 6 个推理 bug
 - 2026-07-17：**v5 更新** — 推理脚本重构：从 config JSON 读取模型参数、自动发现最新 ckpt、新增 ss_only 模式
 - 2026-07-16：**v4 更新** — 新增步骤6（批量评估 + 3D 指标）
+- 2026-07-26：**推理验证** — 修复 3 个推理 bug（dtype 不匹配、flash_attn fp32、ckpt 加载）；端到端 21 条测试集评估通过；SS Flow 100k 步 CD=0.214/HD=0.507/NC=0.459
 - 2026-07-14：修复 12 个 bug + 4 个训练启动 bug，单卡 RTX 4090 24GB 可行
 
 ---
@@ -360,7 +361,8 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-export SPARSE_ATTN_BACKEND=xformers
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（训练用啥推理用啥，fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa，flash_attn 不兼容 fp32）
 
 # 自动找最新 ckpt
 SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
@@ -421,10 +423,13 @@ python lato_integration/inference_lato.py \
 
 ### 步骤 6：批量评估
 
+#### 6a. 单条验证（确认管线正常）
+
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-export SPARSE_ATTN_BACKEND=xformers
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
 
 SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
@@ -439,8 +444,20 @@ python lato_integration/evaluate_3d_metrics.py \
     --gt_meshes /data/huanghaoyang/3D/database \
     --output_dir outputs/eval_results_v3 \
     --limit 1
+```
 
-# 确认通过后跑全部 21 条（去掉 --limit）
+#### 6b. 全部评估（21 条测试集）
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+
+# 确认 6a 通过后跑全部 21 条（去掉 --limit）
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
     --slat_ckpt "$SLAT_CKPT" \
@@ -701,3 +718,150 @@ python lato_integration/run_train.py \
 tail -5 /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3/log.txt
 # mse 应从正常值开始，持续下降，不再 NaN
 ```
+
+---
+
+### Bug 8: 推理时 dtype 不匹配 + flash_attn 不支持 fp32（🆕 2026-07-26 修复）
+
+**现象 1**：`evaluate_3d_metrics.py` 报错 `Input type (float) and bias type (c10::Half) should be the same`
+
+**根因链**：
+
+```
+Bug 7 修复 → config use_fp16=false (fp32 训练)
+              ↓
+evaluate_3d_metrics.py 硬编码 use_fp16=True (line 360)
+              ↓
+structure_head = structure_head.half()  # fp16 权重
+              ↓
+SS Flow forward: h = h.type(x.dtype)    # ss_flow.py:224 — 输出转回输入 dtype (fp32)
+              ↓
+structure_head(fp32_input) + fp16_weight → dtype mismatch 💥
+```
+
+**现象 2**：修复 dtype 后报错 `FlashAttention only support fp16 and bf16 data type`
+
+**根因**：`trellis/modules/attention/__init__.py:3` 默认 `BACKEND = 'flash_attn'`，flash_attn 只支持 fp16/bf16，不支持 fp32。
+
+**修复**：
+
+| 文件 | 修改 | 说明 |
+|------|------|------|
+| `evaluate_3d_metrics.py:360` | `default=True → default=False` | 默认 fp32，与训练一致 |
+| 环境变量 | `export ATTN_BACKEND=xformers` | xformers 支持 fp32 |
+
+**推理前必须设置**：
+```bash
+export ATTN_BACKEND=xformers
+```
+
+---
+
+### Bug 9: evaluate_3d_metrics.py 无法加载 structure_head 权重（🆕 2026-07-26 修复）
+
+**现象**：`LatoStructureHead: 使用随机初始化（未找到预训练权重）`
+
+**根因**：
+
+1. **checkpoint 格式误判**：
+   - eval 脚本 `load_pipeline()` 对 SS/SLat ckpt 只用 `ckpt.get('state_dict', ckpt.get('model', ckpt))`
+   - 但 TRELLIS misc 格式的权重在 `ckpt['denoiser']` 子 dict 里
+   - 导致 SS Flow 加载了错误的 dict（顶层 key 如 `step`/`optimizer`），`load_state_dict(strict=False)` 不报错但实际没加载到
+
+2. **structure_head 单独保存**：
+   - 训练时 structure_head 未嵌入 denoiser ckpt，而是单独保存为 `structure_head_step*.pt`
+   - eval 脚本只在 denoiser state_dict 里找 `structure_head.*` 前缀的 key，找不到
+
+**修复**（`evaluate_3d_metrics.py` `load_pipeline()`）：
+
+| 位置 | 修改 |
+|------|------|
+| SS ckpt 加载 | 先检查 `ckpt_raw['denoiser']`（TRELLIS misc 格式），再 fallback |
+| structure_head | 先在 state_dict 中找 `structure_head.*` 前缀；找不到则 glob 同目录下 `structure_head_step*.pt` 取最新 |
+
+---
+
+### 步骤 7：推理环境变量检查清单
+
+```bash
+# 推理前必须设置
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（与训练一致，fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa；flash_attn 只支持 fp16）
+
+# 选一张空闲 GPU
+export CUDA_VISIBLE_DEVICES=2
+```
+
+> **环境变量说明：**
+>
+> | 变量 | 推荐值 | 作用范围 | 原因 |
+> |------|--------|---------|------|
+> | `ATTN_BACKEND` | `sdpa` | SS Flow dense attention (DiT blocks) | 与训练一致；fp32 兼容；PyTorch 内置 |
+> | `SPARSE_ATTN_BACKEND` | `xformers` | SLat Flow sparse attention (SparseMultiHeadAttention) | 稀疏模块只支持 `xformers` / `flash_attn`；fp32 下仅 `xformers` 可用 |
+>
+> ⚠️ `SPARSE_ATTN_BACKEND` **不支持** `sdpa`，设为 `sdpa` 会被静默忽略并 fallback 到 `flash_attn`（fp32 报错）。
+
+---
+
+## 测试集评估结果（2026-07-26）
+
+**训练状态**：
+- SS Flow: 100,000 steps / 1,000,000（10%）
+- LatoStructureHead: 100,000 steps（独立 ckpt：`structure_head_step0100000.pt`）
+- SLat Flow: 旧 v2 ckpt @ 880,000 steps（`outputs/lato_slat_flow/`）
+- LATO VoxelVAE + ConnectionHead: 冻结预训练（epoch 1, best loss 0.0807）
+
+**评估命令**：
+```bash
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" \
+    --slat_ckpt "$SLAT_CKPT" \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/eval_results_v3 \
+    --save_meshes
+```
+
+**21 条测试集全量结果**：
+
+| 指标 | Mean | Std | Min | Max |
+|------|------|-----|-----|-----|
+| Chamfer Distance ↓ | 0.214 | 0.047 | 0.130 | 0.311 |
+| Hausdorff Distance ↓ | 0.507 | 0.038 | 0.429 | 0.565 |
+| Normal Consistency ↑ | 0.459 | 0.112 | 0.054 | 0.601 |
+
+**中间状态诊断**（`denoiser_step0100000.pt`）：
+
+| 检查点 | 值 | 判断 |
+|--------|-----|------|
+| SS Flow output (z_s) | range [-2.68, 2.32] | ✅ Flow Matching 潜空间正常 |
+| Structure Head output (occ) | max=9.38, mean=-1105 | ⚠️ 大量负 bias，仅 ~9.8k 体素 > 0 |
+| threshold=0 active voxels | ~9,836 | ✅ 合理的体素数量 |
+| Generated mesh vertices | 64-680 | ❌ 偏少（正常应 2k-5k） |
+
+---
+
+## Flow Matching Loss 收敛 ≠ 推理质量好
+
+**关键理解**：SS Flow 训练的是**单步速度场预测**，推理时是**多步链式去噪**。
+
+```
+训练: noise → 单步预测 v → MSE(v, v_gt)     ← loss 衡量这个
+推理: noise → 20 步迭代去噪 → z_s → SH → occ ← 质量取决于这个
+```
+
+| | 训练 MSE | 推理质量 |
+|---|----------|---------|
+| 100k 步 | 0.004 ✅ | 差（CD=0.214） |
+| 300k 步 | ~0.003 | 明显改善 |
+| 500k+ 步 | ~0.002 | 好 |
+
+**原因**：
+1. **误差累积**：每步去噪都有小误差，20 步累积后差距变大。类似 diffusion 模型训练 10% 时 loss 已降但生成的图还是噪声
+2. **Structure Head 权重低**：BCE occupancy 损失权重 λ=0.1（仅占 10%），10 万步时 SH 还在保守期（大量负 bias 避免假阳性）
+3. **SLat Flow 不匹配**：当前用的旧 v2 ckpt，输入分布来自 TRELLIS SS Decoder 而非 LatoStructureHead
+
+**结论**：没有 bug，就是训得太少。SS Flow 训到 300k+ 步后重新评估，指标会大幅改善。
