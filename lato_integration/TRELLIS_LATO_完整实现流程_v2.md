@@ -173,7 +173,7 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
   └─→ 步骤4 (训练 SLat Flow) ←─────────────────────────────────────────┘
           │
           ▼
-      步骤5 (单条推理) ─→ 步骤6 (批量评估)
+      步骤5 (单条推理) ─→ 步骤6 (完整推理)
 ```
 
 **步骤 3 和 4 可以同时跑**（两张不同 GPU），SLat Flow 训练不依赖 SS Flow 输出。
@@ -356,85 +356,18 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ---
 
-### 步骤 5：单条推理验证
+### 步骤 5：单条推理
 
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-export ATTN_BACKEND=sdpa                # dense attention: SDPA（训练用啥推理用啥，fp32 兼容）
-export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa，flash_attn 不兼容 fp32）
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（与训练一致，fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa；flash_attn 只支持 fp16）
 
 # 自动找最新 ckpt
 SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
-# 完整推理（SS + SLat + LATO → mesh）
-python lato_integration/inference_lato.py \
-    --ss_ckpt "$SS_CKPT" \
-    --slat_ckpt "$SLAT_CKPT" \
-    --prompt "A brake caliper fixing interaxis 116.32 inner pad 222.29 pistons_num 6" \
-    --seed 42 \
-    --output output_v3.obj
-
-# SS-only 模式（只验证 SS Flow + LatoStructureHead）
-python lato_integration/inference_lato.py \
-    --mode ss_only \
-    --ss_ckpt "$SS_CKPT" \
-    --prompt "A brake caliper"
-```
-
-**常用调参：**
-
-```bash
-# 边太少（mesh 有洞）→ 降低边阈值
---edge_threshold 0.3
-
-# 边太多（噪声面过多）→ 提高边阈值
---edge_threshold 0.5
-
-# VoxelVAE decode 保留更多/更少顶点
---lato_threshold 0.1   # 更多顶点
---lato_threshold 0.3   # 更少顶点
-```
-
-**全部参数：**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--mode` | `full` | `full`=完整管线, `ss_only`=仅 SS Flow + LatoStructureHead |
-| `--ss_ckpt` | 无 | SS Flow checkpoint 路径（含 LatoStructureHead） |
-| `--slat_ckpt` | 无 | SLat Flow checkpoint 路径 |
-| `--ss_dir` | 无 | 自动发现：SS Flow 训练输出目录 |
-| `--slat_dir` | 无 | 自动发现：SLat Flow 训练输出目录 |
-| `--lato_ckpt` | `$LATO_ROOT/.../vae_128to512.pt` | LATO VAE checkpoint |
-| `--lato_config` | `$LATO_ROOT/.../infer_vae_512.yaml` | LATO VAE config |
-| `--prompt` | 刹车卡钳示例 | 文本描述 |
-| `--output` | `output_mesh.obj` | 输出 mesh 路径 |
-| `--seed` | 42 | 随机种子 |
-| `--ss_steps` | 20 | SS Flow 采样步数 |
-| `--slat_steps` | 20 | SLat Flow 采样步数 |
-| `--cfg_strength` | 5.0 | CFG 强度 |
-| `--lato_threshold` | 0.2 | VoxelVAE decode threshold |
-| `--edge_threshold` | 0.45 | ConnectionHead 边概率阈值 |
-| `--k_neighbors` | 32 | KDTree 最近邻数 |
-| `--no_fp16` | false | 禁用 FP16（调试用） |
-
----
-
-### 步骤 6：批量评估
-
-#### 6a. 单条验证（确认管线正常）
-
-```bash
-cd /data/huanghaoyang/3D/TRELLIS
-export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
-export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
-
-SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
-
-# 先跑 1 条验证管线
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
     --slat_ckpt "$SLAT_CKPT" \
@@ -446,7 +379,8 @@ python lato_integration/evaluate_3d_metrics.py \
     --limit 1
 ```
 
-#### 6b. 全部评估（21 条测试集）
+---
+### 步骤 6：完整推理
 
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
@@ -457,7 +391,7 @@ export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（�
 SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
-# 确认 6a 通过后跑全部 21 条（去掉 --limit）
+# 确认步骤 5 单条通过后跑全部 21 条（去掉 --limit）
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
     --slat_ckpt "$SLAT_CKPT" \
@@ -748,11 +682,12 @@ structure_head(fp32_input) + fp16_weight → dtype mismatch 💥
 | 文件 | 修改 | 说明 |
 |------|------|------|
 | `evaluate_3d_metrics.py:360` | `default=True → default=False` | 默认 fp32，与训练一致 |
-| 环境变量 | `export ATTN_BACKEND=xformers` | xformers 支持 fp32 |
+| 环境变量 | `export ATTN_BACKEND=sdpa` + `export SPARSE_ATTN_BACKEND=xformers` | dense attn 用 sdpa（与训练一致），sparse attn 用 xformers（fp32 兼容） |
 
 **推理前必须设置**：
 ```bash
-export ATTN_BACKEND=xformers
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（与训练一致，fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa；flash_attn 只支持 fp16）
 ```
 
 ---
@@ -814,6 +749,14 @@ export CUDA_VISIBLE_DEVICES=2
 
 **评估命令**：
 ```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
+export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
     --slat_ckpt "$SLAT_CKPT" \
