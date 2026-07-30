@@ -141,8 +141,14 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             # 🔧 使用 autocast (fp16) 节省显存 — 128³ 激活值巨大（~2GB @ fp32/B=4）
             with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
                 occ_logits = self.training_models['structure_head'](x_0_pred)
+                # 🔧 pos_weight 补偿极端正负样本不平衡（~1:200）
+                # 不加 pos_weight 时 out_conv.bias 会学到 ~-1105，正样本无法跨过 0 阈值
+                n_pos = ss_occupancy_128.sum().clamp(min=1)
+                n_neg = ss_occupancy_128.numel() - n_pos
+                pos_weight = (n_neg / n_pos).clamp(1.0, 500.0)
                 occ_bce = F.binary_cross_entropy_with_logits(
-                    occ_logits, ss_occupancy_128.float(), reduction='mean'
+                    occ_logits, ss_occupancy_128.float(),
+                    reduction='mean', pos_weight=pos_weight,
                 )
             # 🔧 NaN 保护：辅助损失出 NaN 就跳过，不让它污染主损失
             if torch.isfinite(occ_bce):

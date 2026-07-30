@@ -810,6 +810,10 @@ def main():
     else:
         vertex_coords_3d = vertex_coords_4d.float()
 
+    if vertex_coords_3d.numel() == 0:
+        print("[ERROR] 模型输出空顶点（欠训练或 prompt 偏差过大），无法构建 mesh")
+        sys.exit(1)
+
     # 归一化坐标到 [-0.5, 0.5]
     if vertex_coords_3d.max() > 1.0:
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"]

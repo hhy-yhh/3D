@@ -322,6 +322,9 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_t
     else:
         vertex_coords_3d = vertex_coords_4d.float()
 
+    if vertex_coords_3d.numel() == 0:
+        return None
+
     if vertex_coords_3d.max() > 1.0:
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"]
         vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
