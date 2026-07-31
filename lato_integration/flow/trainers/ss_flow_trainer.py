@@ -138,18 +138,21 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             x_0_pred = x_0_pred.clamp(-50.0, 50.0)
 
             # LatoStructureHead: 16³ → 128³ occupancy
-            # 🔧 使用 autocast (fp16) 节省显存 — 128³ 激活值巨大（~2GB @ fp32/B=4）
+            # 🔧 autocast fp16 用于前向（节省 128³ 激活显存），
+            # 但 BCE 必须在 fp32 计算 — stage2/3 中间激活值超 fp16 上限 65504 → Inf
             with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
                 occ_logits = self.training_models['structure_head'](x_0_pred)
-                # 🔧 pos_weight 补偿极端正负样本不平衡（~1:200）
-                # 不加 pos_weight 时 out_conv.bias 会学到 ~-1105，正样本无法跨过 0 阈值
-                n_pos = ss_occupancy_128.sum().clamp(min=1)
-                n_neg = ss_occupancy_128.numel() - n_pos
-                pos_weight = (n_neg / n_pos).clamp(1.0, 500.0)
-                occ_bce = F.binary_cross_entropy_with_logits(
-                    occ_logits, ss_occupancy_128.float(),
-                    reduction='mean', pos_weight=pos_weight,
-                )
+            # 🔧 转 fp32 + clamp，防止 fp16 溢出导致 Inf → NaN → 被跳过
+            occ_logits = occ_logits.float().clamp(-50.0, 50.0)
+            # 🔧 pos_weight 补偿极端正负样本不平衡（~1:200）
+            # 不加 pos_weight 时 out_conv.bias 会学到 ~-1105，正样本无法跨过 0 阈值
+            n_pos = ss_occupancy_128.sum().clamp(min=1)
+            n_neg = ss_occupancy_128.numel() - n_pos
+            pos_weight = (n_neg / n_pos).clamp(1.0, 500.0)
+            occ_bce = F.binary_cross_entropy_with_logits(
+                occ_logits, ss_occupancy_128.float(),
+                reduction='mean', pos_weight=pos_weight,
+            )
             # 🔧 NaN 保护：辅助损失出 NaN 就跳过，不让它污染主损失
             if torch.isfinite(occ_bce):
                 terms["occ_bce_128"] = occ_bce
