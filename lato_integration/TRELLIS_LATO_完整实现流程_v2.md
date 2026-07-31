@@ -904,6 +904,62 @@ python lato_integration/evaluate_3d_metrics.py \
 | ~50k 步 | ~2 天 | 基本收敛，推理指标明显改善 |
 | ~100k 步 | ~4-5 天 | 充分收敛 |
 
+### Bug 12: StructureHead 前向 fp16 溢出 — occ_bce 7 步后消失（🆕 2026-07-31 修复）
+
+**现象**：
+
+- 重置全部 StructureHead 权重 + resume 后，`occ_bce_128` 仅在前 7 步出现
+- 随后完全消失，loss == mse（occ_bce 未参与）
+- occ_bce 值快速下降：0.716 → 0.686 → 0.658 → 0.543 → 0.434 → 0.180 → 0.046 → 消失
+
+**根因链**：
+
+```
+StructureHead: 3 级 2× 上采样 (16³ → 32³ → 64³ → 128³), base_channels=256
+                    ↓
+每个 stage 的 3³ 卷积累积放大中间激活值:
+  stage1: 50 × 3³ ×   8 × 0.04 ≈   432      (fp16 安全)
+  stage2: 432 × 3³ × 256 × 0.02 ≈  59,719   (接近 fp16 上限 65504)
+  stage3: 59k × 3³ × 128 × 0.01 ≈ 2,060,524 (远超 fp16 上限!)
+                    ↓
+training_losses 中 torch.autocast(fp16) 包裹 StructureHead 前向
+  → stage3 中间激活 → Inf (fp16 overflow)
+  → occ_logits = Inf
+                    ↓
+  → BCE(Inf, ...) = Inf
+  → torch.isfinite(Inf) → False
+  → occ_bce 静默跳过，不写 log
+```
+
+**为什么前 7 步能工作**：
+
+- 重置后的 kaiming 权重初始值较小，中间激活刚好在 fp16 边界内
+- 7 步梯度更新后权重略微增长 → 突破临界点 → 第 8 步起全 Inf
+
+**修复**（`ss_flow_trainer.py`）：
+
+```python
+# 修复前
+with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
+    occ_logits = self.training_models['structure_head'](x_0_pred)
+    n_pos = ss_occupancy_128.sum().clamp(min=1)
+    ...
+    occ_bce = F.binary_cross_entropy_with_logits(
+        occ_logits, ss_occupancy_128.float(), ...)
+
+# 修复后
+with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
+    occ_logits = self.training_models['structure_head'](x_0_pred)
+# 🔧 BCE 移到 autocast 外 + fp32 clamp
+occ_logits = occ_logits.float().clamp(-50.0, 50.0)
+n_pos = ss_occupancy_128.sum().clamp(min=1)
+...
+occ_bce = F.binary_cross_entropy_with_logits(
+    occ_logits, ss_occupancy_128.float(), ...)
+```
+
+> **设计说明**：autocast 保留给 StructureHead 前向（节省 128³ 激活显存），BCE 计算移到外面用 fp32。`sigmoid(±50)` 已饱和，clamp 无损精度。
+
 ---
 
 ### 步骤 7：推理环境变量检查清单

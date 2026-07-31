@@ -142,8 +142,9 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             # 但 BCE 必须在 fp32 计算 — stage2/3 中间激活值超 fp16 上限 65504 → Inf
             with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
                 occ_logits = self.training_models['structure_head'](x_0_pred)
-            # 🔧 转 fp32 + clamp，防止 fp16 溢出导致 Inf → NaN → 被跳过
-            occ_logits = occ_logits.float().clamp(-50.0, 50.0)
+            # 🔧 转 fp32 + nan_to_num：fp16 autocast 中 stage2/3 激活全超 65504 → Inf
+            # Inf + 正常权重 → NaN（例如 0 × Inf）。clamp 拦不住 NaN（NaN.clamp 仍是 NaN）
+            occ_logits = torch.nan_to_num(occ_logits.float(), nan=0.0, posinf=50.0, neginf=-50.0)
             # 🔧 pos_weight 补偿极端正负样本不平衡（~1:200）
             # 不加 pos_weight 时 out_conv.bias 会学到 ~-1105，正样本无法跨过 0 阈值
             n_pos = ss_occupancy_128.sum().clamp(min=1)
