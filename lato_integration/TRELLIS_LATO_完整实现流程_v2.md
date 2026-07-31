@@ -777,6 +777,133 @@ torch.save(ckpt, '$SH_CKPT')
 
 > ⚠️ SS Flow (denoiser) 权重不受影响，Flow Matching MSE 独立于 StructureHead，**无需重置 SS Flow**。
 
+### Bug 11: 仅重置 bias 不够 — Stage Conv 权重仍然在生产极端负值（🆕 2026-07-31 修复）
+
+**现象**：
+
+- 重置 `out_conv.bias` 为 0 后 resume，log 中 `occ_bce_128` 仍然不存在
+- 507k+ 步无任何 occ_bce 产出
+
+**诊断**：
+
+```
+加载 StructureHead ckpt (bias=0) + 随机 latent 输入
+  → occ_logits: mean=-425,476, min=-1,727,389, max=8.75
+  → >0 voxels: 2
+```
+
+| | 随机初始化 | 当前 ckpt (bias=0) |
+|------|----------|---------|
+| occ_logits mean | **0.10** | **-432,648** |
+| >0 voxels | 2,090,113 | **2** |
+
+**根因链**：
+
+```
+Bug 10 修复前 107k 步训练（无 pos_weight）
+  → conv 学会将一切输入推到极端负值（配合 out_conv.bias ≈ -1105）
+  → 只重置 out_conv.bias → 0，但 stage1/2/3 conv 权重仍是坏的
+  → conv 输出仍然 ~ -432k
+  → training_losses 中 StructureHead 走 torch.autocast (fp16)
+  → -432k 超出 fp16 上限 65504 → Inf
+  → BCE output → Inf
+  → torch.isfinite(occ_bce) → False → 静默跳过
+  → occ_bce 永远不会写 log
+```
+
+**修复**：重置全部 StructureHead 权重（不只是 bias）：
+
+```bash
+python3 << 'EOF'
+import torch, torch.nn as nn
+
+ckpt_path = 'outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt'
+ckpt = torch.load(ckpt_path, map_location='cpu')
+
+for k in list(ckpt.keys()):
+    if 'weight' in k:
+        nn.init.kaiming_normal_(ckpt[k])
+    elif 'bias' in k:
+        ckpt[k].zero_()
+    print(f'{k}: reinit')
+
+torch.save(ckpt, ckpt_path)
+print('Done.')
+EOF
+```
+
+> ⚠️ StructureHead 需要从零开始学习（SS Flow 不受影响）。预计 50k 步收敛（~2 天）。
+
+### StructureHead 恢复训练与验证计划（2026-07-31）
+
+**启动训练**：
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
+    --config configs/generation/lato_ss_flow_v3.json \
+    --data_dir /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/lato_ss_flow_v3 \
+    --num_gpus 1 --ckpt 500000
+```
+
+**阶段 1 — 30 分钟后验证 occ_bce 恢复**：
+
+```bash
+tail -5 outputs/lato_ss_flow_v3/log.txt | grep -o "occ_bce_[^,}]*"
+```
+
+**阶段 2 — ~1 天后（~20k 步）验证 StructureHead 输出正常**：
+
+```bash
+python3 -c "
+import torch
+from lato_integration.structure_head import LatoStructureHead
+import glob, os
+
+ckpt = sorted(glob.glob('outputs/lato_ss_flow_v3/ckpts/structure_head_step*.pt'))[-1]
+head = LatoStructureHead(in_channels=8, base_channels=256).cuda()
+head.load_state_dict(torch.load(ckpt, map_location='cuda'))
+
+x = torch.randn(1, 8, 16, 16, 16).cuda() * 2
+with torch.no_grad():
+    occ = head(x)
+    print(f'Occ logits mean: {occ.mean():.2f}')       # 应在 ±5 以内
+    print(f'Active voxels (>0): {(occ>0).sum().item()}')  # 应在几万到几十万
+"
+```
+
+**阶段 3 — ~2 天后（~50k 步）推理验证质量**：
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=xformers
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
+
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" \
+    --slat_ckpt "$SLAT_CKPT" \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/eval_results_v3 \
+    --save_meshes --limit 1
+```
+
+**训练恢复时间线**：
+
+| 步数 | 时间 | 标志 |
+|------|------|------|
+| 几百步 | ~30 分钟 | `occ_bce_128` 出现在 log |
+| ~20k 步 | ~1 天 | StructureHead occ_logits 恢复正常范围（±5） |
+| ~50k 步 | ~2 天 | 基本收敛，推理指标明显改善 |
+| ~100k 步 | ~4-5 天 | 充分收敛 |
+
 ---
 
 ### 步骤 7：推理环境变量检查清单
@@ -871,3 +998,56 @@ python lato_integration/evaluate_3d_metrics.py \
 3. **SLat Flow 不匹配**：当前用的旧 v2 ckpt，输入分布来自 TRELLIS SS Decoder 而非 LatoStructureHead
 
 **结论**：没有 bug，就是训得太少。SS Flow 训到 300k+ 步后重新评估，指标会大幅改善。
+
+---
+
+## 推理验证结果（2026-07-31）
+
+**训练状态（Bug 11 修复前）**：
+- SS Flow: 507,500 steps / 1,000,000（50%），mse ~0.001
+- StructureHead: 500,000 steps（**conv 权重被 107k 步无 pos_weight 训练污染，仅 bias 被重置**）
+- SLat Flow: 旧 v2 ckpt @ 880,000 steps（`outputs/lato_slat_flow/`）
+- log: 无 NaN，log_scale 稳定在 20.0
+- occ_bce_128: **消失于 step 106,920，此后 40 万步不存在**
+
+**单条推理结果**（limit=1，StructureHead 输出 ~ -432k）：
+
+| 指标 | 2026-07-26 (100k步) | 2026-07-31 (507k步) | 变化 |
+|------|---------------------|---------------------|:--:|
+| Chamfer Distance ↓ | 0.214 | 0.265 | 📉 SS Flow 与解码头分布偏移 |
+| Hausdorff Distance ↓ | 0.507 | 0.541 | 📉 同上 |
+| Normal Consistency ↑ | 0.459 | 0.530 | 📈 SS Flow 自身去噪质量提升 |
+
+**根因诊断**：
+
+```
+StructureHead ckpt (bias=0, conv 权重 = 坏):
+  occ_logits mean = -432,648  ← conv 输出极端负值
+  >0 voxels = 2 / 2,097,152   ← 几乎全部被压制
+
+训练时 autocast fp16: -432k → Inf → BCE Inf → NaN guard 跳过 → occ_bce 不写 log
+```
+
+**修复**：Bug 11 — 全部 StructureHead conv 权重 + bias 重新初始化，从 step 500,000 resume 训练。预计 ~50k 步收敛（~2 天）。
+
+**当前步骤（2026-07-31）**：
+
+```bash
+# 1. 重置 StructureHead 全部权重
+python3 << 'EOF'
+import torch, torch.nn as nn
+ckpt = torch.load('outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt', map_location='cpu')
+for k in list(ckpt.keys()):
+    if 'weight' in k: nn.init.kaiming_normal_(ckpt[k])
+    elif 'bias' in k: ckpt[k].zero_()
+torch.save(ckpt, 'outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt')
+EOF
+
+# 2. Resume 训练
+cd /data/huanghaoyang/3D/TRELLIS
+CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
+    --config configs/generation/lato_ss_flow_v3.json \
+    --data_dir /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/lato_ss_flow_v3 \
+    --num_gpus 1 --ckpt 500000
+```
