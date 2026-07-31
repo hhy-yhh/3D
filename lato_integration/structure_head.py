@@ -144,7 +144,7 @@ def coords_from_occupancy(
     Returns:
         coords: [N, 4] tensor，列顺序 [batch_idx, x, y, z]（int）。
     """
-    # argwhere 返回 [N, 4] 列: [B_idx, X, Y, Z]
-    coords = torch.argwhere(logits > threshold)
+    # argwhere 返回 [N, 5] 列: [B, C, X, Y, Z]，去掉 channel 列 → [N, 4]: [B, X, Y, Z]
+    coords = torch.argwhere(logits > threshold)[:, [0, 2, 3, 4]]
     # argwhere 输出可能是 long，转为 int 与 TRELLIS 保持一致
     return coords.int()

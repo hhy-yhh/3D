@@ -716,6 +716,69 @@ export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（�
 
 ---
 
+### Bug 10: StructureHead 训练无效 — BCE 缺少 `pos_weight`（🆕 2026-07-30 修复）
+
+**现象**：
+
+- 训练 40 万步后 `out_conv.bias ≈ -1105`，`occ_logits.mean ≈ -1105`
+- 仅 ~9.8k 体素 > 0，部分样本全部 < 0 → VoxelVAE 收到空 coords → 空顶点 → 崩溃
+- 推理指标 CD=0.214，远低于预期
+
+**根因**：
+
+```
+Occupancy BCE 正负样本比 = 1:200（128³ 中 ~10k occupied vs ~2M empty）
+                    ↓
+F.binary_cross_entropy_with_logits(reduction='mean', pos_weight=None)
+                    ↓
+99.5% 负样本 ≈ 对 loss 贡献 0（输出负值即可正确）
+ 0.5% 正样本 → 需要跨过 0 阈值，但梯度 ≈ 1.0 × lr=1e-4 / 步
+                    ↓
+模型学到捷径: out_conv.bias → -1105，所有特征输出被压制
+从 -1105 恢复到 0 需要 1100 万步 → 40 万步远远不够
+                    ↓
+StructureHead 功能完全失效
+```
+
+> **责任归属**：这是 v3 架构设计时引入的训练代码 bug。原版 TRELLIS 和 LATO 均无 StructureHead + occupancy BCE 这套组件，`pos_weight` 缺失是生成 `ss_flow_trainer.py` 时的疏忽。
+
+**修复**（`lato_integration/flow/trainers/ss_flow_trainer.py`）：
+
+```python
+# 修复前
+occ_bce = F.binary_cross_entropy_with_logits(
+    occ_logits, ss_occupancy_128.float(), reduction='mean'
+)
+
+# 修复后 — 动态 pos_weight 补偿正负不平衡
+n_pos = ss_occupancy_128.sum().clamp(min=1)
+n_neg = ss_occupancy_128.numel() - n_pos
+pos_weight = (n_neg / n_pos).clamp(1.0, 500.0)
+occ_bce = F.binary_cross_entropy_with_logits(
+    occ_logits, ss_occupancy_128.float(),
+    reduction='mean', pos_weight=pos_weight,
+)
+```
+
+**已有 ckpt 修复**：
+
+```bash
+# StructureHead 独立保存，需单独重置所有 bias
+SH_CKPT=outputs/lato_ss_flow_v3/ckpts/structure_head_step0400000.pt
+python3 -c "
+import torch
+ckpt = torch.load('$SH_CKPT', map_location='cpu')
+for k, v in ckpt.items():
+    if 'bias' in k and v.ndim == 1:
+        v.zero_()
+torch.save(ckpt, '$SH_CKPT')
+"
+```
+
+> ⚠️ SS Flow (denoiser) 权重不受影响，Flow Matching MSE 独立于 StructureHead，**无需重置 SS Flow**。
+
+---
+
 ### 步骤 7：推理环境变量检查清单
 
 ```bash
