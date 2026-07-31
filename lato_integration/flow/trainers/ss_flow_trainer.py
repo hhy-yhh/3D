@@ -138,13 +138,11 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
             x_0_pred = x_0_pred.clamp(-50.0, 50.0)
 
             # LatoStructureHead: 16³ → 128³ occupancy
-            # 🔧 autocast fp16 用于前向（节省 128³ 激活显存），
-            # 但 BCE 必须在 fp32 计算 — stage2/3 中间激活值超 fp16 上限 65504 → Inf
-            with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
+            # 🔧 禁用 autocast — stage2/3 128³ 激活全超 fp16 范围 → Inf/NaN
+            #    nan_to_num 只能修前向，反向 checkpoint 重新计算时激活再次 Inf → 梯度废掉
+            with torch.autocast(device_type='cuda', enabled=False):
                 occ_logits = self.training_models['structure_head'](x_0_pred)
-            # 🔧 转 fp32 + nan_to_num：fp16 autocast 中 stage2/3 激活全超 65504 → Inf
-            # Inf + 正常权重 → NaN（例如 0 × Inf）。clamp 拦不住 NaN（NaN.clamp 仍是 NaN）
-            occ_logits = torch.nan_to_num(occ_logits.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+            occ_logits = occ_logits.clamp(-50.0, 50.0)
             # 🔧 pos_weight 补偿极端正负样本不平衡（~1:200）
             # 不加 pos_weight 时 out_conv.bias 会学到 ~-1105，正样本无法跨过 0 阈值
             n_pos = ss_occupancy_128.sum().clamp(min=1)
