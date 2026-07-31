@@ -904,13 +904,44 @@ python lato_integration/evaluate_3d_metrics.py \
 | ~50k 步 | ~2 天 | 基本收敛，推理指标明显改善 |
 | ~100k 步 | ~4-5 天 | 充分收敛 |
 
-### Bug 12: StructureHead 前向 fp16 溢出 — occ_bce 7 步后消失（🆕 2026-07-31 修复）
+### Bug 12: StructureHead autocast fp16 溢出 — occ_bce 7 步后消失（🆕 2026-07-31 修复）
 
 **现象**：
 
 - 重置全部 StructureHead 权重 + resume 后，`occ_bce_128` 仅在前 7 步出现
 - 随后完全消失，loss == mse（occ_bce 未参与）
 - occ_bce 值快速下降：0.716 → 0.686 → 0.658 → 0.543 → 0.434 → 0.180 → 0.046 → 消失
+
+**验证方法（CPU fp32 检测）**：
+
+```bash
+python3 << 'EOF'
+import torch, sys
+sys.path.insert(0, '/data/huanghaoyang/3D/TRELLIS')
+from lato_integration.structure_head import LatoStructureHead
+
+ckpt = torch.load('outputs/lato_ss_flow_v3/ckpts/structure_head_step0510000.pt', map_location='cpu')
+head = LatoStructureHead(in_channels=8, base_channels=256)
+head.load_state_dict(ckpt)
+x = torch.randn(1, 8, 16, 16, 16) * 2
+
+with torch.no_grad():
+    occ = head(x)
+    print(f'FP32: mean={occ.mean():.0f}, min={occ.min():.0f}, max={occ.max():.0f}')
+    outside = (occ.abs() > 65500).sum().item()
+    print(f'Outside fp16 range (>65500): {outside} / {occ.numel()}')
+    if outside > 0:
+        print('❌ 值超出 fp16 范围 → autocast 下变 Inf')
+EOF
+```
+
+**实测输出**：
+
+```
+FP32: mean=-15527331, min=-23029436, max=-89916
+Outside fp16 range (>65500): 2097152 / 2097152
+❌ 100% 的值超出 fp16 范围 — autocast 下全部变 Inf
+```
 
 **根因链**：
 
@@ -922,43 +953,38 @@ StructureHead: 3 级 2× 上采样 (16³ → 32³ → 64³ → 128³), base_chan
   stage2: 432 × 3³ × 256 × 0.02 ≈  59,719   (接近 fp16 上限 65504)
   stage3: 59k × 3³ × 128 × 0.01 ≈ 2,060,524 (远超 fp16 上限!)
                     ↓
-training_losses 中 torch.autocast(fp16) 包裹 StructureHead 前向
-  → stage3 中间激活 → Inf (fp16 overflow)
-  → occ_logits = Inf
-                    ↓
-  → BCE(Inf, ...) = Inf
-  → torch.isfinite(Inf) → False
-  → occ_bce 静默跳过，不写 log
+training_losses 中 torch.autocast(fp16) 包裹 StructureHead
+  → 前向: stage3 激活全部 Inf → occ_logits = Inf
+  → BCE(Inf, ...) = Inf → isfinite=False → occ_bce 不写 log
+  → 🔁 反向: torch.checkpoint 重新计算 stage3 激活 → 再次 Inf
+  → Inf 梯度污染 conv 权重 → 权重无法学习
 ```
 
-**为什么前 7 步能工作**：
-
-- 重置后的 kaiming 权重初始值较小，中间激活刚好在 fp16 边界内
-- 7 步梯度更新后权重略微增长 → 突破临界点 → 第 8 步起全 Inf
-
-**修复**（`ss_flow_trainer.py`）：
+**失败的尝试：只把 BCE 移到 autocast 外面**
 
 ```python
-# 修复前
+# ❌ 不够: nan_to_num/clamp 只能修前向 BCE，反向用 checkpoint 重新计算时
+# StructureHead 激活仍然在 fp16 下溢出 → 梯度废掉
 with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
     occ_logits = self.training_models['structure_head'](x_0_pred)
-    n_pos = ss_occupancy_128.sum().clamp(min=1)
-    ...
-    occ_bce = F.binary_cross_entropy_with_logits(
-        occ_logits, ss_occupancy_128.float(), ...)
-
-# 修复后
-with torch.autocast(device_type='cuda', enabled=self.fp16_mode is not None):
-    occ_logits = self.training_models['structure_head'](x_0_pred)
-# 🔧 BCE 移到 autocast 外 + fp32 clamp
 occ_logits = occ_logits.float().clamp(-50.0, 50.0)
-n_pos = ss_occupancy_128.sum().clamp(min=1)
-...
-occ_bce = F.binary_cross_entropy_with_logits(
-    occ_logits, ss_occupancy_128.float(), ...)
+# BCE 计算安全，但梯度已经被 autocast 内的 Inf 污染了
 ```
 
-> **设计说明**：autocast 保留给 StructureHead 前向（节省 128³ 激活显存），BCE 计算移到外面用 fp32。`sigmoid(±50)` 已饱和，clamp 无损精度。
+**最终修复**（`ss_flow_trainer.py`）：
+
+```python
+# ✅ 正确：StructureHead 完全禁用 autocast，前向+反向全在 fp32
+with torch.autocast(device_type='cuda', enabled=False):
+    occ_logits = self.training_models['structure_head'](x_0_pred)
+occ_logits = occ_logits.clamp(-50.0, 50.0)
+```
+
+> **设计说明**：
+> - `enabled=False`：无论 trainer 的 fp16_mode 是什么，StructureHead 始终跑 fp32
+> - 内存安全：StructureHead 使用 `torch.utils.checkpoint`，128³ 中间激活不常驻，反向时逐 stage 重新计算
+> - `clamp(-50, 50)`：防御性兜底，fp32 正常不会触发
+> - 对比原始 TRELLIS SS Decoder 也是 64³ 输出（小 8 倍），LatoStructureHead 到 128³ 远远超出 fp16 能力范围
 
 ---
 
