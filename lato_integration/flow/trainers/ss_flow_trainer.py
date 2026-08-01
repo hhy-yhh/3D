@@ -66,6 +66,22 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
         self.lambda_occupancy = lambda_occupancy
         self.aux_decode_every = aux_decode_every
 
+    def load(self, load_dir, step=0):
+        """
+        覆盖父类 load()：缺失的模型 ckpt 自动回退到随机初始化。
+        这样删除 structure_head ckpt 后 resume 不会崩溃。
+        """
+        import os
+        for name, model in self.models.items():
+            ckpt_path = os.path.join(load_dir, 'ckpts', f'{name}_step{step:07d}.pt')
+            if not os.path.exists(ckpt_path):
+                if self.is_master:
+                    print(f'\n[LATO] {name} ckpt 不存在，使用随机初始化')
+                # 保存当前（随机 init）权重作为临时 ckpt，让父类 load() 不崩溃
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                torch.save(model.state_dict(), ckpt_path)
+        super().load(load_dir, step)
+
     def get_inference_cond(self, cond, **kwargs):
         """
         构建推理条件 — 移除训练专用字段 (如 ss_occupancy_128)，
