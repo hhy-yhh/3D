@@ -68,18 +68,55 @@ class LatoSSFlowTrainer(FlowMatchingTrainer):
 
     def load(self, load_dir, step=0):
         """
-        覆盖父类 load()：缺失的模型 ckpt 自动回退到随机初始化。
-        这样删除 structure_head ckpt 后 resume 不会崩溃。
+        覆盖父类 load()：
+        1. 缺失的模型 ckpt → 自动用随机初始化补充
+        2. 模型架构变更（参数数量变化）→ 自动修复 optimizer state
         """
         import os
+        import shutil
+
+        # ---- 1. 修复缺失的模型 ckpt ----
+        reinit = False
         for name, model in self.models.items():
             ckpt_path = os.path.join(load_dir, 'ckpts', f'{name}_step{step:07d}.pt')
             if not os.path.exists(ckpt_path):
                 if self.is_master:
                     print(f'\n[LATO] {name} ckpt 不存在，使用随机初始化')
-                # 保存当前（随机 init）权重作为临时 ckpt，让父类 load() 不崩溃
                 os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                 torch.save(model.state_dict(), ckpt_path)
+                reinit = True
+
+        # ---- 2. 修复 misc ckpt（optimizer state 参数数量不匹配） ----
+        if reinit and self.is_master:
+            misc_path = os.path.join(load_dir, 'ckpts', f'misc_step{step:07d}.pt')
+            misc = torch.load(misc_path, map_location='cpu', weights_only=False)
+            opt = misc['optimizer']
+
+            # 统计当前模型总参数数
+            n_current = sum(
+                sum(1 for _ in m.parameters()) for m in self.models.values()
+            )
+            n_saved = sum(len(g['params']) for g in opt['param_groups'])
+
+            if n_current != n_saved:
+                print(f'[LATO] Optimizer params 不匹配 ({n_saved} → {n_current})，'
+                      f'重建 optimizer state（权重保留，动量清零）')
+
+                # 重建 param_groups：用当前 master_params 的 id
+                # （必须用 master_params，因为 optimizer 操作的是它们，
+                #   fp16_mode='inflat_all' 时 master_params ≠ model.parameters()）
+                all_ids = [id(p) for p in self.master_params]
+
+                for group in opt['param_groups']:
+                    group['params'] = all_ids
+
+                # 清空旧的 state（Adam 动量等），新 params 从默认值开始
+                opt['state'] = {}
+
+                # 备份原 misc 再覆盖
+                shutil.copy2(misc_path, misc_path + '.bak')
+                torch.save(misc, misc_path)
+
         super().load(load_dir, step)
 
     def get_inference_cond(self, cond, **kwargs):
