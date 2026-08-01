@@ -16,7 +16,6 @@ LatoStructureHead — 轻量 3D CNN 上采样头
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 
 class ResBlock3d(nn.Module):
@@ -25,13 +24,15 @@ class ResBlock3d(nn.Module):
     def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
         padding = kernel_size // 2
+        self.norm1 = nn.GroupNorm(min(32, channels), channels)
         self.conv1 = nn.Conv3d(channels, channels, kernel_size, padding=padding)
+        self.norm2 = nn.GroupNorm(min(32, channels), channels)
         self.conv2 = nn.Conv3d(channels, channels, kernel_size, padding=padding)
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.conv1(x))
-        h = self.conv2(h)
+        h = self.act(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
         return x + h
 
 
@@ -49,6 +50,7 @@ class UpsampleBlock3d(nn.Module):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm = nn.GroupNorm(min(32, out_channels), out_channels)
         self.res_blocks = nn.ModuleList([
             ResBlock3d(out_channels) for _ in range(num_res_blocks)
         ])
@@ -56,7 +58,7 @@ class UpsampleBlock3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.upsample(x)
-        h = self.act(self.conv(h))
+        h = self.act(self.norm(self.conv(h)))
         for block in self.res_blocks:
             h = block(h)
         return h
@@ -105,21 +107,10 @@ class LatoStructureHead(nn.Module):
         Returns:
             occupancy_logits: [B, 1, 128, 128, 128]
         """
-        # 🔧 使用 checkpoint 减少显存 — stage2/3 激活值巨大（64³→128³）
-        # checkpoint 不存储中间激活，反向时重新计算
-        h = checkpoint(self._forward_stage1, x, use_reentrant=False)
-        h = checkpoint(self._forward_stage2, h, use_reentrant=False)
-        h = checkpoint(self._forward_stage3, h, use_reentrant=False)
+        h = self.stage1(x)    # 16³ → 32³
+        h = self.stage2(h)    # 32³ → 64³
+        h = self.stage3(h)    # 64³ → 128³
         return self.out_conv(h)  # → [B, 1, 128, 128, 128]
-
-    def _forward_stage1(self, x):
-        return self.stage1(x)
-
-    def _forward_stage2(self, x):
-        return self.stage2(x)
-
-    def _forward_stage3(self, x):
-        return self.stage3(x)
 
     def convert_to_fp16(self) -> None:
         """兼容 TRELLIS trainer — 轻量 CNN 无需真正转换，直接返回。"""
