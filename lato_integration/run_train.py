@@ -108,6 +108,94 @@ def find_ckpt(cfg):
     return cfg
 
 
+def fix_missing_ckpts(cfg):
+    """
+    在 trainer 创建之前修复缺失/架构变更的 checkpoint。
+
+    场景：删除了 structure_head ckpt（架构变了），resume 时需要：
+    1. 用当前架构的随机初始化权重补充缺失的模型 ckpt
+    2. 修复 misc ckpt 中 optimizer state 的参数数量
+    3. 补充缺失的 EMA ckpt
+    """
+    step = cfg.load_ckpt
+    if step is None:
+        return
+
+    ckpt_dir = os.path.join(cfg.load_dir, 'ckpts')
+    need_fix = False
+
+    # 检查哪些模型 ckpt 缺失
+    for name, model_cfg in cfg.models.items():
+        ckpt_path = os.path.join(ckpt_dir, f'{name}_step{step:07d}.pt')
+        if not os.path.exists(ckpt_path):
+            need_fix = True
+            break
+
+    if not need_fix:
+        return
+
+    print('\n' + '=' * 60)
+    print('[LATO] Pre-flight: 修复缺失/架构变更的 checkpoint')
+    print('=' * 60)
+
+    # 临时创建缺失模型以获取当前架构的随机初始化权重
+    model_dict = {}
+    for name, model_cfg in cfg.models.items():
+        ckpt_path = os.path.join(ckpt_dir, f'{name}_step{step:07d}.pt')
+        if not os.path.exists(ckpt_path):
+            if name not in model_dict:
+                model_dict[name] = resolve_model(model_cfg.name, model_cfg.args)
+            m = model_dict[name]
+            print(f'  [FIX] {name}_step{step:07d}.pt → 保存随机初始化权重')
+            torch.save(m.state_dict(), ckpt_path)
+
+            # 探测 denoiser 的 EMA ckpt，为缺失模型创建同名 EMA
+            for ema_ref in glob.glob(os.path.join(ckpt_dir, f'denoiser_ema*_step{step:07d}.pt')):
+                # 从 denoiser_ema0.9999_step0580000.pt 提取 EMA rate
+                ema_part = os.path.basename(ema_ref).replace('denoiser_ema', '').replace(f'_step{step:07d}.pt', '')
+                ema_path = os.path.join(ckpt_dir, f'{name}_ema{ema_part}_step{step:07d}.pt')
+                if not os.path.exists(ema_path):
+                    print(f'  [FIX] {os.path.basename(ema_path)} → 补充 EMA ckpt')
+                    torch.save(m.state_dict(), ema_path)
+
+    # 修复 misc ckpt 的 optimizer state
+    misc_path = os.path.join(ckpt_dir, f'misc_step{step:07d}.pt')
+    if os.path.exists(misc_path):
+        misc = torch.load(misc_path, map_location='cpu', weights_only=False)
+        opt = misc['optimizer']
+
+        # 计算当前架构的总参数数
+        if not model_dict:
+            for name, mc in cfg.models.items():
+                model_dict[name] = resolve_model(mc.name, mc.args)
+
+        n_current = sum(
+            sum(1 for _ in m.parameters()) for m in model_dict.values()
+        )
+        n_saved = sum(len(g['params']) for g in opt['param_groups'])
+
+        if n_current != n_saved:
+            print(f'  [FIX] misc_step{step:07d}.pt → optimizer params {n_saved} → {n_current}')
+            import shutil
+            shutil.copy2(misc_path, misc_path + '.bak')
+
+            all_ids = []
+            for m in model_dict.values():
+                for p in m.parameters():
+                    all_ids.append(id(p))
+
+            for group in opt['param_groups']:
+                group['params'] = all_ids
+            opt['state'] = {}
+
+            torch.save(misc, misc_path)
+
+    # 清理临时模型
+    del model_dict
+    torch.cuda.empty_cache()
+    print('=' * 60 + '\n')
+
+
 def setup_rng(rank):
     torch.manual_seed(rank)
     torch.cuda.manual_seed_all(rank)
@@ -218,6 +306,7 @@ if __name__ == '__main__':
 
     if cfg.auto_retry == 0:
         cfg = find_ckpt(cfg)
+        fix_missing_ckpts(cfg)
         if cfg.num_gpus > 1:
             mp.spawn(main, args=(cfg,), nprocs=cfg.num_gpus, join=True)
         else:
@@ -226,6 +315,7 @@ if __name__ == '__main__':
         for rty in range(cfg.auto_retry):
             try:
                 cfg = find_ckpt(cfg)
+                fix_missing_ckpts(cfg)
                 if cfg.num_gpus > 1:
                     mp.spawn(main, args=(cfg,), nprocs=cfg.num_gpus, join=True)
                 else:
