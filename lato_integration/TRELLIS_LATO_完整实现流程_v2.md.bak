@@ -3,7 +3,6 @@
 > **目标：** TRELLIS 文本转3D 管线中，**Encoder 全部用 LATO VoxelVAE，Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS**。SS Flow 和 SLat Flow 均在刹车卡钳数据集上从零训练，最后用 Chamfer Distance / Hausdorff Distance / Normal Consistency 评估。
 
 **更新记录：**
-- 2026-08-03：**v8 更新 — GT 数据根因修复** — 发现并修复 `load_quantized_mesh_original()` 对未归一化 STL 的坐标截断 bug：刹车卡钳毫米级坐标被 `np.clip` 压扁为 2D 平面，导致 234 个 SS occupancy GT 全部为单层体素。通过预处理归一化 STL + 重跑 LATO encode 恢复 3D GT。同时修复 StructureHead 全量重置后 optimizer Adam state 未清理导致训练无效的问题（Bug 16）。
 - 2026-08-01：**LatoStructureHead 训练健壮性修复** — 修复 3 个关键 bug：`get_inference_cond` MRO 链断裂致训练字段泄漏到推理（Bug 13）、`x_0_pred` latent 溢出（Bug 14）、深层 Transformer fp16 激活累积溢出（Bug 15）
 - 2026-07-23：**v7 更新** — 架构全面重构：TRELLIS SS/SLat Encoder/Decoder 全部替换为 LATO VoxelVAE；新增 `LatoStructureHead` 替代 SS Decoder；移除 coords×2 hack；删除 GS/RF decoder 及 VAE 训练器
 - 2026-07-19：**v6 更新** — 端到端测试集推理验证通过；修复 6 个推理 bug
@@ -17,7 +16,7 @@
 ## 架构概览
 
 ```
-                    v2 管线 (旧)                         v4 管线 (🆕)                       对应目标
+                    v2 管线 (旧)                         v3 管线 (🆕)                       对应目标
                    ════════════════                   ═══════════════                     ════════
 
   Text ─→ CLIP ─→ SS Flow ─→ SS Decoder(TRELLIS)    Text ─→ CLIP ─→ SS Flow ─→ LatoStructureHead   ① 全 LATO 架构
@@ -38,9 +37,9 @@
     SLat Encoder: LATO VoxelVAE.encode() ✅             SLat 目标: LATO VoxelVAE.encode() → feats@128
 ```
 
-### v3 → v4 核心变化
+### v2 → v3 核心变化
 
-| 组件 | v3 | v4 |
+| 组件 | v2 | v3 |
 |------|-----|-----|
 | SS Encoder（训练） | TRELLIS SparseStructureEncoder（冻结） | LATO VoxelVAE.encode() |
 | SS Decoder（推理） | TRELLIS SparseStructureDecoder（冻结, 64³） | **🆕 LatoStructureHead**（可训练, 128³ 直接输出） |
@@ -52,12 +51,12 @@
 
 ---
 
-## 推理全链路追踪（v4：`pipeline.run()` → mesh.obj）
+## 推理全链路追踪（v3：`pipeline.run()` → mesh.obj）
 
 ```
 TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 │
-├─[1] sample_sparse_structure_lato()   # 🆕 :109 v4 新增方法
+├─[1] sample_sparse_structure_lato()   # 🆕 :109 v3 新增方法
 │   ├─ self.models['sparse_structure_flow_model']    ← 🆕 你的 SS Flow ckpt
 │   └─ self.models['lato_structure_head']            ← 🆕 LatoStructureHead（替代 SS Decoder!）
 │       └─ SS Flow(16³×8) → 3D CNN 上采样 → occ@128³ → coords
@@ -131,7 +130,7 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 
 ---
 
-## 文件清单（v4）
+## 文件清单（v3）
 
 | 操作 | 文件 | 说明 |
 |------|------|------|
@@ -144,7 +143,7 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 | ✏️ 修改 | `lato_integration/inference_lato.py` | v5→v6：LatoStructureHead 替代 SS Decoder，移除 coords×2 |
 | ✏️ 修改 | `lato_integration/evaluate_3d_metrics.py` | load_pipeline() 加载 LatoStructureHead |
 | ✏️ 修改 | `lato_integration/flow/trainers/ss_flow_trainer.py` | 新增 `LatoSSFlowTrainer`，训练目标改为 128³ occupancy |
-| ✏️ 修改 | `lato_integration/flow/trainers/__init__.py` | 新增 v4 trainer 名称导出 |
+| ✏️ 修改 | `lato_integration/flow/trainers/__init__.py` | 新增 v3 trainer 名称导出 |
 | ✏️ 修改 | `lato_integration/flow/ss_flow.py` | 修复 IO ResBlocks 残差连接 shape 不匹配 |
 | ✏️ 修改 | `trellis/trainers/utils.py` | 修复 `model_grads_to_master_grads` None grad 处理 |
 | ✏️ 修改 | `trellis/trainers/basic.py` | 修复 `run_step` 梯度 NaN 检查跳过 None grad |
@@ -163,7 +162,7 @@ TrellisTextTo3DPipeline.run()          # trellis_text_to_3d.py:212
 
 ---
 
-## 完整执行步骤（v4）
+## 完整执行步骤（v3）
 
 ### 依赖关系
 
@@ -223,7 +222,7 @@ rm -f lato_integration/trainers/slat_vae_mesh_dec.py
 
 ---
 
-### 步骤 1：生成 SS 训练目标（🆕 v4 新步骤）
+### 步骤 1：生成 SS 训练目标（🆕 v3 新步骤）
 
 ```bash
 ssh 服务器
@@ -254,7 +253,7 @@ EOF
 
 ---
 
-### 步骤 2：创建 v4 训练配置
+### 步骤 2：创建 v3 训练配置
 
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
@@ -278,7 +277,7 @@ if "trainer" not in cfg:
     cfg["trainer"] = {"name": "FlowMatchingCFGTrainer", "args": {}}
 cfg["trainer"]["args"]["lambda_occupancy"] = 0.1
 
-# 🔧 v4 fix: 使用 LATO 自定义数据集（加载 ss_occupancy_128）
+# 🔧 v3 fix: 使用 LATO 自定义数据集（加载 ss_occupancy_128）
 cfg["dataset"]["name"] = "TextConditionedLatoSSStructureLatent"
 cfg["dataset"]["args"]["occupancy_dir"] = "ss_occupancy_128"
 
@@ -286,13 +285,13 @@ cfg["dataset"]["args"]["occupancy_dir"] = "ss_occupancy_128"
 cfg["trainer"]["args"]["batch_size_per_gpu"] = 2
 cfg["trainer"]["args"]["batch_split"] = 2  # 梯度累积保持有效 batch=4
 
-with open("configs/generation/lato_ss_flow_v4.json", "w") as f:
+with open("configs/generation/lato_ss_flow_v3.json", "w") as f:
     json.dump(cfg, f, indent=4)
-print("Done: configs/generation/lato_ss_flow_v4.json")
+print("Done: configs/generation/lato_ss_flow_v3.json")
 EOF
 ```
 
-> **输出**：`configs/generation/lato_ss_flow_v4.json`（在原有 SS Flow 配置基础上增加 `structure_head` 模型、`lambda_occupancy`，并使用 `TextConditionedLatoSSStructureLatent` 数据集）
+> **输出**：`configs/generation/lato_ss_flow_v3.json`（在原有 SS Flow 配置基础上增加 `structure_head` 模型、`lambda_occupancy`，并使用 `TextConditionedLatoSSStructureLatent` 数据集）
 
 ---
 
@@ -302,9 +301,9 @@ EOF
 cd /data/huanghaoyang/3D/TRELLIS
 
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
-    --config configs/generation/lato_ss_flow_v4.json \
+    --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v4 \
+    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3 \
     --num_gpus 1 --auto_retry 0
 ```
 
@@ -332,14 +331,14 @@ cd /data/huanghaoyang/3D/TRELLIS
 CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
     --config configs/generation/lato_slat_flow.json \
     --data_dir /data/huanghaoyang/3D/database_lato/lato_latents \
-    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_slat_flow_v4 \
+    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_slat_flow_v3 \
     --num_gpus 1 --auto_retry 0
 
 # 方式二：从旧 ckpt 续训（推荐，节省时间）
 CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
     --config configs/generation/lato_slat_flow.json \
     --data_dir /data/huanghaoyang/3D/database_lato/lato_latents \
-    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_slat_flow_v4 \
+    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_slat_flow_v3 \
     --load_dir outputs/lato_slat_flow \
     --ckpt 0880000 \
     --num_gpus 1 --auto_retry 0
@@ -367,8 +366,8 @@ export ATTN_BACKEND=sdpa                # dense attention: SDPA（与训练一�
 export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa；flash_attn 只支持 fp16）
 
 # 自动找最新 ckpt
-SS_CKPT=$(ls outputs/lato_ss_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
@@ -377,7 +376,7 @@ python lato_integration/evaluate_3d_metrics.py \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
     --gt_meshes /data/huanghaoyang/3D/database \
-    --output_dir outputs/eval_results_v4 \
+    --output_dir outputs/eval_results_v3 \
     --limit 1
 ```
 
@@ -390,8 +389,8 @@ export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYT
 export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
 export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
 
-SS_CKPT=$(ls outputs/lato_ss_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 # 确认步骤 5 单条通过后跑全部 21 条（去掉 --limit）
 python lato_integration/evaluate_3d_metrics.py \
@@ -401,7 +400,7 @@ python lato_integration/evaluate_3d_metrics.py \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
     --gt_meshes /data/huanghaoyang/3D/database \
-    --output_dir outputs/eval_results_v4
+    --output_dir outputs/eval_results_v3
 ```
 
 **输出文件：**
@@ -422,7 +421,7 @@ python lato_integration/evaluate_3d_metrics.py \
 
 ---
 
-## 原版 TRELLIS vs v3 vs v4：逐阶段对比
+## 原版 TRELLIS vs v2 vs v3：逐阶段对比
 
 ### 总览
 
@@ -433,13 +432,13 @@ python lato_integration/evaluate_3d_metrics.py \
 v2 LATO 管线:
   Text → CLIP → SS Flow(重训) → SS Decoder(TRELLIS冻结) → ×2坐标 → SLat Flow(重训) → LATO VoxelVAE → Mesh
 
-v4 LATO 管线 (🆕):
+v3 LATO 管线 (🆕):
   Text → CLIP → SS Flow(重训) → LatoStructureHead(🆕可训练) → coords@128 → SLat Flow(重训) → LATO VoxelVAE → Mesh
 ```
 
 ### 阶段对比表
 
-| 阶段 | 原版 TRELLIS | v2 LATO | v4 LATO (🆕) |
+| 阶段 | 原版 TRELLIS | v2 LATO | v3 LATO (🆕) |
 |------|-------------|---------|--------------|
 | **SS Encoder（训练）** | TRELLIS 3D CNN | TRELLIS（冻结） | **LATO VoxelVAE.encode()** |
 | **SS Flow** | Dense DiT (512ch) | 同，重训 | 同，重训（目标变了） |
@@ -480,7 +479,7 @@ LATO VoxelVAE 的 decoder 是端到端的：输入 sparse latent → 输出 mesh
 
 ---
 
-## 已知 Bug 修复清单（v4）
+## 已知 Bug 修复清单（v3）
 
 ### Bug 1: None grad 崩溃 — `model_grads_to_master_grads`
 
@@ -538,7 +537,7 @@ TypeError: EnhancedSSFlowModel.forward() got an unexpected keyword argument 'ss_
 |------|------|
 | `torch.autocast` 包裹 structure_head 前向（fp16 计算） | `ss_flow_trainer.py` |
 | `torch.utils.checkpoint` — stage3 不存中间激活 | `structure_head.py` |
-| `batch_size_per_gpu: 2` + 梯度累积 | `lato_ss_flow_v4.json` |
+| `batch_size_per_gpu: 2` + 梯度累积 | `lato_ss_flow_v3.json` |
 | IO ResBlocks 残差连接 shape 检查 | `flow/ss_flow.py` |
 
 ### Bug 6: 从零训练 NaN 死循环 + 日志崩溃
@@ -609,7 +608,7 @@ master_params_to_model_params() 拷贝 fp32→fp16 → Inf
 | `flow/ss_flow.py` | ② forward 末尾输出 NaN guard — `nan_to_num` + `clamp` 兜底 | 234-236 |
 | `flow/ss_flow.py` | ③ `clamp_weights_fp16_safe()` — fp16 训练时每步钳制权重 ±65500，fp32 自动跳过 | 240-253 |
 | `flow/trainers/ss_flow_trainer.py` | ④ `run_step()` override — optimizer.step() 后调用 `clamp_weights_fp16_safe()` | 78-88 |
-| `configs/.../lato_ss_flow_v4.json` | ⑤ `"use_fp16": false` — 模型全 fp32 | — |
+| `configs/.../lato_ss_flow_v3.json` | ⑤ `"use_fp16": false` — 模型全 fp32 | — |
 
 **Resume 时 fp16→fp32 自动转换**：
 
@@ -629,29 +628,29 @@ load checkpoint (fp16 权重)
 # 1. 改 config 为 fp32
 python3 -c "
 import json
-cfg = json.load(open('configs/generation/lato_ss_flow_v4.json'))
+cfg = json.load(open('configs/generation/lato_ss_flow_v3.json'))
 cfg['models']['denoiser']['args']['use_fp16'] = False
-json.dump(cfg, open('configs/generation/lato_ss_flow_v4.json', 'w'), indent=2)
+json.dump(cfg, open('configs/generation/lato_ss_flow_v3.json', 'w'), indent=2)
 print('Done: use_fp16 → False')
 "
 
 # 2. 删除被污染的 checkpoint（仅保留 step 10000）
-cd /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v4/ckpts
+cd /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3/ckpts
 ls | grep -v step0010000 | xargs rm -f
 
 # 3. 从 step 10000 resume
 cd /data/huanghaoyang/3D/TRELLIS
 python lato_integration/run_train.py \
-    --config configs/generation/lato_ss_flow_v4.json \
+    --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v4 \
+    --output_dir /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3 \
     --num_gpus 1 --auto_retry 0 --ckpt 10000
 ```
 
 **验证收敛**：
 
 ```bash
-tail -5 /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v4/log.txt
+tail -5 /data/huanghaoyang/3D/TRELLIS/outputs/lato_ss_flow_v3/log.txt
 # mse 应从正常值开始，持续下降，不再 NaN
 ```
 
@@ -742,7 +741,7 @@ F.binary_cross_entropy_with_logits(reduction='mean', pos_weight=None)
 StructureHead 功能完全失效
 ```
 
-> **责任归属**：这是 v4 架构设计时引入的训练代码 bug。原版 TRELLIS 和 LATO 均无 StructureHead + occupancy BCE 这套组件，`pos_weight` 缺失是生成 `ss_flow_trainer.py` 时的疏忽。
+> **责任归属**：这是 v3 架构设计时引入的训练代码 bug。原版 TRELLIS 和 LATO 均无 StructureHead + occupancy BCE 这套组件，`pos_weight` 缺失是生成 `ss_flow_trainer.py` 时的疏忽。
 
 **修复**（`lato_integration/flow/trainers/ss_flow_trainer.py`）：
 
@@ -766,7 +765,7 @@ occ_bce = F.binary_cross_entropy_with_logits(
 
 ```bash
 # StructureHead 独立保存，需单独重置所有 bias
-SH_CKPT=outputs/lato_ss_flow_v4/ckpts/structure_head_step0400000.pt
+SH_CKPT=outputs/lato_ss_flow_v3/ckpts/structure_head_step0400000.pt
 python3 -c "
 import torch
 ckpt = torch.load('$SH_CKPT', map_location='cpu')
@@ -819,7 +818,7 @@ Bug 10 修复前 107k 步训练（无 pos_weight）
 python3 << 'EOF'
 import torch, torch.nn as nn
 
-ckpt_path = 'outputs/lato_ss_flow_v4/ckpts/structure_head_step0500000.pt'
+ckpt_path = 'outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt'
 ckpt = torch.load(ckpt_path, map_location='cpu')
 
 for k in list(ckpt.keys()):
@@ -843,16 +842,16 @@ EOF
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
-    --config configs/generation/lato_ss_flow_v4.json \
+    --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/lato_ss_flow_v4 \
+    --output_dir outputs/lato_ss_flow_v3 \
     --num_gpus 1 --ckpt 500000
 ```
 
 **阶段 1 — 30 分钟后验证 occ_bce 恢复**：
 
 ```bash
-tail -5 outputs/lato_ss_flow_v4/log.txt | grep -o "occ_bce_[^,}]*"
+tail -5 outputs/lato_ss_flow_v3/log.txt | grep -o "occ_bce_[^,}]*"
 ```
 
 **阶段 2 — ~1 天后（~20k 步）验证 StructureHead 输出正常**：
@@ -863,7 +862,7 @@ import torch
 from lato_integration.structure_head import LatoStructureHead
 import glob, os
 
-ckpt = sorted(glob.glob('outputs/lato_ss_flow_v4/ckpts/structure_head_step*.pt'))[-1]
+ckpt = sorted(glob.glob('outputs/lato_ss_flow_v3/ckpts/structure_head_step*.pt'))[-1]
 head = LatoStructureHead(in_channels=8, base_channels=256).cuda()
 head.load_state_dict(torch.load(ckpt, map_location='cuda'))
 
@@ -883,7 +882,7 @@ export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYT
 export ATTN_BACKEND=sdpa
 export SPARSE_ATTN_BACKEND=xformers
 
-SS_CKPT=$(ls outputs/lato_ss_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 python lato_integration/evaluate_3d_metrics.py \
@@ -893,7 +892,7 @@ python lato_integration/evaluate_3d_metrics.py \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
     --gt_meshes /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/eval_results_v4 \
+    --output_dir outputs/eval_results_v3 \
     --save_meshes --limit 1
 ```
 
@@ -922,7 +921,7 @@ import torch, sys
 sys.path.insert(0, '/data/huanghaoyang/3D/TRELLIS')
 from lato_integration.structure_head import LatoStructureHead
 
-ckpt = torch.load('outputs/lato_ss_flow_v4/ckpts/structure_head_step0510000.pt', map_location='cpu')
+ckpt = torch.load('outputs/lato_ss_flow_v3/ckpts/structure_head_step0510000.pt', map_location='cpu')
 head = LatoStructureHead(in_channels=8, base_channels=256)
 head.load_state_dict(ckpt)
 x = torch.randn(1, 8, 16, 16, 16) * 2
@@ -1161,8 +1160,8 @@ export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYT
 export ATTN_BACKEND=sdpa                # dense attention: SDPA（fp32 兼容）
 export SPARSE_ATTN_BACKEND=xformers     # sparse attention: 必须 xformers（不支持 sdpa）
 
-SS_CKPT=$(ls outputs/lato_ss_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow_v4/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SS_CKPT=$(ls outputs/lato_ss_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v3/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
@@ -1171,7 +1170,7 @@ python lato_integration/evaluate_3d_metrics.py \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
     --gt_meshes /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/eval_results_v4 \
+    --output_dir outputs/eval_results_v3 \
     --save_meshes
 ```
 
@@ -1253,251 +1252,18 @@ StructureHead ckpt (bias=0, conv 权重 = 坏):
 # 1. 重置 StructureHead 全部权重
 python3 << 'EOF'
 import torch, torch.nn as nn
-ckpt = torch.load('outputs/lato_ss_flow_v4/ckpts/structure_head_step0500000.pt', map_location='cpu')
+ckpt = torch.load('outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt', map_location='cpu')
 for k in list(ckpt.keys()):
     if 'weight' in k: nn.init.kaiming_normal_(ckpt[k])
     elif 'bias' in k: ckpt[k].zero_()
-torch.save(ckpt, 'outputs/lato_ss_flow_v4/ckpts/structure_head_step0500000.pt')
+torch.save(ckpt, 'outputs/lato_ss_flow_v3/ckpts/structure_head_step0500000.pt')
 EOF
 
 # 2. Resume 训练
 cd /data/huanghaoyang/3D/TRELLIS
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
-    --config configs/generation/lato_ss_flow_v4.json \
+    --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/lato_ss_flow_v4 \
+    --output_dir outputs/lato_ss_flow_v3 \
     --num_gpus 1 --ckpt 500000
-```
-
----
-
-# 🆕 v8 补充：GT 数据根因修复与流程更新
-
-> **日期：** 2026-08-03
-> **状态：** SS occupancy 归一化已修复，LATO encode 重新运行中
-
----
-
-## 根因分析
-
-### 问题表现
-
-v4 管线训练后推理 mesh 不成形：所有顶点 Z 轴聚集在 [1.48, 1.50]，mesh 实际为 2D 平面。CD=0.215、HD=0.507、NC=0.571。
-
-### 逐段诊断链
-
-```
-推理 mesh 扁平
-  → VoxelVAE decode 顶点 Z 坐标全在 [508, 511]（res512）
-  → SLat Flow 输入 coords 全在 Z=127（res128）
-  → StructureHead 输出 occupancy X 轴跨度为 0（全部正体素聚集在 X=127）
-  → GT occupancy 同样：所有 234 个训练文件的 X 轴跨度为 0
-  → GT 来自 LATO VoxelVAE.encode() 的 latent coords
-  → LATO encode 输入 voxels 已全部 Z=127
-```
-
-### 最终定位
-
-**`lato/datasets/vertex_head.py` 第 172 行 `load_quantized_mesh_original()` 函数：**
-
-```python
-vertices = np.clip(np.asarray(mesh_o3d.vertices), -0.5 + 1e-6, 0.5 - 1e-6)
-```
-
-此函数假设输入 mesh 已归一化到 [-0.5, 0.5]。刹车卡钳 STL 为毫米级原始坐标（几十到几百 mm），Z 轴（厚度方向 ~20-80mm）因范围远小于 X/Y 轴，被全部截断至 0.5。量化到 res=128 后全部落入单个体素层（z=127），形成 2D 平面。
-
-**影响链路：** 2D voxels → VoxelVAE.encode() → 2D latent coords → 步骤1 生成 2D occupancy GT → SS Flow + StructureHead 忠实地学到 2D 目标。
-
-### TRELLIS 对比
-
-TRELLIS 的 SS VAE 训练数据集（`trellis/datasets/sparse_structure.py` 第 43-45 行）使用**预处理好的 `.ply` voxel 文件**，坐标已在 [-0.5, 0.5] 范围内，不做在线归一化。LATO 试图从原始 mesh 一步到位体素化，缺少归一化预处理步骤。
-
----
-
-## 修复方案
-
-### 思路
-
-不修改 LATO 源码（避免第三方库升级时补丁失效），采用与 TRELLIS 一致的**离线预处理**方式：将 STL 归一化到 [-0.5, 0.5] 后再进行 LATO encode。
-
-### 步骤 0（新增）：归一化 STL 网格
-
-```bash
-cd /data/huanghaoyang/3D/TRELLIS
-
-python3 << 'EOF'
-import trimesh, numpy as np, os, glob, shutil
-from tqdm import tqdm
-
-DB = "/data/huanghaoyang/3D/database_lato"
-mesh_dir = os.path.join(DB, "meshes")
-backup_dir = os.path.join(DB, "meshes_mm_backup")
-norm_dir = os.path.join(DB, "meshes_normalized")
-
-# 备份原始 STL
-if not os.path.exists(backup_dir):
-    shutil.move(mesh_dir, backup_dir)
-
-os.makedirs(norm_dir, exist_ok=True)
-
-files = sorted(glob.glob(os.path.join(backup_dir, "*.stl")))
-for path in tqdm(files, desc="Normalizing"):
-    name = os.path.basename(path)
-    out_path = os.path.join(norm_dir, name)
-    if os.path.exists(out_path):
-        continue
-    mesh = trimesh.load(path, force="mesh")
-    v = mesh.vertices
-    center = (v.min(axis=0) + v.max(axis=0)) / 2
-    scale = (v.max(axis=0) - v.min(axis=0)).max()
-    mesh.vertices = (v - center) / scale * 0.9  # 最长边 → 0.9，留 5% margin
-    mesh.export(out_path)
-
-# 软链接归一化目录为 meshes/
-os.symlink(norm_dir, mesh_dir)
-print(f"Done: {len(files)} files → {norm_dir}")
-EOF
-```
-
-### 步骤 1（🆕 更新）：重新生成 SS occupancy
-
-步骤 0 完成后，重跑 LATO encode 和 occupancy 生成，使用新输出路径避免覆盖旧数据：
-
-```bash
-cd /data/huanghaoyang/3D/TRELLIS
-export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-
-# A. 重跑 LATO encode（输出到 lato_latents_v2/）
-python lato_integration/encode_lato_latent_v2.py \
-    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
-    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
-    --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
-    --resolution 128
-
-# B. 从新 latent 生成 SS occupancy
-python3 << 'EOF'
-import numpy as np, os, glob
-
-latent_dir = "/data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128"
-output_dir = "/data/huanghaoyang/3D/database_lato/ss_occupancy_128_v2"
-os.makedirs(output_dir, exist_ok=True)
-
-for npz_path in glob.glob(os.path.join(latent_dir, "*.npz")):
-    key = os.path.basename(npz_path).replace(".npz", "")
-    data = np.load(npz_path, allow_pickle=True)
-    coords = data['coords']   # [N, 4] sparse @ res128
-    occ = np.zeros((1, 128, 128, 128), dtype=np.float32)
-    for c in coords:
-        if c[0] == 0:
-            occ[0, c[1], c[2], c[3]] = 1.0
-    np.savez_compressed(os.path.join(output_dir, f"{key}.npz"), occupancy=occ)
-
-print(f"Done: {len(glob.glob(output_dir + '/*.npz'))} files → {output_dir}")
-EOF
-
-# C. 验证 occupancy 为 3D
-python3 << 'EOF'
-import numpy as np, os, glob
-
-files = sorted(glob.glob("/data/huanghaoyang/3D/database_lato/ss_occupancy_128_v2/*.npz"))[:3]
-for f in files:
-    occ = np.load(f)['occupancy']
-    pos = np.where(occ[0] > 0)
-    ok = pos[2].max() - pos[2].min() > 10
-    print(f"{'✅' if ok else '❌'} {os.path.basename(f)[:40]} "
-          f"Xspan={pos[0].max()-pos[0].min()} "
-          f"Yspan={pos[1].max()-pos[1].min()} "
-          f"Zspan={pos[2].max()-pos[2].min()}")
-EOF
-```
-
-### 步骤 2（🆕 更新）：创建 v4 训练配置
-
-config 中数据集指向新的 occupancy 目录：
-
-```python
-cfg["dataset"]["args"]["occupancy_dir"] = "ss_occupancy_128_v2"
-```
-
-### 步骤 3+4：训练（不变）
-
-SS Flow + StructureHead 和 SLat Flow 的训练步骤不变。注意：重置 StructureHead 权重后，**必须同时清理 misc checkpoint 中的 optimizer Adam state**（Bug 16）。
-
-```bash
-# 重置 StructureHead + 清理 Adam state
-python3 << 'EOF'
-import torch, torch.nn as nn, os, glob
-
-ckpt_dir = "outputs/lato_ss_flow_v4/ckpts"
-misc_files = sorted(glob.glob(f"{ckpt_dir}/misc_step*.pt"))
-latest = misc_files[-1]
-step = int(os.path.basename(latest).replace("misc_step","").replace(".pt",""))
-
-# 重置权重
-sh_path = f"{ckpt_dir}/structure_head_step{step:07d}.pt"
-sh = torch.load(sh_path, map_location='cpu')
-for k in list(sh.keys()):
-    if 'weight' in k: nn.init.kaiming_normal_(sh[k])
-    elif 'bias' in k: sh[k].zero_()
-torch.save(sh, sh_path)
-print(f"StructureHead 权重重置完成 (step {step})")
-
-# 清空 StructureHead 对应的 Adam state
-misc = torch.load(latest, map_location='cpu', weights_only=False)
-for g in misc['optimizer']['param_groups']:
-    for pid in g['params']:
-        s = misc['optimizer']['state'].get(pid, {})
-        ea = s.get('exp_avg')
-        if ea is not None and ea.numel() == 1 and ea.shape == torch.Size([1]):
-            for pid2 in g['params']:
-                st = misc['optimizer']['state'].get(pid2, {})
-                for k in ['exp_avg', 'exp_avg_sq']:
-                    if k in st and st[k] is not None:
-                        st[k].zero_()
-                st['step'] = 0
-            break
-torch.save(misc, latest)
-print(f"Optimizer state 已清理，保存: {os.path.basename(latest)}")
-EOF
-
-# Resume 训练
-CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
-    --config configs/generation/lato_ss_flow_v4.json \
-    --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/lato_ss_flow_v4 \
-    --num_gpus 1 --ckpt latest
-```
-
----
-
-## 新增 Bug：Bug 16 — StructureHead 权重重置后 Adam state 未清理
-
-**现象：** StructureHead 全量重置（kaiming_normal_ init）后训练 130k 步，推理 mesh 仍然输出 2D 平面。
-
-**根因：** 手动编辑 `structure_head_step*.pt` 覆写权重后，misc checkpoint 中的 optimizer Adam state 仍然保留旧权重的 momentum 和 variance（out_conv.bias ≈ -1105 时代）。Adam 持续将新权重推向旧错误方向，130k 步训练基本无效。
-
-**修复：** 重置权重时必须同步清空 misc checkpoint 中对应 param_group 的 `exp_avg`、`exp_avg_sq`，并将 `step` 归零。
-
----
-
-## 旧 vs 新 关键对比
-
-| 项目 | 旧（v4-v7） | 🆕 新（v8） |
-|------|------------|------------|
-| **STL 预处理** | 无（原始 mm 坐标） | 归一化到 [-0.5, 0.5] |
-| **LATO encode** | `load_quantized_mesh_original` clip 截断 | 预处理后 encode 正常 |
-| **SS occupancy GT** | 2D 平面（Z 轴塌缩） | 3D 体素 |
-| **SLat latent** | 2D coords | 3D coords |
-| **StructureHead 重置后** | 未清理 Adam state（Bug 16） | 同步清理 optimizer state |
-| **代码修改** | 不动 LATO 源码 | 不动 LATO 源码 ✅ |
-
----
-
-## 已知影响范围
-
-- **SS Flow 需要重训：** 训练目标从 2D 变为 3D，SS Flow 学到的 2D 映射不再适用
-- **SLat Flow 理论上兼容：** Flow Matching 对坐标分布偏移有天然鲁棒性，且 v2 推理已验证 3D coords 输入（来自 TRELLIS SS Decoder）可正常产出 CD=0.214
-- **LATO VAE 不受影响：** 预训练权重冻结，仅 encode 输入归一化方式变更
-- **推理管线无需改动：** 仅输入数据变化，代码不变
 ```

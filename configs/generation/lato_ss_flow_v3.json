@@ -32,7 +32,7 @@
         "args": {
             "latent_model": "ss_enc_conv3d_16l8_fp16",
             "min_aesthetic_score": 4.5,
-            "occupancy_dir": "ss_occupancy_128",
+            "occupancy_dir": "ss_occupancy_128_v2",
             "normalization": {
                 "mean": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 "std": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
