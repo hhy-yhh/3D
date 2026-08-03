@@ -1585,6 +1585,95 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ---
 
+## 🆕 训练健康自检脚本
+
+> 每 10000 步跑一次（30 秒），区分"训练不够"和"有 bug"。
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+
+cat > check_health.sh << 'SCRIPT'
+#!/bin/bash
+CKPT_DIR=${1:-outputs/lato_ss_flow_v5}
+LOG="$CKPT_DIR/log.txt"
+
+echo "=== 训练健康检查 @ $(date +%H:%M) ==="
+
+# 1. StructureHead 3D？
+python3 -c "
+import torch, glob, numpy as np, sys
+sys.path.insert(0,'.')
+from lato_integration.structure_head import LatoStructureHead
+from lato_integration.flow.ss_flow import EnhancedSSFlowModel
+d='cuda:0'
+ckpt_dir='$CKPT_DIR/ckpts'
+sc=sorted(glob.glob(f'{ckpt_dir}/denoiser_step*.pt'))
+if not sc: print('⏳ 无checkpoint'); exit(0)
+ss=EnhancedSSFlowModel(resolution=16,in_channels=8,out_channels=8,model_channels=512,
+    cond_channels=768,num_blocks=24,num_heads=16,mlp_ratio=4,
+    patch_size=1,pe_mode='ape',qk_rms_norm=True,use_fp16=False).to(d)
+sh=LatoStructureHead(in_channels=8,base_channels=256,num_res_blocks=1).to(d)
+ss.load_state_dict(torch.load(sc[-1],map_location=d,weights_only=True)
+    .get('denoiser',{}),strict=False);ss.eval()
+sh.load_state_dict(torch.load(
+    sorted(glob.glob(f'{ckpt_dir}/structure_head_step*.pt'))[-1],
+    map_location=d,weights_only=True),strict=False);sh.eval()
+with torch.no_grad():
+    z=torch.randn(1,8,16,16,16,device=d)
+    cond=torch.zeros(1,1,768,device=d)
+    out=ss(z,torch.tensor([500.],device=d),cond)
+    pos=np.where(sh(out)[0,0].cpu().numpy()>0)
+    n=len(pos[0])
+    if n>0:
+        xs=pos[2].max()-pos[2].min()
+        ys=pos[1].max()-pos[1].min()
+        zs=pos[0].max()-pos[0].min()
+        ok='✅' if min(xs,ys,zs)>10 else '❌'
+        print(f'  SH 3D: {ok}  n={n}  Xspan={xs}  Yspan={ys}  Zspan={zs}')
+    else:
+        print('  SH 3D: ❌  全负')
+"
+
+# 2. loss 趋势
+echo -n "  occ_bce(最近200均值): "
+grep "occ_bce_128" "$LOG" | tail -200 | grep -oP 'occ_bce_128":\s*\K[\d.]+' | \
+    awk '{s+=$1;n++}END{printf "%.4f\n",s/n}'
+
+echo -n "  MSE(最近200均值):      "
+grep -oP '"mse":\s*\K[\d.]+' "$LOG" | tail -200 | \
+    awk '{s+=$1;n++}END{printf "%.4f\n",s/n}'
+
+# 3. NaN
+echo -n "  NaN: "
+c=$(grep -c "NaN" "$LOG" 2>/dev/null)
+echo "$c 条$([ $c -gt 0 ] && echo ' ❌' || echo ' ✅')"
+
+# 4. 步数
+echo -n "  step: "
+tail -1 "$LOG" | grep -oP '"step":\s*\K[\d.]+' | awk '{printf "%.0f\n", $1}'
+
+echo ""
+SCRIPT
+
+chmod +x check_health.sh
+
+# 使用方式
+# bash check_health.sh outputs/lato_ss_flow_v5
+```
+
+### 判断标准
+
+| 指标 | 正常 | 异常 |
+|------|:--:|:--:|
+| SH 3D | X/Y/Z span 均 > 10 | 任一轴 span=0 |
+| occ_bce | > 0.01 | 趋近于 0（3.5×10⁻⁸） |
+| MSE | 持续下降 | 不降或上升 |
+| NaN | 0 | > 0 |
+
+**四项全正常 = 继续训，不是 bug，只是训练不够。**
+
+---
+
 ## 🆕 v8 执行状态（2026-08-03）
 
 | 步骤 | 内容 | 状态 |
