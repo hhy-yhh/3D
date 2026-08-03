@@ -1497,9 +1497,91 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
 ## 已知影响范围
 
 - **SS Flow 需要重训：** 训练目标从 2D 变为 3D，SS Flow 学到的 2D 映射不再适用
-- **SLat Flow 理论上兼容：** Flow Matching 对坐标分布偏移有天然鲁棒性，且 v2 推理已验证 3D coords 输入（来自 TRELLIS SS Decoder）可正常产出 CD=0.214
+- **SLat Flow 通过 v2 推理验证可兼容 3D 输入：** 旧 SLat Flow 训练时虽然与 SS Flow 一样基于 2D latent，但 v2 推理已验证其接受 TRELLIS SS Decoder 产出的 3D coords 可正常产出 CD=0.214。SLat Flow 作为 sparse 128³ 上逐体素 feat 回归任务，对坐标分布敏感度远低于 dense latent 生成的 SS Flow。如果 v5 SS Flow 训好后评估发现 SLat 质量不达标，再按下方步骤重训
 - **LATO VAE 不受影响：** 预训练权重冻结，仅 encode 输入归一化方式变更
 - **推理管线无需改动：** 仅输入数据变化，代码不变
+
+---
+
+## 🆕 v8 SLat Flow 重训配置（备用）
+
+> 如果 v5 SS Flow + 旧 SLat Flow 组合的 CD > 0.5，按以下步骤重训 SLat Flow。
+
+### SLat Flow 训练 config（新建 `lato_slat_flow_v8.json`）
+
+与旧 config 的差异：
+- `--data_dir` 指向新 latent 目录 `lato_latents_v2/`
+- `max_num_voxels` 从 16384 提高到 65536（新 latent 体素数 29k-52k）
+- normalization stats 需从新 latent 重新计算
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+
+# 从新 latent 计算 normalization stats
+python3 << 'EOF'
+import numpy as np, glob, json
+
+d = "/data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128"
+feats_list = []
+for f in glob.glob(f"{d}/*.npz"):
+    feats = np.load(f, allow_pickle=True)['feats']  # [N, 16]
+    feats_list.append(feats)
+
+all_feats = np.concatenate(feats_list, axis=0)
+mean = all_feats.mean(axis=0).tolist()
+std = all_feats.std(axis=0).tolist()
+
+# 保存 stats
+stats = {"mean": mean, "std": std}
+with open(f"{d}/stats.json", "w") as f:
+    json.dump(stats, f, indent=2)
+
+print(f"stats.json 已保存（{len(feats_list)} 文件, {all_feats.shape[0]} 体素）")
+print(f"mean[:8]: {[f'{v:.4f}' for v in mean[:8]]}")
+print(f"std[:8]:  {[f'{v:.4f}' for v in std[:8]]}")
+EOF
+
+# 创建 v8 SLat config（基于旧 config 更新关键参数）
+python3 << 'EOF'
+import json
+
+with open("configs/generation/lato_slat_flow.json") as f:
+    cfg = json.load(f)
+
+# 加载新 stats
+with open("/data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json") as f:
+    stats = json.load(f)
+
+cfg["dataset"]["args"]["max_num_voxels"] = 65536
+cfg["dataset"]["args"]["normalization"] = stats
+cfg["models"]["denoiser"]["args"]["use_fp16"] = False  # fp32 训练
+
+with open("configs/generation/lato_slat_flow_v8.json", "w") as f:
+    json.dump(cfg, f, indent=2)
+print("configs/generation/lato_slat_flow_v8.json 已创建")
+EOF
+```
+
+### SLat Flow 训练命令
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+
+CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
+    --config configs/generation/lato_slat_flow_v8.json \
+    --data_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
+    --output_dir outputs/lato_slat_flow_v8 \
+    --num_gpus 1
+```
+
+| 项目 | 旧 | 🆕 v8 |
+|------|-----|------|
+| 训练数据 | `lato_latents/`（2D） | `lato_latents_v2/`（3D） |
+| max_num_voxels | 16384 | 65536 |
+| normalization | 旧 2D 统计 | 新 3D 统计 |
+| use_fp16 | true | false |
+| 预计步数 | 1,000,000 | 1,000,000 |
+| 预计时间 | ~4.5 天 | ~5 天（voxel 更多） |
 
 ---
 
@@ -1516,7 +1598,8 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
 | 步骤 2 | 更新 config：`occupancy_dir` → `ss_occupancy_128_v2` | ✅ 已改 |
 | 步骤 3 | 重置 StructureHead + 清理 Adam state | ⏳ 待执行 |
 | 步骤 4 | SS Flow + StructureHead 训练 | ⏳ 待执行 |
-| 步骤 5 | SLat Flow 训练（暂不重训，观察 v2 ckpt 兼容性） | ⏳ 待定 |
+| 步骤 5 | SLat Flow 训练：先复用旧 ckpt（v2 已验证兼容 3D coords）；若 CD>0.5 则用 v8 config 重训 | ⏳ 待 SS 训完评估 |
+| 步骤 6 | 最终评估 + CD/HD/NC 指标 | ⏳ 待定 |
 
 ### 新数据目录结构
 
