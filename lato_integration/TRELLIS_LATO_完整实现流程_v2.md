@@ -1500,4 +1500,81 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
 - **SLat Flow 理论上兼容：** Flow Matching 对坐标分布偏移有天然鲁棒性，且 v2 推理已验证 3D coords 输入（来自 TRELLIS SS Decoder）可正常产出 CD=0.214
 - **LATO VAE 不受影响：** 预训练权重冻结，仅 encode 输入归一化方式变更
 - **推理管线无需改动：** 仅输入数据变化，代码不变
+
+---
+
+## 🆕 v8 执行状态（2026-08-03）
+
+| 步骤 | 内容 | 状态 |
+|------|------|:--:|
+| 步骤 0 | STL 归一化：234 个 mesh → `meshes_normalized/` → 软链接 `meshes/` | ✅ 完成 |
+| 步骤 0 验证 | voxelization Z 轴 span=39-57（原 0），全部 3D | ✅ 通过 |
+| 步骤 1A | 重跑 LATO encode → `lato_latents_v2/` | ✅ 完成 |
+| 步骤 1A 验证 | 新 latent Z span=45-53（原 0），voxel 数 29k-52k（原固定 16k） | ✅ 通过 |
+| 步骤 1B | 生成 SS occupancy → `ss_occupancy_128_v2/`（234 个 npz） | ✅ 完成 |
+| 步骤 1B 验证 | occupancy X/Y/Z 全部 3D，体素数 29k-52k | ✅ 通过 |
+| 步骤 2 | 更新 config：`occupancy_dir` → `ss_occupancy_128_v2` | ✅ 已改 |
+| 步骤 3 | 重置 StructureHead + 清理 Adam state | ⏳ 待执行 |
+| 步骤 4 | SS Flow + StructureHead 训练 | ⏳ 待执行 |
+| 步骤 5 | SLat Flow 训练（暂不重训，观察 v2 ckpt 兼容性） | ⏳ 待定 |
+
+### 新数据目录结构
+
+```
+/data/huanghaoyang/3D/database_lato/
+├── meshes_mm_backup/          # 原始 mm 坐标 STL（备份）
+├── meshes_normalized/         # 🆕 归一化 STL（[-0.5, 0.5]）
+├── meshes → meshes_normalized # 软链接
+├── metadata.csv               # 不变
+├── test/                      # 测试集（不变）
+├── lato_latents/              # 旧 2D latent（v4-v7）
+├── lato_latents_v2/           # 🆕 3D latent
+│   └── latents/lato_vae_16dim_128/
+├── ss_occupancy_128/          # 旧 2D occupancy
+└── ss_occupancy_128_v2/       # 🆕 3D occupancy
+```
+
+### 启动训练
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+
+# 先重置 StructureHead + 清理 Adam state
+python3 << 'EOF'
+import torch, torch.nn as nn, os, glob
+ckpt_dir = "outputs/lato_ss_flow_v4/ckpts"
+misc_files = sorted(glob.glob(f"{ckpt_dir}/misc_step*.pt"))
+latest = misc_files[-1]
+step = int(os.path.basename(latest).replace("misc_step","").replace(".pt",""))
+
+sh_path = f"{ckpt_dir}/structure_head_step{step:07d}.pt"
+sh = torch.load(sh_path, map_location='cpu')
+for k in list(sh.keys()):
+    if 'weight' in k: nn.init.kaiming_normal_(sh[k])
+    elif 'bias' in k: sh[k].zero_()
+torch.save(sh, sh_path)
+print(f"StructureHead 权重重置 (step {step})")
+
+misc = torch.load(latest, map_location='cpu', weights_only=False)
+for g in misc['optimizer']['param_groups']:
+    for pid in g['params']:
+        s = misc['optimizer']['state'].get(pid, {})
+        ea = s.get('exp_avg')
+        if ea is not None and ea.numel() == 1 and ea.shape == torch.Size([1]):
+            for pid2 in g['params']:
+                st = misc['optimizer']['state'].get(pid2, {})
+                for k in ['exp_avg', 'exp_avg_sq']:
+                    if k in st and st[k] is not None: st[k].zero_()
+                st['step'] = 0
+            break
+torch.save(misc, latest)
+print("Adam state 已清理")
+EOF
+
+# 启动训练
+CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
+    --config configs/generation/lato_ss_flow_v3.json \
+    --data_dir /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/lato_ss_flow_v4 \
+    --num_gpus 1 --ckpt latest
 ```
