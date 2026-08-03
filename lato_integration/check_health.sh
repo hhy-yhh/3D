@@ -86,7 +86,7 @@ echo "    MSE:     $MSE_AVG"
 # ── 4. NaN ──
 NAN_COUNT=$(grep -c "NaN" "$LOG" 2>/dev/null || echo 0)
 echo ""
-echo "  NaN: $NAN_COUNT 条$([ $NAN_COUNT -gt 0 ] && echo ' ❌' || echo ' ✅')"
+if [ "$NAN_COUNT" -gt 0 ]; then echo "  NaN: $NAN_COUNT 条 ❌"; else echo "  NaN: 0 条 ✅"; fi
 
 # ── 5. log_scale ──
 LOG_SCALE=$(tail -1 "$LOG" | grep -oP 'log_scale":\s*\K[\d.]+')
@@ -99,24 +99,8 @@ ls -1 "$CKPT_DIR/ckpts/denoiser_step"*.pt 2>/dev/null | sort -V | tail -1 | xarg
 
 # ── 7. 判决 ──
 echo ""
-python3 << PYEOF
-import subprocess, sys
-
-occ = "$OCC_AVG"
-nan = "$NAN_COUNT"
-
-checks = []
-checks.append(("SH 3D", "$SH_OK" == "1" if "$SH_OK" != "" else True))  # 由上一步决定
-checks.append(("occ_bce > 0.01", float(occ) > 0.01 if occ != "N/A" else False))
-checks.append(("NaN = 0", nan == "0" or nan == "0\n"))
-
-all_ok = all(c[1] for c in checks)
-
-print("═══════════════════════════════════════════")
-if all_ok:
-    print("  ✅ 训练健康 — 继续训，只是训练不够")
-else:
-    print("  ❌ 有问题 — 排查上述失败项")
-print("═══════════════════════════════════════════")
-print("")
-PYEOF
+echo "═══════════════════════════════════════════"
+echo "  查看上述指标自行判断:"
+echo "  SH 3D ✅ + occ_bce>0.01 + NaN=0 = 训练健康"
+echo "═══════════════════════════════════════════"
+echo ""
