@@ -1589,104 +1589,45 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 > 每 10000 步跑一次（30 秒，不占训练 GPU），精确区分"训练不够"和"有 bug"。
 >
-> 本地文件: `lato_integration/check_health.sh`
+> **文件位置:** `check_health.sh`（TRELLIS 根目录）
 >
-> 用法: `bash lato_integration/check_health.sh outputs/lato_ss_flow_v5 0`
-
-```bash
-#!/bin/bash
-# ============================================================================
-# check_health.sh — 训练健康自检
-# 用法: bash check_health.sh [ckpt_dir] [gpu_id]
-# ============================================================================
-CKPT_DIR=${1:-outputs/lato_ss_flow_v5}
-GPU=${2:-0}
-LOG="$CKPT_DIR/log.txt"
-export CUDA_VISIBLE_DEVICES=$GPU
-
-echo ""
-echo "═══════════════════════════════════════════"
-echo "  训练健康检查: $CKPT_DIR"
-echo "  $(date '+%Y-%m-%d %H:%M:%S')"
-echo "═══════════════════════════════════════════"
-
-# ── 1. 训练步数 ──
-STEP=$(grep -oP '^\d+' "$LOG" | tail -1)
-echo "  训练步数: $STEP"
-
-# ── 2. StructureHead 3D？(固定 seed，只加载 StructureHead) ──
-python3 << 'PYEOF'
-import torch, glob, numpy as np, sys
-sys.path.insert(0, ".")
-from lato_integration.structure_head import LatoStructureHead
-
-d = "cuda:0"
-ckpt_dir = "${CKPT_DIR}/ckpts"
-shc = sorted(glob.glob(f"{ckpt_dir}/structure_head_step*.pt"))
-if not shc:
-    print("\n  ⏳ 无 StructureHead checkpoint，跳过")
-    exit(0)
-
-sh = LatoStructureHead(in_channels=8, base_channels=256, num_res_blocks=1).to(d)
-sh.load_state_dict(torch.load(shc[-1], map_location=d, weights_only=True), strict=False)
-sh.eval()
-
-torch.manual_seed(42)
-results = []
-for _ in range(3):
-    x = torch.randn(1, 8, 16, 16, 16, device=d) * 2
-    with torch.no_grad():
-        occ = sh(x)
-    pos = np.where(occ[0, 0].cpu().numpy() > 0)
-    n = len(pos[0])
-    if n > 0:
-        results.append({"n": n, "xs": pos[2].max()-pos[2].min(),
-                        "ys": pos[1].max()-pos[1].min(), "zs": pos[0].max()-pos[0].min()})
-
-if not results:
-    print("\n  ❌ SH 3D: 全部输出为负！StructureHead 未学习")
-else:
-    n_avg = int(np.mean([r["n"] for r in results]))
-    xs = int(np.mean([r["xs"] for r in results]))
-    ys = int(np.mean([r["ys"] for r in results]))
-    zs = int(np.mean([r["zs"] for r in results]))
-    ok = min(xs, ys, zs) > 10
-    print(f"\n  {'✅' if ok else '❌'} SH 3D: n={n_avg}  Xspan={xs}  Yspan={ys}  Zspan={zs}")
-    if not ok: print("     → StructureHead 塌缩为 2D，需排查！")
-PYEOF
-
-# ── 3. loss 趋势 ──
-OCC_AVG=$(grep "occ_bce_128" "$LOG" | tail -200 | grep -oP 'occ_bce_128":\s*\K[\d.]+' | awk '{s+=$1;n++}END{if(n>0)printf "%.4f",s/n; else print "N/A"}')
-MSE_AVG=$(grep -oP '"mse":\s*\K[\d.]+' "$LOG" | tail -200 | awk '{s+=$1;n++}END{if(n>0)printf "%.4f",s/n; else print "N/A"}')
-echo "\n  Loss 趋势（最近200步均值）:"
-echo "    occ_bce: $OCC_AVG"
-echo "    MSE:     $MSE_AVG"
-
-# ── 4. NaN ──
-NAN_COUNT=$(grep -c "NaN" "$LOG" 2>/dev/null || echo 0)
-echo "\n  NaN: $NAN_COUNT 条$([ $NAN_COUNT -gt 0 ] && echo ' ❌' || echo ' ✅')"
-
-# ── 5. checkpoint ──
-echo "\n  最新 checkpoint:"
-ls -1 "$CKPT_DIR/ckpts/denoiser_step"*.pt 2>/dev/null | sort -V | tail -1 | xargs basename | sed 's/^/    /'
-```
+> **用法:**
+> ```bash
+> cd /data/huanghaoyang/3D/TRELLIS
+> bash check_health.sh outputs/lato_ss_flow_v5 0
+> bash check_health.sh outputs/lato_ss_flow_v5 0 --data_dir /data/huanghaoyang/3D/database_lato  # 加载真实 latent 测试
+> ```
 
 ### 判断标准
 
 | 指标 | 正常 | 异常 |
 |------|:--:|:--:|
-| SH 3D | X/Y/Z span 均 > 10 | 任一轴 span=0 |
-| occ_bce | > 0.01 | 趋近于 0（3.5×10⁻⁸） |
+| SH 3D | X/Y/Z span 均 > 10，n > 0 | 全负（n=0）或任一轴 span=0 |
+| occ_bce | > 0.01 | 趋近于 0（3.5×10⁻⁸）或 N/A |
 | MSE | 持续下降 | 不降或上升 |
 | NaN | 0 | > 0 |
 
 **四项全正常 = 继续训，不是 bug，只是训练不够。**
-| SH 3D | X/Y/Z span 均 > 10 | 任一轴 span=0 |
-| occ_bce | > 0.01 | 趋近于 0（3.5×10⁻⁸） |
-| MSE | 持续下降 | 不降或上升 |
-| NaN | 0 | > 0 |
 
-**四项全正常 = 继续训，不是 bug，只是训练不够。**
+### 输出示例（健康）
+
+```
+=== 训练健康检查 @ 18:17 ===
+[SH 3D] ✅ n=99207 Xspan=106 Yspan=111 Zspan=111 (随机(0.1/0.5/1.0/2.0))
+  occ_bce(最近200均值): 0.0966
+  MSE(最近200均值):      0.0989
+  NaN: 0 条 ✅
+  step: 20000
+  denoiser:      denoiser_step0020000.pt
+  structure_head: structure_head_step0020000.pt
+```
+
+### 注意事项
+
+1. **必须在 TRELLIS 根目录运行**（不在 `lato_integration/` 子目录下），否则 ckpt 路径解析错误
+2. **推荐加 `--data_dir`** 用真实 SS latent 测试 StructureHead，比随机输入更准确
+3. **step 从 ckpt 文件名提取**（`denoiser_step0020000.pt` → 20000），不依赖 log 解析
+4. **测试输入不是 `randn*2`**（与 Flow Matching latent 分布不同，会产生误导的"全负"），而是多 scale 随机输入或真实 latent
 
 ---
 
