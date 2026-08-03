@@ -84,7 +84,8 @@ echo "    occ_bce: $OCC_AVG"
 echo "    MSE:     $MSE_AVG"
 
 # ── 4. NaN ──
-NAN_COUNT=$(grep -c "NaN" "$LOG" 2>/dev/null || echo 0)
+NAN_COUNT=$(grep -c "NaN" "$LOG" 2>/dev/null; echo 0)
+NAN_COUNT=$(echo "$NAN_COUNT" | head -1)
 echo ""
 if [ "$NAN_COUNT" -gt 0 ]; then echo "  NaN: $NAN_COUNT 条 ❌"; else echo "  NaN: 0 条 ✅"; fi
 
