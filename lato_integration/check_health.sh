@@ -11,12 +11,12 @@ LOG="$CKPT_DIR/log.txt"
 DATA_DIR=""
 
 # 解析 --data_dir
-for i in "$@"; do
-    if [ "$i" = "--data_dir" ]; then
-        shift
-        DATA_DIR="$2"
-    fi
-    shift 2>/dev/null
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --data_dir) DATA_DIR="$2"; shift 2 ;;
+        --data_dir=*) DATA_DIR="${1#*=}"; shift ;;
+        *) shift ;;
+    esac
 done
 
 export CUDA_VISIBLE_DEVICES=$GPU
@@ -30,9 +30,12 @@ echo "  $(date '+%H:%M')"
 echo "═══════════════════════════════════════════"
 
 # ── 1. 训练步数 ──
-# 🔧 兼容多种 log 格式：行首数字 / JSON "step" / 纯数字行
+# 🔧 优先匹配 JSON "step":N，fallback 行首数字
 if [ -f "$LOG" ]; then
-    STEP=$(grep -oP '(?:^\d+(?=:)|"step":\s*\d+|(?<!\w)\d{4,}(?!\w))' "$LOG" 2>/dev/null | grep -oP '\d+' | tail -1)
+    STEP=$(grep -oP '"step":\s*\K\d+' "$LOG" 2>/dev/null | tail -1)
+    if [ -z "$STEP" ]; then
+        STEP=$(grep -oP '^\d+' "$LOG" 2>/dev/null | tail -1)
+    fi
 else
     STEP=""
 fi
