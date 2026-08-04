@@ -406,7 +406,7 @@ def main():
     # ── 预加载 GT mesh ──
     print("\n预加载 GT mesh ...")
     gt_meshes = {}
-    sha256_col = "file_identifier" if "sha256" in test_samples[0] else None
+    sha256_col = "sha256" if "sha256" in test_samples[0] else None
     for sample in tqdm(test_samples, desc="Loading GT"):
         sha = sample[sha256_col] if sha256_col else sample.get("file_identifier", sample.get("ID"))
         gt_path = os.path.join(opt.gt_meshes, f"{sha}.stl")
