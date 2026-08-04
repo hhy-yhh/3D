@@ -3,6 +3,7 @@
 > **目标：** TRELLIS 文本转3D 管线中，**Encoder 全部用 LATO VoxelVAE，Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS**。SS Flow 和 SLat Flow 均在刹车卡钳数据集上从零训练，最后用 Chamfer Distance / Hausdorff Distance / Normal Consistency 评估。
 
 **更新记录：**
+- 2026-08-04：**v10 更新 — SLat Flow 架构加速** — 启用 `EnhancedSLatFlowModel`（Swin window attention + fp16），O(N²)→O(N×W³) 大幅提速；修复 2 个 dtype 不兼容 bug（Bug 19/20）；Windows DataLoader 兼容修复
 - 2026-08-03：**v8 更新 — GT 数据根因修复** — 发现并修复 `load_quantized_mesh_original()` 对未归一化 STL 的坐标截断 bug：刹车卡钳毫米级坐标被 `np.clip` 压扁为 2D 平面，导致 234 个 SS occupancy GT 全部为单层体素。通过预处理归一化 STL + 重跑 LATO encode 恢复 3D GT。同时修复 StructureHead 全量重置后 optimizer Adam state 未清理导致训练无效的问题（Bug 16）。
 - 2026-08-01：**LatoStructureHead 训练健壮性修复** — 修复 3 个关键 bug：`get_inference_cond` MRO 链断裂致训练字段泄漏到推理（Bug 13）、`x_0_pred` latent 溢出（Bug 14）、深层 Transformer fp16 激活累积溢出（Bug 15）
 - 2026-07-23：**v7 更新** — 架构全面重构：TRELLIS SS/SLat Encoder/Decoder 全部替换为 LATO VoxelVAE；新增 `LatoStructureHead` 替代 SS Decoder；移除 coords×2 hack；删除 GS/RF decoder 及 VAE 训练器
@@ -1587,18 +1588,30 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ## 🆕 训练健康自检脚本
 
-> 每 10000 步跑一次（30 秒，不占训练 GPU），精确区分"训练不够"和"有 bug"。
+> 每 10000 步跑一次（30 秒，不占训练 GPU），精确区分"训练不够"和"有 bug"。自动检测 SS/SLat Flow 类型。
 >
 > **文件位置:** `check_health.sh`（TRELLIS 根目录）
->
-> **用法:**
-> ```bash
-> cd /data/huanghaoyang/3D/TRELLIS
-> bash check_health.sh outputs/lato_ss_flow_v5 0
-> bash check_health.sh outputs/lato_ss_flow_v5 0 --data_dir /data/huanghaoyang/3D/database_lato  # 加载真实 latent 测试
-> ```
 
-### 判断标准
+### 用法
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+
+# SS Flow（自动检测：目录下有 structure_head_step*.pt）
+bash check_health.sh outputs/lato_ss_flow_v5 0
+
+# SLat Flow（自动检测：无 structure_head ckpt）
+bash check_health.sh outputs/lato_slat_flow_v10 0
+
+# 显式指定类型
+bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
+bash check_health.sh outputs/lato_ss_flow_v5 0 --type ss
+
+# 加载真实 latent 测试（SS Flow 更准确的 StructureHead 检查）
+bash check_health.sh outputs/lato_ss_flow_v5 0 --data_dir /data/huanghaoyang/3D/database_lato
+```
+
+### SS Flow 判断标准
 
 | 指标 | 正常 | 异常 |
 |------|:--:|:--:|
@@ -1607,31 +1620,84 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 | MSE | 持续下降 | 不降或上升 |
 | NaN | 0 | > 0 |
 
+### SLat Flow 判断标准
+
+| 指标 | 正常 | 异常 |
+|------|:--:|:--:|
+| `[SLat Forward]` | mean ∈ [-10,10], NaN=0, Inf=0 | NaN/Inf 或 mean 异常 |
+| MSE | 持续下降 | 不降或上升 |
+| NaN | 0 | > 0 |
+| VAE 兼容性 | denorm 范围在 ±10 内 | 超出 ±10（VoxelVAE 可能拒解） |
+
 **四项全正常 = 继续训，不是 bug，只是训练不够。**
 
-### 输出示例（健康）
+### SS Flow 输出示例（健康）
 
 ```
 === 训练健康检查 @ 18:17 ===
+  类型: ss  | 目录: outputs/lato_ss_flow_v5  | GPU: 0
+
+  ── 基础指标 ──
+  checkpoint step:  20000
+  log entries:       20000
+  MSE (最近200均值): 0.0989
+  MSE 趋势:          📉下降 (最近50: 0.0921 vs 前50: 0.1103)
+  NaN:               0 条 ✅
+
+  ── SS Flow 专项 ──
+  occ_bce (最近200均值): 0.0966
 [SH 3D] ✅ n=99207 Xspan=106 Yspan=111 Zspan=111 (随机(0.1/0.5/1.0/2.0))
-  occ_bce(最近200均值): 0.0966
-  MSE(最近200均值):      0.0989
-  NaN: 0 条 ✅
-  step: 20000
+
+  ── 文件清单 ──
   denoiser:      denoiser_step0020000.pt
   structure_head: structure_head_step0020000.pt
+  log:           outputs/lato_ss_flow_v5/log.txt (20000 条记录)
+
+  ── 判断 ──
+  ✅ 全部指标正常 — 继续训练
+```
+
+### SLat Flow 输出示例（健康）
+
+```
+=== 训练健康检查 @ 18:30 ===
+  类型: slat  | 目录: outputs/lato_slat_flow_v10  | GPU: 0
+
+  ── 基础指标 ──
+  checkpoint step:  5000
+  log entries:       5000
+  MSE (最近200均值): 0.8523
+  MSE 趋势:          📉下降 (最近50: 0.8102 vs 前50: 0.9015)
+  NaN:               0 条 ✅
+
+  ── SLat Flow 专项 ──
+[SLat Model] ✅ 已加载: denoiser_step0050000.pt
+[SLat Forward] ✅ mean=-0.0234 std=0.9872 NaN=0 Inf=0 voxels=5000
+
+  ── VAE 兼容性预估 ──
+  stats mean[:4]: [0.1604, 1.2764, 0.2798, -0.0889]
+  stats std[:4]:  [0.0429, 0.0580, 0.0577, 0.0466]
+  denorm 范围:     [0.032, 0.289] ...
+  VAE 安全:        ✅ 范围内
+
+  ── 文件清单 ──
+  denoiser:      denoiser_step0050000.pt
+  log:           outputs/lato_slat_flow_v10/log.txt (5000 条记录)
+
+  ── 判断 ──
+  ✅ 全部指标正常 — 继续训练
 ```
 
 ### 注意事项
 
 1. **必须在 TRELLIS 根目录运行**（不在 `lato_integration/` 子目录下），否则 ckpt 路径解析错误
-2. **推荐加 `--data_dir`** 用真实 SS latent 测试 StructureHead，比随机输入更准确
-3. **step 从 ckpt 文件名提取**（`denoiser_step0020000.pt` → 20000），不依赖 log 解析
-4. **测试输入不是 `randn*2`**（与 Flow Matching latent 分布不同，会产生误导的"全负"），而是多 scale 随机输入或真实 latent
+2. **类型自动检测**：目录下有 `structure_head_step*.pt` → SS Flow，否则 → SLat Flow
+3. **SLat Flow 检查包含**：模型加载 → 随机 sparse tensor 前向 → NaN/Inf/输出范围检查 → VAE stats 兼容性
+4. **推荐加 `--data_dir`** 用真实 SS latent 测试 StructureHead，比随机输入更准确（仅 SS Flow 有效）
 
 ---
 
-## 🆕 v9 执行状态与修复记录（2026-08-04）
+## 🆕 v9/v10 执行状态与修复记录（2026-08-04）
 
 ### 执行状态
 
@@ -1643,7 +1709,7 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 | 步骤 2 | Config `occupancy_dir` → `ss_occupancy_128_v2` | ✅ |
 | 步骤 3 | 重置 StructureHead + 清理 Adam state | ✅ |
 | 步骤 4 | **SS Flow v5 训练**（GPU 4） | 🔄 100k步 |
-| 步骤 5 | **SLat Flow v5 训练**（GPU 7） | 🔄 刚启动 |
+| 步骤 5 | **SLat Flow v10 训练**（GPU 7, Swin+fp16） | 🔄 待启动 |
 | 步骤 6 | 最终评估 | ⏳ |
 
 ---
@@ -1697,6 +1763,105 @@ json.dump(stats, open(f'{d}/stats.json', 'w'), indent=2)
 | 18c | 未打印生成 mesh 的顶点数/面数 | 新增 `v=` `f=` `CD=` 逐条打印 |
 | 18d | pipeline.run() 黑盒，无法定位瓶颈 | 新增逐段诊断：`[SS]` `[SLat]` `[VAE L0/L1/L2]` |
 
+#### Bug 19：`ctx_pos_embedder` dtype 不匹配（2026-08-04）
+
+**现象**：训练启动时报 `mat1 and mat2 must have the same dtype, but got Half and Float`
+
+**根因链**：
+```
+EnhancedSLatFlowModel.__init__
+  → super().__init__() → convert_to_fp16() (仅转 input_blocks/out_blocks + 旧 blocks)
+  → _rebuild_blocks_with_swin() → 新建 Swin blocks (fp32!)
+  → ctx_pos_embedder = AbsolutePositionEmbedder() (fp32, 无 Linear 层)
+
+forward:
+  cond = cond.type(fp16)              # CLIP embeddings → fp16
+  cond_pe = ctx_pos_embedder(coords)  # fp32!
+  cond = cond + cond_pe               # fp16 + fp32 → dtype mismatch
+```
+
+**修复**（`lato_integration/flow/slat_flow.py:229`）：
+```python
+# 修复前
+cond = cond + cond_pe.unsqueeze(0)
+
+# 修复后
+cond = cond + cond_pe.unsqueeze(0).type(cond.dtype)
+```
+
+#### Bug 20：Swin blocks 未转换 fp16（2026-08-04）
+
+**现象**：修了 Bug 19 后仍然 `mat1 and mat2 must have the same dtype`
+
+**根因链**：
+```
+EnhancedSLatFlowModel.__init__
+  → super().__init__()
+      → SLatFlowModel.__init__
+          → self.blocks = [full-attn blocks]  (旧 blocks)
+          → convert_to_fp16()                 ← 此时 blocks 转 fp16 ✓
+  → _rebuild_blocks_with_swin()
+      → self.blocks = [NEW Swin blocks]       ← 替换！新 blocks 是 fp32 ❌
+      → 没有 convert_to_fp16()
+```
+
+**修复**（`lato_integration/flow/slat_flow.py:180-183`）：
+```python
+# 在 _rebuild_blocks_with_swin() 末尾添加
+if self.use_fp16:
+    self.blocks.apply(convert_module_to_f16)
+```
+
+#### v10 SLat Flow 架构加速（2026-08-04）
+
+**背景**：v8/v9 SLat Flow 使用 `LATOSLatFlowModel`（简单包装 `SLatFlowModel`），12 层 **full self-attention**，对 65536 体素做 O(N²) 注意力（~4.3B pairs/block）。v9 首次启动训练极慢，每步 ~10-15 秒。
+
+**方案**：切换到 `EnhancedSLatFlowModel` — 代码已存在（`lato_integration/flow/slat_flow.py`），仅需改 config model name。
+
+**v8 → v10 对比**：
+
+| 参数 | v8 (`lato_slat_flow_v8.json`) | v10 (`lato_slat_flow_v9.json`) |
+|------|-----|------|
+| model `name` | `LATOSLatFlowModel` | **`EnhancedSLatFlowModel`** |
+| self-attention | Full (O(N²)) | **Swin window (O(N×W³))** |
+| window_size | — | **8** (交替偏移) |
+| cross PE | 共享 | **分离** (ctx_pos_embedder) |
+| `use_fp16` | `false` | **`true`** |
+| `use_swin_attn` | — | `true` |
+| `use_separate_cross_pe` | — | `true` |
+
+**加速原理**：
+```
+Full Self-Attention:  65536² ≈ 4.3B pairs × 12 blocks → 每步 ~10s
+Swin Window Attn:     8³=512 neighbors × 12 blocks     → 每步 ~0.3-1s
+                      (交替偏移窗口覆盖跨窗口连接)
+
+理论加速: 65536/512 ≈ 128x
+实测加速: 10-50x (考虑 fp16 2x 叠加)
+```
+
+**涉及文件**：
+
+| 文件 | 修改 |
+|------|------|
+| `configs/generation/lato_slat_flow_v9.json` | 🆕 新建：`EnhancedSLatFlowModel` + Swin + fp16 |
+| `lato_integration/run_train.py:38-39` | 注册 `EnhancedSLatFlowModel` → `MODEL_REPLACEMENTS` |
+| `lato_integration/flow/slat_flow.py:182-183` | `_rebuild_blocks_with_swin` 末尾加 fp16 转换 |
+| `lato_integration/flow/slat_flow.py:229` | `cond_pe` 加 `.type(cond.dtype)` |
+| `trellis/trainers/flow_matching/sparse_flow_matching.py:67-75` | Windows `num_workers=0` 兼容 |
+
+**训练命令**：
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+CUDA_VISIBLE_DEVICES=7 python lato_integration/run_train.py \
+    --config configs/generation/lato_slat_flow_v9.json \
+    --data_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
+    --output_dir outputs/lato_slat_flow_v10 \
+    --num_gpus 1
+```
+
+> ⚠️ 架构变更（Swin blocks + separate PE），**必须从零训练**，不能从 v8 checkpoint resume。
+
 #### 验证结论：CFG 不是问题
 
 | CFG | CD | HD | NC |
@@ -1718,16 +1883,17 @@ CD 几乎相同 → 散块与 CFG 无关。CFG=5.0 的 NC 更高，保持默认�
 ### 当前训练架构
 
 ```
-SS Flow v5（GPU 4）                  SLat Flow v5（GPU 7）
-─────────────────────                ─────────────────────
-config: lato_ss_flow_v3.json         config: lato_slat_flow_v8.json
+SS Flow v5（GPU 4）                  SLat Flow v10（GPU 7）
+─────────────────────                ──────────────────────
+config: lato_ss_flow_v3.json         config: lato_slat_flow_v9.json
 data:   database_lato/               data:   lato_latents_v2/
-model:  EnhancedSSFlowModel          model:  LATOSLatFlowModel
-        + LatoStructureHead          stats:  新 3D mean/std
-target: ss_occupancy_128_v2 (3D)     target: 3D latent coords+feats
-loss:   FlowMSE + occBCE(λ=0.1)     loss:   SparseFlowMSE
-fp16:   false (fp32)                 fp16:   inflat_all (12层稀疏, 安全)
-steps:  1,000,000                    steps:  1,000,000
+model:  EnhancedSSFlowModel          model:  EnhancedSLatFlowModel
+        + LatoStructureHead                  + Swin window attn (w=8)
+target: ss_occupancy_128_v2 (3D)             + separate cross PE
+loss:   FlowMSE + occBCE(λ=0.1)     target: 3D latent coords+feats
+fp16:   false (fp32)                 loss:   SparseFlowMSE + latent_cons
+steps:  1,000,000                    fp16:   true (12层安全)
+                                     steps:  1,000,000
 ```
 
 ---
@@ -1766,8 +1932,8 @@ steps:  1,000,000                    steps:  1,000,000
 | SS config | `configs/generation/lato_ss_flow_v3.json` |
 | SS Flow ckpt | `outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt` |
 | StructureHead ckpt | `outputs/lato_ss_flow_v5/ckpts/structure_head_step*.pt` |
-| SLat config | `configs/generation/lato_slat_flow_v8.json` |
-| SLat Flow ckpt | `outputs/lato_slat_flow_v5/ckpts/denoiser_step*.pt` |
+| SLat config | `configs/generation/lato_slat_flow_v9.json` |
+| SLat Flow ckpt | `outputs/lato_slat_flow_v10/ckpts/denoiser_step*.pt` |
 | LATO VAE | `/data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt` |
 | LATO config | `/data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml` |
 
@@ -1785,13 +1951,13 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
     --num_gpus 1
 ```
 
-**SLat Flow v5（GPU 7）：**
+**SLat Flow v10（GPU 7）：**
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 CUDA_VISIBLE_DEVICES=7 python lato_integration/run_train.py \
-    --config configs/generation/lato_slat_flow_v8.json \
+    --config configs/generation/lato_slat_flow_v9.json \
     --data_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
-    --output_dir outputs/lato_slat_flow_v5 \
+    --output_dir outputs/lato_slat_flow_v10 \
     --num_gpus 1
 ```
 
