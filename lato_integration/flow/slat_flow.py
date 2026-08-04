@@ -222,7 +222,7 @@ class EnhancedSLatFlowModel(_SLatFlowModel):
                 torch.zeros_like(ctx_positions),
             ], dim=-1)  # [N_ctx, 3]
             cond_pe = self.ctx_pos_embedder(ctx_coords_3d)  # [N_ctx, cond_channels]
-            cond = cond + cond_pe.unsqueeze(0)  # [B, N_ctx, cond_channels]
+            cond = cond + cond_pe.unsqueeze(0).type(cond.dtype)  # [B, N_ctx, cond_channels]
 
         skips = []
         # IO input blocks
