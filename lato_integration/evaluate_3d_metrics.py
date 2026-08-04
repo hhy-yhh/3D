@@ -404,23 +404,28 @@ def main():
     print("=" * 60)
 
     # ── 预加载 GT mesh ──
+    # 优先使用 CSV 的 file_path 列（绝对路径），fallback 到 file_identifier + --gt_meshes
     print("\n预加载 GT mesh ...")
     gt_meshes = {}
-    sha256_col = "sha256" if "sha256" in test_samples[0] else None
     for sample in tqdm(test_samples, desc="Loading GT"):
-        sha = sample[sha256_col] if sha256_col else sample.get("file_identifier", sample.get("ID"))
-        gt_path = os.path.join(opt.gt_meshes, f"{sha}.stl")
+        key = sample.get("file_identifier", sample.get("ID"))
+        # 1) 优先：CSV 里的 file_path 绝对路径
+        gt_path = sample.get("file_path", "")
+        if gt_path and os.path.exists(gt_path):
+            pass  # 直接用
+        else:
+            # 2) fallback: --gt_meshes/{file_identifier}.stl
+            gt_path = os.path.join(opt.gt_meshes, f"{key}.stl")
         if not os.path.exists(gt_path):
-            # 尝试其他扩展名
             for ext in [".obj", ".ply", ".glb"]:
-                alt = os.path.join(opt.gt_meshes, f"{sha}{ext}")
+                alt = os.path.join(opt.gt_meshes, f"{key}{ext}")
                 if os.path.exists(alt):
                     gt_path = alt
                     break
         try:
-            gt_meshes[sha] = trimesh.load(gt_path, force="mesh")
+            gt_meshes[key] = trimesh.load(gt_path, force="mesh")
         except Exception as e:
-            print(f"  [WARN] 无法加载 {sha}: {e}")
+            print(f"  [WARN] 无法加载 {key}: {e}")
 
     print(f"  已加载 {len(gt_meshes)} 个 GT mesh")
 
@@ -434,11 +439,13 @@ def main():
     print("=" * 60)
 
     for idx, sample in enumerate(tqdm(test_samples, desc="Evaluating")):
-        sha = sample[sha256_col] if sha256_col else sample.get("file_identifier", sample.get("ID"))
+        key = sample.get("file_identifier", sample.get("ID"))
 
-        if sha not in gt_meshes:
-            failures.append({"sha": sha, "error": "GT mesh not found"})
+        if key not in gt_meshes:
+            failures.append({"sha": key, "error": "GT mesh not found"})
             continue
+
+        sha = key  # 统一后续变量名
 
         # 获取 prompt
         if captions_col and sample.get(captions_col):
