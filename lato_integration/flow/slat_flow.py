@@ -172,8 +172,13 @@ class EnhancedSLatFlowModel(_SLatFlowModel):
             for attn_mode, window_size, shift_sequence, shift_window, serialize_mode
             in _swin_block_config(self.num_blocks, self._window_size)
         ])
-        # 重新初始化 weights
+        # 对新 blocks 应用与父类一致的 xavier_uniform 初始化
         for block in self.blocks:
+            for module in block.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
             if not self.share_mod:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
