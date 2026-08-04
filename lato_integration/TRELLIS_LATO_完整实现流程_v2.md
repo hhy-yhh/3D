@@ -1747,3 +1747,40 @@ python lato_integration/evaluate_3d_metrics.py \
     --limit 1 \
     --save_meshes
 ```
+
+### 训练质量巡检（每 10k 步）
+
+> health check 确认"没坏"，但无法验证生成质量。每 10k 步跑推理看实际 mesh 成型程度。
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=xformers
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
+STEP=$(basename "$SS_CKPT" | sed 's/denoiser_step//;s/\.pt//')
+
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" \
+    --slat_ckpt "$SLAT_CKPT" \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/eval_step${STEP} \
+    --limit 1 \
+    --save_meshes
+
+ls outputs/eval_step${STEP}/meshes/
+```
+
+**判断标准：**
+
+| 指标 | 散块（未成型）| 开始成型 | 充分收敛 |
+|------|:--:|:--:|:--:|
+| CD ↓ | >0.20 | 0.10-0.15 | <0.08 |
+| 顶点数 | <500 | 1000-3000 | >3000 |
+| 面数 | <200 | 500-2000 | >2000 |
+| 视觉 | 零星碎片 | 可辨轮廓 | 完整形状 |

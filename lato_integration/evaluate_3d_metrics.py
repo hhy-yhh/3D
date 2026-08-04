@@ -502,8 +502,11 @@ def main():
             results.append({
                 "sha": sha,
                 "prompt": prompt,
+                "num_vertices": len(pred_mesh.vertices),
+                "num_faces": len(pred_mesh.faces),
                 **metrics,
             })
+            print(f"    v={len(pred_mesh.vertices)} f={len(pred_mesh.faces)} CD={metrics['chamfer_distance']:.4f}")
 
         except Exception as e:
             failures.append({"sha": sha, "error": str(e)})
