@@ -190,24 +190,44 @@ bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
 ## 推理全链路
 
 ```
-[1] CLIP.encode(prompt) → cond [1, 77, 768]
-
-[2] SS Flow.sample(noise[1,8,16³], cond, steps=20, cfg=5.0)
-    → z_s [1, 8, 16, 16, 16]
-
-[3] LatoStructureHead(z_s)
-    → occ_logits [1, 1, 128, 128, 128]
-    → argwhere(>0) → coords [N, 4] int
-
-[4] SLat Flow.sample(noise[N,16]@coords, cond, steps=20, cfg=5.0)
-    → slat [N, 16] (归一化空间)
-    → slat * std + mean  ← 反归一化（stats.json）
-
-[5] TRELLIS SparseTensor → LATO SparseTensor
-    → LATO VoxelVAE.decode() → vertex hierarchy
-
-[6] KDTree(vertices) → ConnectionHead → edges → triangulation → mesh
-    → CD / HD / NC vs GT
+Step 1 ─ CLIP 文本编码
+│  功能: prompt → text embeddings [1, 77, 768] + null embedding (CFG)
+│  文件: trellis/pipelines/trellis_text_to_3d.py → get_cond()
+│        (内部调用 transformers.CLIPTextModel)
+│
+├─ Step 2 ─ SS Flow 去噪采样
+│  功能: 随机噪声 → 20步 Flow Matching Euler 迭代 → dense latent [1, 8, 16³]
+│  文件: trellis/pipelines/trellis_text_to_3d.py → sample_sparse_structure_lato()
+│        trellis/pipelines/samplers/flow_euler.py → FlowEulerSampler.sample()
+│        lato_integration/flow/ss_flow.py → EnhancedSSFlowModel.forward()
+│
+├─ Step 3 ─ LatoStructureHead → coords
+│  功能: dense 16³ → 3级 2× 上采样 → occupancy logits [1, 1, 128³]
+│        → argwhere(>0) → coords [N, 4] int @ res128
+│  文件: lato_integration/structure_head.py → LatoStructureHead.forward()
+│                                         → coords_from_occupancy()
+│
+├─ Step 4 ─ SLat Flow 去噪采样 + 反归一化
+│  功能: coords + 随机噪声 → SparseTensor → 20步迭代去噪 → slat [N, 16]
+│        → slat = slat * std + mean  (反归一化，恢复原始特征尺度)
+│  文件: trellis/pipelines/trellis_text_to_3d.py → sample_slat()
+│        lato_integration/flow/slat_flow.py → EnhancedSLatFlowModel.forward()
+│        归一化/反归一化: trellis/datasets/structured_latent.py (训练)
+│                         trellis_text_to_3d.py:236-238 (推理)
+│
+├─ Step 5 ─ TRELLIS → LATO SparseTensor 转换 → VoxelVAE decode
+│  功能: TRELLIS SparseTensor → LATO SparseTensor (不同库，不同实现)
+│        → VoxelVAE.decode(training=False) → 多级 vertex hierarchy
+│  文件: trellis/pipelines/trellis_text_to_3d.py → decode_slat_lato()
+│        LATO: lato/models/lato_vae/lato_vae.py → VoxelVAE.decode()
+│
+└─ Step 6 ─ ConnectionHead → 边预测 → 三角面片化 → Mesh
+   功能: vertex_coords/feats → KDTree(k=32) → 候选边对
+        → ConnectionHead → sigmoid → threshold(0.45) 过滤
+        → NetworkX 公共邻居法 → 三角面 → trimesh.Trimesh → .obj
+   文件: lato_integration/inference_lato.py → predict_edges_batched()
+                                            → edges_to_mesh()
+        LATO: vertex_encoder.py → ConnectionHead
 ```
 
 ---
