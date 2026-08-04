@@ -458,19 +458,42 @@ def main():
 
         try:
             with torch.no_grad():
-                            outputs = pipeline.run(
-                    prompt,
-                    seed=opt.seed,
-                    sparse_structure_sampler_params={
-                        "steps": opt.ss_steps,
-                        "cfg_strength": opt.cfg_strength,
-                    },
-                    slat_sampler_params={
-                        "steps": opt.slat_steps,
-                        "cfg_strength": opt.cfg_strength,
-                    },
-                    formats=["mesh"],
-                )
+                # ── 🔍 逐段诊断 ──
+                cond = pipeline.get_cond([prompt])
+                torch.manual_seed(opt.seed)
+
+                # 1) SS Flow → StructureHead
+                flow_model = pipeline.models['sparse_structure_flow_model']
+                head = pipeline.models['lato_structure_head']
+                dtype = next(flow_model.parameters()).dtype
+                noise = torch.randn(1, flow_model.in_channels, flow_model.resolution,
+                                    flow_model.resolution, flow_model.resolution,
+                                    dtype=dtype, device=device)
+                ss_params = {**pipeline.sparse_structure_sampler_params,
+                             "steps": opt.ss_steps, "cfg_strength": opt.cfg_strength}
+                z_s = pipeline.sparse_structure_sampler.sample(
+                    flow_model, noise, **cond, **ss_params, verbose=False
+                ).samples
+                occ_logits = head(z_s)
+                n_active = (occ_logits > 0).sum().item()
+                print(f"  [SS] occ_logits mean={occ_logits.mean():.2f} min={occ_logits.min():.2f} max={occ_logits.max():.2f} active(>0)={n_active}")
+
+                coords = torch.argwhere(occ_logits > 0)[:, [0, 2, 3, 4]].int()
+                print(f"  [SS] coords={coords.shape[0]}")
+
+                # 2) SLat Flow
+                slat = pipeline.sample_slat(cond, coords,
+                    sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
+                print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f}")
+
+                # 3) LATO VoxelVAE decode
+                outputs = pipeline.decode_slat(slat, formats=["mesh"])
+                dec = outputs.get("lato_decoded", [])
+                for i, level in enumerate(dec):
+                    vr = level.get("vertex", {})
+                    vc = vr.get("coords")
+                    nv = vc.shape[0] if vc is not None else 0
+                    print(f"  [VAE L{i}] vertices={nv}")
 
             pred_mesh = extract_mesh_from_output(
                 outputs, connection_head, model_cfg, device, opt.edge_threshold, opt.k_neighbors
