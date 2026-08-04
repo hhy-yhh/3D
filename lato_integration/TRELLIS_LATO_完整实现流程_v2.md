@@ -1631,7 +1631,7 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ---
 
-## 🆕 v8 执行状态（2026-08-03）
+## 🆕 v9 执行状态（2026-08-04）
 
 | 步骤 | 内容 | 状态 |
 |------|------|:--:|
@@ -1642,68 +1642,108 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 | 步骤 1B | 生成 SS occupancy → `ss_occupancy_128_v2/`（234 个 npz） | ✅ 完成 |
 | 步骤 1B 验证 | occupancy X/Y/Z 全部 3D，体素数 29k-52k | ✅ 通过 |
 | 步骤 2 | 更新 config：`occupancy_dir` → `ss_occupancy_128_v2` | ✅ 已改 |
-| 步骤 3 | 重置 StructureHead + 清理 Adam state | ⏳ 待执行 |
-| 步骤 4 | SS Flow + StructureHead 训练 | ⏳ 待执行 |
-| 步骤 5 | SLat Flow 训练：先复用旧 ckpt（v2 已验证兼容 3D coords）；若 CD>0.5 则用 v8 config 重训 | ⏳ 待 SS 训完评估 |
+| 步骤 3 | 重置 StructureHead + 清理 Adam state | ✅ 完成 |
+| 步骤 4 | SS Flow + StructureHead 训练 → `outputs/lato_ss_flow_v5/` | 🔄 90k步，继续中 |
+| 步骤 4 验证 | 健康检查全绿（SH 3D✅, occ_bce=0.038, MSE=0.024, NaN=0）| ✅ 通过 |
+| 步骤 5 | SLat Flow 训练 | ⏳ 待 SS 训完评估 |
 | 步骤 6 | 最终评估 + CD/HD/NC 指标 | ⏳ 待定 |
 
-### 新数据目录结构
+---
+
+## 🆕 v9 已验证文件路径汇总（2026-08-04）
+
+> 以下所有路径均经过 234/234 或 21/21 全量匹配验证。
+
+### 数据目录结构
 
 ```
 /data/huanghaoyang/3D/database_lato/
-├── meshes_mm_backup/          # 原始 mm 坐标 STL（备份）
-├── meshes_normalized/         # 🆕 归一化 STL（[-0.5, 0.5]）
-├── meshes → meshes_normalized # 软链接
-├── metadata.csv               # 不变
-├── test/                      # 测试集（不变）
-├── lato_latents/              # 旧 2D latent（v4-v7）
-├── lato_latents_v2/           # 🆕 3D latent
-│   └── latents/lato_vae_16dim_128/
-├── ss_occupancy_128/          # 旧 2D occupancy
-└── ss_occupancy_128_v2/       # 🆕 3D occupancy
+├── metadata.csv                        # 训练集 234 条
+├── test/
+│   └── metadata.csv                    # 测试集 21 条
+├── meshes_mm_backup/                   # 原始 mm 坐标 STL（备份，sha256 命名）
+├── meshes_normalized/                  # 🆕 归一化 STL [-0.5, 0.5]（sha256 命名）
+├── meshes → meshes_normalized          # 软链接
+├── lato_latents_v2/                    # 🆕 3D latent
+│   └── latents/lato_vae_16dim_128/     # 234 个 npz, Zspan>40
+├── ss_occupancy_128_v2/                # 🆕 3D occupancy（234 个 npz, Zspan>40）
+└── ss_latents/
+    └── ss_enc_conv3d_16l8_fp16/        # TRELLIS SS latent（255 个 npz，训练+测试）
 ```
 
-### 启动训练
+### 训练数据（234 条，全部匹配）
+
+| 数据 | 路径 | 匹配 |
+|------|------|:--:|
+| metadata | `/data/huanghaoyang/3D/database_lato/metadata.csv` | — |
+| SS latent | `/data/huanghaoyang/3D/database_lato/ss_latents/ss_enc_conv3d_16l8_fp16/{sha256}.npz` | 234/234 |
+| occupancy | `/data/huanghaoyang/3D/database_lato/ss_occupancy_128_v2/{sha256}.npz` | 234/234 |
+
+### 测试数据（21 条）
+
+| 数据 | 路径 | 匹配 |
+|------|------|:--:|
+| metadata | `/data/huanghaoyang/3D/database_lato/test/metadata.csv` | — |
+| SS latent | `/data/huanghaoyang/3D/database_lato/ss_latents/ss_enc_conv3d_16l8_fp16/{sha256}.npz` | 21/21 |
+| GT mesh | CSV `file_path` 列 → `/data/huanghaoyang/3D/database/{file_identifier}.stl` | 21/21 |
+
+### 模型文件
+
+| 模型 | 路径 |
+|------|------|
+| SS config | `configs/generation/lato_ss_flow_v3.json` |
+| SS Flow ckpt | `outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt` |
+| StructureHead ckpt | `outputs/lato_ss_flow_v5/ckpts/structure_head_step*.pt` |
+| SLat config | `configs/generation/lato_slat_flow.json` |
+| SLat Flow ckpt | `outputs/lato_slat_flow/ckpts/denoiser_step*.pt` |
+| LATO VAE ckpt | `/data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt` |
+| LATO config | `/data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml` |
+
+### 已删除（旧 2D 数据）
+
+| 目录 | 原因 |
+|------|------|
+| `ss_occupancy_128/` | Zspan=0，2D 扁平 |
+| `lato_latents/` | Zspan=0，2D 扁平 |
+
+### 关键说明
+
+- **instance 匹配方式**：`StandardDatasetBase` 用 CSV 的 `sha256` 列作为 instance，拼路径 `{root}/{subdir}/{sha256}.npz`
+- **occupancy 在训练中的作用**：仅 StructureHead 的 BCE loss 使用，`lambda_occupancy=0.1`；SS Flow 的 Flow Matching MSE 不受影响
+- **evaluate_3d_metrics.py 已修复**：GT mesh 加载改为优先使用 CSV 的 `file_path` 绝对路径，解决 sha256 文件名不匹配问题
+
+---
+
+### 训练命令（当前 v5）
 
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
-
-# 先重置 StructureHead + 清理 Adam state
-python3 << 'EOF'
-import torch, torch.nn as nn, os, glob
-ckpt_dir = "outputs/lato_ss_flow_v4/ckpts"
-misc_files = sorted(glob.glob(f"{ckpt_dir}/misc_step*.pt"))
-latest = misc_files[-1]
-step = int(os.path.basename(latest).replace("misc_step","").replace(".pt",""))
-
-sh_path = f"{ckpt_dir}/structure_head_step{step:07d}.pt"
-sh = torch.load(sh_path, map_location='cpu')
-for k in list(sh.keys()):
-    if 'weight' in k: nn.init.kaiming_normal_(sh[k])
-    elif 'bias' in k: sh[k].zero_()
-torch.save(sh, sh_path)
-print(f"StructureHead 权重重置 (step {step})")
-
-misc = torch.load(latest, map_location='cpu', weights_only=False)
-for g in misc['optimizer']['param_groups']:
-    for pid in g['params']:
-        s = misc['optimizer']['state'].get(pid, {})
-        ea = s.get('exp_avg')
-        if ea is not None and ea.numel() == 1 and ea.shape == torch.Size([1]):
-            for pid2 in g['params']:
-                st = misc['optimizer']['state'].get(pid2, {})
-                for k in ['exp_avg', 'exp_avg_sq']:
-                    if k in st and st[k] is not None: st[k].zero_()
-                st['step'] = 0
-            break
-torch.save(misc, latest)
-print("Adam state 已清理")
-EOF
-
-# 启动训练
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
     --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/lato_ss_flow_v4 \
-    --num_gpus 1 --ckpt latest
+    --output_dir outputs/lato_ss_flow_v5 \
+    --num_gpus 1
+```
+
+### 推理命令（当前 v5）
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=xformers
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
+
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" \
+    --slat_ckpt "$SLAT_CKPT" \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/eval_results_v5 \
+    --limit 1 \
+    --save_meshes
 ```
