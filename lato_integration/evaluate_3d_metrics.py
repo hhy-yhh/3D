@@ -54,9 +54,8 @@ for _p in [_TRELLIS_ROOT, _LATO_ROOT]:
         sys.path.insert(0, _p)
 
 from trellis.pipelines.trellis_text_to_3d import TrellisTextTo3DPipeline
-from trellis.models.lato_slat_flow import LATOSLatFlowModel
-from lato_integration.flow.ss_flow import EnhancedSSFlowModel
 from lato_integration.structure_head import LatoStructureHead, coords_from_occupancy
+from lato_integration import build_flow_model_from_config
 from lato.models.lato_vae.lato_vae import VoxelVAE
 from vertex_encoder import ConnectionHead as LATOConnectionHead
 if "utils" in sys.modules:
@@ -178,13 +177,22 @@ def load_pipeline(opt, device):
     pipeline.models.pop('sparse_structure_decoder', None)
 
     print("[2/5] 加载训练好的 SS Flow + LatoStructureHead ...")
-    ss_flow = EnhancedSSFlowModel(
-        resolution=16, in_channels=8, out_channels=8,
-        model_channels=512, cond_channels=768,
-        num_blocks=24, num_heads=16, mlp_ratio=4,
-        patch_size=1, pe_mode="ape", qk_rms_norm=True,
-        use_fp16=opt.use_fp16,
-    ).to(device)
+    # v10: 从 config JSON 自动解析模型架构（兼容 EnhancedSSFlowModel / v5-v10 变化）
+    ss_config_path = os.path.join(os.path.dirname(os.path.dirname(opt.ss_ckpt)), "config.json")
+    if os.path.exists(ss_config_path):
+        print(f"  SS config: {ss_config_path}")
+        ss_flow = build_flow_model_from_config(ss_config_path, device, use_fp16=opt.use_fp16)
+    else:
+        # fallback: 硬编码默认参数
+        print(f"  ⚠️  SS config 不存在 ({ss_config_path})，使用默认参数")
+        from lato_integration.flow.ss_flow import EnhancedSSFlowModel
+        ss_flow = EnhancedSSFlowModel(
+            resolution=16, in_channels=8, out_channels=8,
+            model_channels=512, cond_channels=768,
+            num_blocks=24, num_heads=16, mlp_ratio=4,
+            patch_size=1, pe_mode="ape", qk_rms_norm=True,
+            use_fp16=opt.use_fp16,
+        ).to(device)
     ckpt_raw = torch.load(opt.ss_ckpt, map_location=device, weights_only=True)
     # 兼容多种 ckpt 格式：裸 state_dict / {'state_dict':...} / TRELLIS misc
     if isinstance(ckpt_raw, dict):
@@ -237,13 +245,22 @@ def load_pipeline(opt, device):
     pipeline.models["lato_structure_head"] = structure_head
 
     print("[3/5] 加载训练好的 SLat Flow ...")
-    slat_flow = LATOSLatFlowModel(
-        resolution=128, in_channels=16, out_channels=16,
-        model_channels=384, cond_channels=768,
-        num_blocks=12, num_heads=8, mlp_ratio=4,
-        patch_size=2, num_io_res_blocks=2, io_block_channels=[128],
-        pe_mode="ape", qk_rms_norm=True, use_fp16=opt.use_fp16,
-    ).to(device)
+    # v10: 从 config JSON 自动解析模型架构（兼容 EnhancedSLatFlowModel/LATOSLatFlowModel）
+    slat_config_path = os.path.join(os.path.dirname(os.path.dirname(opt.slat_ckpt)), "config.json")
+    if os.path.exists(slat_config_path):
+        print(f"  SLat config: {slat_config_path}")
+        slat_flow = build_flow_model_from_config(slat_config_path, device, use_fp16=opt.use_fp16)
+    else:
+        # fallback: 硬编码默认参数（使用 EnhancedSLatFlowModel 以兼容 v10）
+        print(f"  ⚠️  SLat config 不存在 ({slat_config_path})，使用默认参数")
+        from lato_integration.flow.slat_flow import EnhancedSLatFlowModel
+        slat_flow = EnhancedSLatFlowModel(
+            resolution=128, in_channels=16, out_channels=16,
+            model_channels=384, cond_channels=768,
+            num_blocks=12, num_heads=8, mlp_ratio=4,
+            patch_size=2, num_io_res_blocks=2, io_block_channels=[128],
+            pe_mode="ape", qk_rms_norm=True, use_fp16=opt.use_fp16,
+        ).to(device)
     slat_ckpt_raw = torch.load(opt.slat_ckpt, map_location=device, weights_only=True)
     if isinstance(slat_ckpt_raw, dict):
         if 'denoiser' in slat_ckpt_raw and isinstance(slat_ckpt_raw['denoiser'], dict):

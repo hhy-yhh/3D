@@ -46,6 +46,8 @@ __all__ = [
     "SparsePredictionHead",
     # Pipeline
     "EnhancedTrellisTextTo3DPipeline",
+    # v10: Dynamic model builder
+    "build_flow_model_from_config",
 ]
 
 # ========================================================================
@@ -67,3 +69,77 @@ __all__ = [
 #   - lato_integration.trainers.sparse_structure_vae / slat_vae_*
 #     → 替代: 不再训练 VAE，只训练 Flow 模型
 # ========================================================================
+
+
+# ========================================================================
+# v10: 动态模型构建器 — 从 config JSON 解析模型类名，自动选择正确架构
+# ========================================================================
+
+def build_flow_model_from_config(config_path: str, device=None, use_fp16=None):
+    """
+    从训练 config JSON 构建 Flow 模型（SS 或 SLat），自动解析模型类名。
+
+    与 run_train.py 的 MODEL_REPLACEMENTS 保持同步，确保推理时加载的模型
+    架构与训练时完全一致（例如 v10 的 EnhancedSLatFlowModel vs v8 的 LATOSLatFlowModel）。
+
+    Args:
+        config_path: 训练 config JSON 路径。
+        device: torch device（默认 cuda）。
+        use_fp16: 是否使用 FP16（默认从 config 读取；若 config 未设置，默认 True）。
+
+    Returns:
+        model 实例（已 .to(device)）。
+    """
+    import json
+    import torch
+    from .flow.slat_flow import EnhancedSLatFlowModel, EnhancedElasticSLatFlowModel
+    from .flow.ss_flow import EnhancedSSFlowModel
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    model_cfg = cfg["models"]["denoiser"]
+    name = model_cfg["name"]
+    args = dict(model_cfg["args"])
+
+    # 如果调用方未指定 use_fp16，从 config 取值；config 未设置则默认 True
+    if use_fp16 is None:
+        use_fp16 = args.get("use_fp16", True)
+    args["use_fp16"] = use_fp16
+
+    # 模型类名 → 类 映射（与 run_train.py MODEL_REPLACEMENTS 同步）
+    MODEL_CLASS_MAP = {
+        "SparseStructureFlowModel": EnhancedSSFlowModel,
+        "EnhancedSSFlowModel": EnhancedSSFlowModel,
+        "SLatFlowModel": EnhancedSLatFlowModel,
+        "ElasticSLatFlowModel": EnhancedElasticSLatFlowModel,
+        "LATOSLatFlowModel": EnhancedSLatFlowModel,  # v8→v10 自动升级
+        "EnhancedSLatFlowModel": EnhancedSLatFlowModel,
+        "EnhancedElasticSLatFlowModel": EnhancedElasticSLatFlowModel,
+    }
+
+    if name not in MODEL_CLASS_MAP:
+        raise ValueError(
+            f"不支持的模型类型: '{name}'。"
+            f"支持的类型: {list(MODEL_CLASS_MAP.keys())}"
+        )
+
+    cls = MODEL_CLASS_MAP[name]
+    print(f"  [ModelBuilder] '{name}' → {cls.__name__}")
+
+    # 过滤 args 到模型构造函数支持的参数
+    import inspect
+    sig_params = set(inspect.signature(cls.__init__).parameters.keys())
+    filtered_args = {k: v for k, v in args.items() if k in sig_params}
+    skipped = set(args.keys()) - sig_params
+    if skipped:
+        print(f"  [ModelBuilder] 跳过不支持的参数: {skipped}")
+
+    model = cls(**filtered_args).to(device)
+    return model
+

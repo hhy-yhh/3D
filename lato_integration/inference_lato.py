@@ -75,11 +75,10 @@ for _p in [_TRELLIS_ROOT, _LATO_ROOT]:
 
 # ── TRELLIS imports ──
 from trellis.pipelines.trellis_text_to_3d import TrellisTextTo3DPipeline
-from trellis.models.lato_slat_flow import LATOSLatFlowModel
 
 # ── LATO integration imports ──
-from lato_integration.flow.ss_flow import EnhancedSSFlowModel
 from lato_integration.structure_head import LatoStructureHead, coords_from_occupancy
+from lato_integration import build_flow_model_from_config
 
 # ── LATO imports ──
 from lato.modules.sparse import SparseTensor as LATOSparseTensor
@@ -166,72 +165,6 @@ def load_checkpoint(ckpt_path: str, device: torch.device) -> dict:
         f"无法识别 checkpoint 格式。keys: {list(ckpt.keys())[:10]}...\n"
         f"  支持的格式: 裸 state_dict / {{'state_dict': ...}} / {{'model': ...}} / TRELLIS misc"
     )
-
-
-def build_ss_flow_from_config(config_path: str, device: torch.device, use_fp16: bool = True):
-    """从训练 config JSON 构建 EnhancedSSFlowModel。
-
-    Args:
-        config_path: lato_ss_flow.json 的路径。
-        device: 计算设备。
-        use_fp16: 是否使用 FP16。
-
-    Returns:
-        EnhancedSSFlowModel 实例。
-    """
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
-    args = cfg['models']['denoiser']['args']
-
-    model = EnhancedSSFlowModel(
-        resolution=args['resolution'],
-        in_channels=args['in_channels'],
-        out_channels=args['out_channels'],
-        model_channels=args['model_channels'],
-        cond_channels=args['cond_channels'],
-        num_blocks=args['num_blocks'],
-        num_heads=args.get('num_heads'),
-        mlp_ratio=args.get('mlp_ratio', 4),
-        patch_size=args.get('patch_size', 1),
-        pe_mode=args.get('pe_mode', 'ape'),
-        qk_rms_norm=args.get('qk_rms_norm', False),
-        use_fp16=use_fp16,
-    ).to(device)
-    return model
-
-
-def build_slat_flow_from_config(config_path: str, device: torch.device, use_fp16: bool = True):
-    """从训练 config JSON 构建 LATOSLatFlowModel。
-
-    Args:
-        config_path: lato_slat_flow.json 的路径。
-        device: 计算设备。
-        use_fp16: 是否使用 FP16。
-
-    Returns:
-        LATOSLatFlowModel 实例。
-    """
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
-    args = cfg['models']['denoiser']['args']
-
-    model = LATOSLatFlowModel(
-        resolution=args['resolution'],
-        in_channels=args['in_channels'],
-        out_channels=args['out_channels'],
-        model_channels=args['model_channels'],
-        cond_channels=args['cond_channels'],
-        num_blocks=args['num_blocks'],
-        num_heads=args.get('num_heads'),
-        mlp_ratio=args.get('mlp_ratio', 4),
-        patch_size=args.get('patch_size', 2),
-        num_io_res_blocks=args.get('num_io_res_blocks', 2),
-        io_block_channels=args.get('io_block_channels'),
-        pe_mode=args.get('pe_mode', 'ape'),
-        qk_rms_norm=args.get('qk_rms_norm', False),
-        use_fp16=use_fp16,
-    ).to(device)
-    return model
 
 
 def build_structure_head_from_config(config_path: str, device: torch.device, use_fp16: bool = True):
@@ -570,14 +503,14 @@ def main():
             print(f"[ERROR] SS config 不存在: {opt.ss_config}")
             sys.exit(1)
 
-        ss_flow = build_ss_flow_from_config(opt.ss_config, device, use_fp16)
+        ss_flow = build_flow_model_from_config(opt.ss_config, device, use_fp16)
         ss_state = load_checkpoint(ss_ckpt_path, device)
         missing, unexpected = ss_flow.load_state_dict(ss_state, strict=False)
         ss_flow.eval()
 
         # 读取到的 step 信息
         ckpt_step = os.path.basename(ss_ckpt_path).replace("denoiser_step", "").replace(".pt", "")
-        print(f"  SS Flow: EnhancedSSFlowModel (from config: {opt.ss_config})")
+        print(f"  SS Flow: (from config: {opt.ss_config})")
         print(f"  Checkpoint step: {ckpt_step}")
         if missing:
             print(f"  ⚠️ Missing keys: {len(missing)} (expected for Enhanced model)")
@@ -628,13 +561,13 @@ def main():
             print(f"[ERROR] SLat config 不存在: {opt.slat_config}")
             sys.exit(1)
 
-        slat_flow = build_slat_flow_from_config(opt.slat_config, device, use_fp16)
+        slat_flow = build_flow_model_from_config(opt.slat_config, device, use_fp16)
         slat_state = load_checkpoint(slat_ckpt_path, device)
         missing, unexpected = slat_flow.load_state_dict(slat_state, strict=False)
         slat_flow.eval()
 
         ckpt_step = os.path.basename(slat_ckpt_path).replace("denoiser_step", "").replace(".pt", "")
-        print(f"  SLat Flow: LATOSLatFlowModel (from config: {opt.slat_config})")
+        print(f"  SLat Flow: (from config: {opt.slat_config})")
         print(f"  Checkpoint step: {ckpt_step}")
         if missing:
             print(f"  ⚠️ Missing keys: {len(missing)}")
