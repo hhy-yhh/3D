@@ -1,0 +1,112 @@
+{
+    "models": {
+        "denoiser": {
+            "name": "EnhancedSLatFlowModel",
+            "args": {
+                "resolution": 128,
+                "in_channels": 16,
+                "out_channels": 16,
+                "model_channels": 384,
+                "cond_channels": 768,
+                "num_blocks": 12,
+                "num_heads": 8,
+                "mlp_ratio": 4,
+                "patch_size": 2,
+                "num_io_res_blocks": 2,
+                "io_block_channels": [128],
+                "pe_mode": "ape",
+                "qk_rms_norm": true,
+                "use_fp16": true,
+                "use_checkpoint": true,
+                "use_swin_attn": true,
+                "window_size": 8,
+                "use_separate_cross_pe": true
+            }
+        }
+    },
+    "dataset": {
+        "name": "TextConditionedSLat",
+        "args": {
+            "latent_model": "lato_vae_16dim_128",
+            "min_aesthetic_score": 4.5,
+            "max_num_voxels": 65536,
+            "normalization": {
+                "mean": [
+                    0.160400390625,
+                    1.2763671875,
+                    0.27978515625,
+                    -0.0888671875,
+                    0.0999755859375,
+                    0.0626220703125,
+                    -0.00583648681640625,
+                    0.28173828125,
+                    0.53076171875,
+                    -0.50390625,
+                    0.51416015625,
+                    0.7919921875,
+                    -0.9111328125,
+                    0.4111328125,
+                    -0.826171875,
+                    -0.06475830078125
+                ],
+                "std": [
+                    0.042938232421875,
+                    0.057952880859375,
+                    0.057708740234375,
+                    0.046630859375,
+                    0.041473388671875,
+                    0.0433349609375,
+                    0.047332763671875,
+                    0.057647705078125,
+                    0.05767822265625,
+                    0.057830810546875,
+                    0.057708740234375,
+                    0.058563232421875,
+                    0.057647705078125,
+                    0.040802001953125,
+                    0.057769775390625,
+                    0.0587158203125
+                ]
+            },
+            "pretrained_slat_dec": null
+        }
+    },
+    "trainer": {
+        "name": "TextConditionedSparseFlowMatchingCFGTrainer",
+        "args": {
+            "max_steps": 1000000,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 0.0001,
+                    "weight_decay": 0.0
+                }
+            },
+            "ema_rate": [0.9999],
+            "fp16_mode": "inflat_all",
+            "fp16_scale_growth": 0.001,
+            "grad_clip": {
+                "name": "AdaptiveGradClipper",
+                "args": {
+                    "max_norm": 1.0,
+                    "clip_percentile": 95
+                }
+            },
+            "i_log": 500,
+            "i_sample": 10000,
+            "i_save": 10000,
+            "p_uncond": 0.1,
+            "t_schedule": {
+                "name": "logitNormal",
+                "args": {
+                    "mean": 1.0,
+                    "std": 1.0
+                }
+            },
+            "sigma_min": 1e-05,
+            "text_cond_model": "openai/clip-vit-large-patch14"
+        }
+    }
+}

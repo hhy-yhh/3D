@@ -64,13 +64,23 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
             shuffle=True,
             batch_size=self.batch_size_per_gpu,
         )
+        # 🔧 Windows spawn 兼容: persistent_workers + num_workers>0 可能导致 DataLoader 静默卡死
+        #    使用 num_workers=0 (主进程加载) 避免 Windows multiprocessing 问题
+        import platform
+        if platform.system() == 'Windows':
+            num_workers = 0
+            persistent_workers = False
+        else:
+            num_workers = 4
+            persistent_workers = True
+
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
+            persistent_workers=persistent_workers,
             collate_fn=functools.partial(self.dataset.collate_fn, split_size=self.batch_split),
             sampler=self.data_sampler,
         )

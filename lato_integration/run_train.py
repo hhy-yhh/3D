@@ -34,6 +34,9 @@ MODEL_REPLACEMENTS = {
     "SLatFlowModel": lato_flow.EnhancedSLatFlowModel,
     "ElasticSLatFlowModel": lato_flow.EnhancedElasticSLatFlowModel,
     "LATOSLatFlowModel": lato_flow.LATOSLatFlowModel,
+    # === v9: EnhancedSLatFlowModel — Swin window attention 加速 ===
+    "EnhancedSLatFlowModel": lato_flow.EnhancedSLatFlowModel,
+    "EnhancedElasticSLatFlowModel": lato_flow.EnhancedElasticSLatFlowModel,
     # === v3: LatoStructureHead — 替代 SS Decoder ===
     "LatoStructureHead": lato_integration.LatoStructureHead,
 }
