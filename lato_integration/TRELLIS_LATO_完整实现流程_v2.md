@@ -1631,61 +1631,133 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 
 ---
 
-## 🆕 v9 执行状态（2026-08-04）
+## 🆕 v9 执行状态与修复记录（2026-08-04）
+
+### 执行状态
 
 | 步骤 | 内容 | 状态 |
 |------|------|:--:|
-| 步骤 0 | STL 归一化：234 个 mesh → `meshes_normalized/` → 软链接 `meshes/` | ✅ 完成 |
-| 步骤 0 验证 | voxelization Z 轴 span=39-57（原 0），全部 3D | ✅ 通过 |
-| 步骤 1A | 重跑 LATO encode → `lato_latents_v2/` | ✅ 完成 |
-| 步骤 1A 验证 | 新 latent Z span=45-53（原 0），voxel 数 29k-52k（原固定 16k） | ✅ 通过 |
-| 步骤 1B | 生成 SS occupancy → `ss_occupancy_128_v2/`（234 个 npz） | ✅ 完成 |
-| 步骤 1B 验证 | occupancy X/Y/Z 全部 3D，体素数 29k-52k | ✅ 通过 |
-| 步骤 2 | 更新 config：`occupancy_dir` → `ss_occupancy_128_v2` | ✅ 已改 |
-| 步骤 3 | 重置 StructureHead + 清理 Adam state | ✅ 完成 |
-| 步骤 4 | SS Flow + StructureHead 训练 → `outputs/lato_ss_flow_v5/` | 🔄 90k步，继续中 |
-| 步骤 4 验证 | 健康检查全绿（SH 3D✅, occ_bce=0.038, MSE=0.024, NaN=0）| ✅ 通过 |
-| 步骤 5 | SLat Flow 训练 | ⏳ 待 SS 训完评估 |
-| 步骤 6 | 最终评估 + CD/HD/NC 指标 | ⏳ 待定 |
+| 步骤 0 | STL 归一化（234 mesh → `meshes_normalized/`） | ✅ |
+| 步骤 1A | LATO encode → `lato_latents_v2/`（3D latent） | ✅ |
+| 步骤 1B | 生成 SS occupancy → `ss_occupancy_128_v2/`（234 npz, 3D） | ✅ |
+| 步骤 2 | Config `occupancy_dir` → `ss_occupancy_128_v2` | ✅ |
+| 步骤 3 | 重置 StructureHead + 清理 Adam state | ✅ |
+| 步骤 4 | **SS Flow v5 训练**（GPU 4） | 🔄 100k步 |
+| 步骤 5 | **SLat Flow v5 训练**（GPU 7） | 🔄 刚启动 |
+| 步骤 6 | 最终评估 | ⏳ |
 
 ---
 
-## 🆕 v9 已验证文件路径汇总（2026-08-04）
+### v9 修复的 Bug
 
-> 以下所有路径均经过 234/234 或 21/21 全量匹配验证。
+#### Bug 17：SLat Flow 反归一化缺失（2026-08-04）
 
-### 数据目录结构
+**现象**：推理时 VoxelVAE decode L0 输出 0 顶点，100k coords → 152 vertices，mesh 碎片化。
+
+**诊断链**：
+```
+[SS] coords=100187 ✅
+[SLat] voxels=100187 feats_mean=-0.18 ✅
+[VAE] L0=0 → L1=19 → L2=152 ❌ 断崖式下降
+```
+
+**根因**：`sample_slat()` 末尾执行 `slat = slat * std + mean` 反归一化，但：
+1. `stats.json` 不存在（v8 步骤遗漏）
+2. 评估/推理命令未传 `--slat_stats`
+3. fallback 到 identity（mean=0, std=1），反归一化无效
+4. VoxelVAE 收到归一化尺度的 feats → 拒绝解码
+
+**修复**：
+```bash
+# 从新 3D latent 生成 stats.json
+python3 -c "
+import numpy as np, json, glob
+d = '/data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128'
+feats = np.concatenate([np.load(f, allow_pickle=True)['feats'] for f in glob.glob(f'{d}/*.npz')], axis=0)
+stats = {'mean': feats.mean(axis=0).tolist(), 'std': feats.std(axis=0).tolist()}
+json.dump(stats, open(f'{d}/stats.json', 'w'), indent=2)
+"
+# 推理时传入 --slat_stats
+```
+
+**新旧 stats 对比**：
+| | 旧 2D | 新 3D |
+|------|------|------|
+| mean[:4] | -2.17, -0.004, -0.13 | **0.16, 1.28, 0.28** |
+| std[:4] | 2.38, 2.39, 2.12 | **0.04, 0.06, 0.06** |
+
+旧 SLat Flow（2D stats 训练）与新 StructureHead（3D coords 输出）完全不兼容 → **SLat Flow 必须重训**。
+
+#### Bug 18：evaluate_3d_metrics.py 多处路径 Bug
+
+| # | 问题 | 修复 |
+|------|------|------|
+| 18a | GT mesh 加载用 sha256 拼路径，sha256 与 meshes_normalized 文件名不匹配 | 优先使用 CSV `file_path` 绝对路径 |
+| 18b | 误将 `sha256_col` 设为 `file_identifier` 而非 `sha256` 列值 | 已修正匹配逻辑 |
+| 18c | 未打印生成 mesh 的顶点数/面数 | 新增 `v=` `f=` `CD=` 逐条打印 |
+| 18d | pipeline.run() 黑盒，无法定位瓶颈 | 新增逐段诊断：`[SS]` `[SLat]` `[VAE L0/L1/L2]` |
+
+#### 验证结论：CFG 不是问题
+
+| CFG | CD | HD | NC |
+|------|------|------|------|
+| 1.5 | 0.267 | 0.543 | 0.446 |
+| 5.0 | 0.268 | 0.544 | 0.611 |
+
+CD 几乎相同 → 散块与 CFG 无关。CFG=5.0 的 NC 更高，保持默认。
+
+#### 已删除目录
+
+| 目录 | 原因 |
+|------|------|
+| `ss_occupancy_128/` | 2D 扁平（Zspan=0） |
+| `lato_latents/` | 2D 数据（Zspan=0） |
+
+---
+
+### 当前训练架构
+
+```
+SS Flow v5（GPU 4）                  SLat Flow v5（GPU 7）
+─────────────────────                ─────────────────────
+config: lato_ss_flow_v3.json         config: lato_slat_flow_v8.json
+data:   database_lato/               data:   lato_latents_v2/
+model:  EnhancedSSFlowModel          model:  LATOSLatFlowModel
+        + LatoStructureHead          stats:  新 3D mean/std
+target: ss_occupancy_128_v2 (3D)     target: 3D latent coords+feats
+loss:   FlowMSE + occBCE(λ=0.1)     loss:   SparseFlowMSE
+fp16:   false (fp32)                 fp16:   inflat_all (12层稀疏, 安全)
+steps:  1,000,000                    steps:  1,000,000
+```
+
+---
+
+## 🆕 v9 已验证文件路径汇总
+
+### 数据目录
 
 ```
 /data/huanghaoyang/3D/database_lato/
 ├── metadata.csv                        # 训练集 234 条
-├── test/
-│   └── metadata.csv                    # 测试集 21 条
-├── meshes_mm_backup/                   # 原始 mm 坐标 STL（备份，sha256 命名）
-├── meshes_normalized/                  # 🆕 归一化 STL [-0.5, 0.5]（sha256 命名）
+├── test/metadata.csv                   # 测试集 21 条
+├── meshes_mm_backup/                   # 原始 STL 备份（sha256 命名）
+├── meshes_normalized/                  # 归一化 STL [-0.5,0.5]
 ├── meshes → meshes_normalized          # 软链接
-├── lato_latents_v2/                    # 🆕 3D latent
-│   └── latents/lato_vae_16dim_128/     # 234 个 npz, Zspan>40
-├── ss_occupancy_128_v2/                # 🆕 3D occupancy（234 个 npz, Zspan>40）
-└── ss_latents/
-    └── ss_enc_conv3d_16l8_fp16/        # TRELLIS SS latent（255 个 npz，训练+测试）
+├── ss_latents/ss_enc_conv3d_16l8_fp16/ # TRELLIS SS latent（255 npz）
+├── ss_occupancy_128_v2/                # 🆕 3D occupancy（234 npz, Zspan>40）
+└── lato_latents_v2/                    # 🆕 3D LATO latent
+    ├── metadata.csv
+    ├── latents/lato_vae_16dim_128/     # 234 npz + stats.json
+    │   └── stats.json                  # mean/std for denormalization
+    └── ...
 ```
 
-### 训练数据（234 条，全部匹配）
+### 训练数据全量匹配
 
-| 数据 | 路径 | 匹配 |
-|------|------|:--:|
-| metadata | `/data/huanghaoyang/3D/database_lato/metadata.csv` | — |
-| SS latent | `/data/huanghaoyang/3D/database_lato/ss_latents/ss_enc_conv3d_16l8_fp16/{sha256}.npz` | 234/234 |
-| occupancy | `/data/huanghaoyang/3D/database_lato/ss_occupancy_128_v2/{sha256}.npz` | 234/234 |
-
-### 测试数据（21 条）
-
-| 数据 | 路径 | 匹配 |
-|------|------|:--:|
-| metadata | `/data/huanghaoyang/3D/database_lato/test/metadata.csv` | — |
-| SS latent | `/data/huanghaoyang/3D/database_lato/ss_latents/ss_enc_conv3d_16l8_fp16/{sha256}.npz` | 21/21 |
-| GT mesh | CSV `file_path` 列 → `/data/huanghaoyang/3D/database/{file_identifier}.stl` | 21/21 |
+| 数据集 | metadata | SS latent | occupancy | LATO latent |
+|------|:--:|:--:|:--:|:--:|
+| 训练（234条）| `database_lato/metadata.csv` | 234/234 | 234/234 | — |
+| SLat 训练（233条）| `lato_latents_v2/metadata.csv` | — | — | 234/234 |
 
 ### 模型文件
 
@@ -1694,28 +1766,16 @@ CUDA_VISIBLE_DEVICES=2 python lato_integration/run_train.py \
 | SS config | `configs/generation/lato_ss_flow_v3.json` |
 | SS Flow ckpt | `outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt` |
 | StructureHead ckpt | `outputs/lato_ss_flow_v5/ckpts/structure_head_step*.pt` |
-| SLat config | `configs/generation/lato_slat_flow.json` |
-| SLat Flow ckpt | `outputs/lato_slat_flow/ckpts/denoiser_step*.pt` |
-| LATO VAE ckpt | `/data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt` |
+| SLat config | `configs/generation/lato_slat_flow_v8.json` |
+| SLat Flow ckpt | `outputs/lato_slat_flow_v5/ckpts/denoiser_step*.pt` |
+| LATO VAE | `/data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt` |
 | LATO config | `/data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml` |
-
-### 已删除（旧 2D 数据）
-
-| 目录 | 原因 |
-|------|------|
-| `ss_occupancy_128/` | Zspan=0，2D 扁平 |
-| `lato_latents/` | Zspan=0，2D 扁平 |
-
-### 关键说明
-
-- **instance 匹配方式**：`StandardDatasetBase` 用 CSV 的 `sha256` 列作为 instance，拼路径 `{root}/{subdir}/{sha256}.npz`
-- **occupancy 在训练中的作用**：仅 StructureHead 的 BCE loss 使用，`lambda_occupancy=0.1`；SS Flow 的 Flow Matching MSE 不受影响
-- **evaluate_3d_metrics.py 已修复**：GT mesh 加载改为优先使用 CSV 的 `file_path` 绝对路径，解决 sha256 文件名不匹配问题
 
 ---
 
-### 训练命令（当前 v5）
+### 训练命令
 
+**SS Flow v5（GPU 4）：**
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
@@ -1725,32 +1785,17 @@ CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
     --num_gpus 1
 ```
 
-### 推理命令（当前 v5）
-
+**SLat Flow v5（GPU 7）：**
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
-export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
-export ATTN_BACKEND=sdpa
-export SPARSE_ATTN_BACKEND=xformers
-
-SS_CKPT=$(ls outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
-
-python lato_integration/evaluate_3d_metrics.py \
-    --ss_ckpt "$SS_CKPT" \
-    --slat_ckpt "$SLAT_CKPT" \
-    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
-    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
-    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
-    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
-    --output_dir outputs/eval_results_v5 \
-    --limit 1 \
-    --save_meshes
+CUDA_VISIBLE_DEVICES=7 python lato_integration/run_train.py \
+    --config configs/generation/lato_slat_flow_v8.json \
+    --data_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
+    --output_dir outputs/lato_slat_flow_v5 \
+    --num_gpus 1
 ```
 
-### 训练质量巡检（每 10k 步）
-
-> health check 确认"没坏"，但无法验证生成质量。每 10k 步跑推理看实际 mesh 成型程度。
+### 推理命令（带 stats + 诊断）
 
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
@@ -1759,28 +1804,40 @@ export ATTN_BACKEND=sdpa
 export SPARSE_ATTN_BACKEND=xformers
 
 SS_CKPT=$(ls outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
-SLAT_CKPT=$(ls outputs/lato_slat_flow/ckpts/denoiser_step*.pt | sort -V | tail -1)
-STEP=$(basename "$SS_CKPT" | sed 's/denoiser_step//;s/\.pt//')
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 python lato_integration/evaluate_3d_metrics.py \
     --ss_ckpt "$SS_CKPT" \
     --slat_ckpt "$SLAT_CKPT" \
+    --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
     --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
     --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
     --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
     --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
-    --output_dir outputs/eval_step${STEP} \
-    --limit 1 \
-    --save_meshes
+    --output_dir outputs/eval_stepXXXXX \
+    --limit 1 --save_meshes
+```
 
-ls outputs/eval_step${STEP}/meshes/
+### 健康检查
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+bash check_health.sh outputs/lato_ss_flow_v5 0 --data_dir /data/huanghaoyang/3D/database_lato
 ```
 
 **判断标准：**
 
-| 指标 | 散块（未成型）| 开始成型 | 充分收敛 |
+| 指标 | 正常 | 异常 |
+|------|:--:|:--:|
+| SH 3D span | X/Y/Z > 10 | 任一轴 span=0 |
+| occ_bce | > 0.01 | 趋近 0 或不存在 |
+| MSE | 持续下降 | 不降或上升 |
+| NaN | 0 | > 0 |
+
+### 成型判定（推理输出）
+
+| 指标 | 散块 | 开始成型 | 充分收敛 |
 |------|:--:|:--:|:--:|
 | CD ↓ | >0.20 | 0.10-0.15 | <0.08 |
 | 顶点数 | <500 | 1000-3000 | >3000 |
 | 面数 | <200 | 500-2000 | >2000 |
-| 视觉 | 零星碎片 | 可辨轮廓 | 完整形状 |
