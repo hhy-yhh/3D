@@ -52,21 +52,23 @@ fi
 
 # ── 2. Loss 检查（通用） ──
 if [ -f "$LOG" ]; then
-    MSE_AVG=$(grep -oP '"mse":\s*\K[\d.]+' "$LOG" 2>/dev/null | tail -200 | awk '{s+=$1;n++}END{if(n>0)printf "%.4f",s/n; else print "N/A"}')
+    # 用 ^\d+:.*?"mse" 只匹配每行第一个 "mse"（loss.mse），避免误匹配 bin_* 里嵌套的 mse
+    MSE_AVG=$(grep -oP '^\d+:.*?"mse":\s*\K[\d.e+\-]+' "$LOG" 2>/dev/null | tail -200 | awk '{s+=$1;n++}END{if(n>0)printf "%.4f",s/n; else print "N/A"}')
     NAN=$(grep -c "NaN" "$LOG" 2>/dev/null || true)
     NAN=${NAN:-0}
     # 检查 loss 趋势：最近 50 步 vs 50-100 步前
-    MSE_RECENT=$(grep -oP '"mse":\s*\K[\d.]+' "$LOG" 2>/dev/null | tail -50 | awk '{s+=$1;n++}END{if(n>0)printf "%.6f",s/n; else print "N/A"}')
-    MSE_OLDER=$(grep -oP '"mse":\s*\K[\d.]+' "$LOG" 2>/dev/null | tail -100 | head -50 | awk '{s+=$1;n++}END{if(n>0)printf "%.6f",s/n; else print "N/A"}')
-    LOG_STEPS=$(grep -oP '^\d+' "$LOG" 2>/dev/null | tail -1)
-    LOG_STEPS=${LOG_STEPS:-0}
+    MSE_RECENT=$(grep -oP '^\d+:.*?"mse":\s*\K[\d.e+\-]+' "$LOG" 2>/dev/null | tail -50 | awk '{s+=$1;n++}END{if(n>0)printf "%.6f",s/n; else print "N/A"}')
+    MSE_OLDER=$(grep -oP '^\d+:.*?"mse":\s*\K[\d.e+\-]+' "$LOG" 2>/dev/null | tail -100 | head -50 | awk '{s+=$1;n++}END{if(n>0)printf "%.6f",s/n; else print "N/A"}')
+    LOG_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    LOG_LAST_STEP=$(grep -oP '^\d+' "$LOG" 2>/dev/null | tail -1)
+    LOG_LAST_STEP=${LOG_LAST_STEP:-0}
 else
-    MSE_AVG="N/A"; MSE_RECENT="N/A"; MSE_OLDER="N/A"; NAN=0; LOG_STEPS=0
+    MSE_AVG="N/A"; MSE_RECENT="N/A"; MSE_OLDER="N/A"; NAN=0; LOG_LINES=0; LOG_LAST_STEP=0
 fi
 
 echo "  ── 基础指标 ──"
 echo "  checkpoint step:  $STEP"
-echo "  log entries:      $LOG_STEPS"
+echo "  log 行数/最后step: $LOG_LINES / $LOG_LAST_STEP"
 echo "  MSE (最近200均值): $MSE_AVG"
 if [ "$MSE_RECENT" != "N/A" ] && [ "$MSE_OLDER" != "N/A" ]; then
     TREND=$(python3 -c "r=$MSE_RECENT; o=$MSE_OLDER; print('📉下降' if r<o*0.98 else ('📈上升' if r>o*1.02 else '➡️平稳'))" 2>/dev/null)
@@ -315,13 +317,22 @@ echo "  denoiser:      $(basename "$DENOISER_CKPT" 2>/dev/null || echo '❌ 未�
 if [ "$TRAIN_TYPE" = "ss" ]; then
     echo "  structure_head: $(basename "$SH_CKPT" 2>/dev/null || echo '❌ 未找到')"
 fi
-echo "  log:           $([ -f "$LOG" ] && echo "$LOG ($LOG_STEPS 条记录)" || echo '❌ 未找到')"
+echo "  log:           $([ -f "$LOG" ] && echo "$LOG ($LOG_LINES 行, step→$LOG_LAST_STEP)" || echo '❌ 未找到')"
 
 echo ""
 echo "  ── 判断 ──"
 ISSUES=0
 if [ "$NAN" -gt 0 ]; then echo "  ❌ 有 NaN"; ISSUES=$((ISSUES+1)); fi
-if [ "$MSE_AVG" = "N/A" ]; then echo "  ⚠️  无 log 数据"; elif [ "$LOG_STEPS" -lt 2 ]; then echo "  ⚠️  log 太少 (<2 条)"; fi
+if [ "$MSE_AVG" = "N/A" ]; then
+    if [ -d "$CKPT_SUBDIR" ]; then
+        echo "  ℹ️  无 log 数据 — 训练处于早期阶段 (< i_log 步)，或正在运行中，属正常现象"
+    else
+        echo "  ⚠️  无 log 且 ckpts/ 目录不存在 — 训练可能尚未初始化"
+        ISSUES=$((ISSUES+1))
+    fi
+elif [ "$LOG_LINES" -lt 2 ]; then
+    echo "  ⚠️  log 行数太少 (<2) — 训练刚启动或 log 写入异常"
+fi
 if [ "$TRAIN_TYPE" = "ss" ] && [ "$OCC_AVG" = "N/A" ]; then echo "  ⚠️  occ_bce 不存在 — StructureHead 可能未参与"; ISSUES=$((ISSUES+1)); fi
 if [ "$TRAIN_TYPE" = "ss" ] && [ "$OCC_AVG" != "N/A" ] && [ "$OCC_AVG" != "0.0000" ]; then
     OCC_VAL=$(python3 -c "print(float('$OCC_AVG'))" 2>/dev/null || echo "0")
