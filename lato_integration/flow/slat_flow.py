@@ -177,6 +177,10 @@ class EnhancedSLatFlowModel(_SLatFlowModel):
             if not self.share_mod:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # 🔧 Swin blocks 是在 convert_to_fp16() 之后创建的，
+        #    必须手动转换以匹配模型 dtype
+        if self.use_fp16:
+            self.blocks.apply(convert_module_to_f16)
 
     def forward(
         self,
