@@ -312,12 +312,16 @@ def load_pipeline(opt, device):
     pipeline.to(device)
     print(f"  模型: {list(pipeline.models.keys())}")
 
-    # 🔧 显存优化：大型模型标记，推理时按需管理
-    #    LATO VoxelVAE.decode() 会触发 spconv 分配临时 workspace，
-    #    与其他模型同时驻留 GPU 时容易因碎片化导致 OOM。
-    #    仅 VAE 使用后主动清理缓存；其他模型保持 GPU 驻留（避免 device mismatch）。
+    # 🔧 显存优化：保留模型引用用于逐阶段 GPU↔CPU 切换
+    #    VAE decode 时 spconv 需要大量连续 workspace，必须卸掉不用的模型
     torch.cuda.empty_cache()
     print("  显存缓存已清理，准备就绪")
+
+    # 保存模型引用以便外部管理设备（不在 load_pipeline 内卸 CPU，避免首轮 device mismatch）
+    pipeline._ss_flow = pipeline.models.get('sparse_structure_flow_model')
+    pipeline._slat_flow = pipeline.models.get('slat_flow_model')
+    pipeline._sh = pipeline.models.get('lato_structure_head')
+    pipeline._vae = pipeline.models.get('lato_vae')
 
     return pipeline, connection_head, model_cfg
 
@@ -396,6 +400,8 @@ def main():
     parser.add_argument("--slat_steps", type=int, default=20)
     parser.add_argument("--cfg_strength", type=float, default=5.0)
     parser.add_argument("--lato_threshold", type=float, default=0.2)
+    parser.add_argument("--ss_threshold", type=float, default=0.0,
+                        help="SS occupancy logits 阈值（调高=更少 voxels，缓解显存；默认0，建议试 0.5/1.0/2.0）")
     parser.add_argument("--edge_threshold", type=float, default=0.45)
     parser.add_argument("--k_neighbors", type=int, default=32,
                         help="KDTree 最近邻数，越小面越少")
@@ -481,15 +487,27 @@ def main():
             prompt = _build_prompt_from_row(sample)
 
         try:
+            # ── 逐段诊断（显存优化：不用的模型卸到 CPU，为 spconv 腾 workspace）──
+            # 🔧 确保本轮模型都在 GPU（上轮末尾可能已卸至 CPU）
+            ss_flow = pipeline._ss_flow
+            sh = pipeline._sh
+            slat_flow = pipeline._slat_flow
+            vae = pipeline._vae
+            if next(ss_flow.parameters()).device.type != 'cuda':
+                ss_flow.to(device)
+                sh.to(device)
+                slat_flow.to(device)
+                vae.to(device)
+                torch.cuda.empty_cache()
+
             with torch.no_grad():
-                # ── 🔍 逐段诊断 ──
                 cond = pipeline.get_cond([prompt])
                 torch.manual_seed(opt.seed)
-                torch.cuda.empty_cache()  # 释放 CLIP tokenizer 产生的临时 buffer
+                torch.cuda.empty_cache()
 
                 # 1) SS Flow → StructureHead
-                flow_model = pipeline.models['sparse_structure_flow_model']
-                head = pipeline.models['lato_structure_head']
+                flow_model = ss_flow
+                head = sh
                 dtype = next(flow_model.parameters()).dtype
                 noise = torch.randn(1, flow_model.in_channels, flow_model.resolution,
                                     flow_model.resolution, flow_model.resolution,
@@ -500,25 +518,43 @@ def main():
                     flow_model, noise, **cond, **ss_params, verbose=False
                 ).samples
                 occ_logits = head(z_s)
-                n_active = (occ_logits > 0).sum().item()
-                print(f"  [SS] occ_logits mean={occ_logits.mean():.2f} min={occ_logits.min():.2f} max={occ_logits.max():.2f} active(>0)={n_active}")
+                n_active = (occ_logits > opt.ss_threshold).sum().item()
 
-                coords = torch.argwhere(occ_logits > 0)[:, [0, 2, 3, 4]].int()
+                # ── 诊断：occ_logits 分布 + 不同阈值下的 active voxel ──
+                _occ = occ_logits.float().cpu().numpy().ravel()
+                _pct = [0, 50, 90, 95, 99, 99.5, 99.9]
+                _pct_vals = np.percentile(_occ, _pct)
+                print(f"  [SS diag] logits percentiles: " + " | ".join(
+                    f"P{p}={v:.2f}" for p, v in zip(_pct, _pct_vals)))
+                print(f"  [SS diag] logits mean={_occ.mean():.2f} min={_occ.min():.2f} max={_occ.max():.2f}")
+                for _th in [0.0, 0.5, 1.0, 2.0, 5.0]:
+                    _n = int((_occ > _th).sum())
+                    _pct_str = f"({_n/2097152*100:.1f}%)"
+                    _flag = " ← threshold" if abs(_th - opt.ss_threshold) < 0.001 else ""
+                    print(f"  [SS diag]   active(>{_th:3.1f}) = {_n:>8d} {_pct_str}{_flag}")
+
+                print(f"  [SS] occ_logits mean={occ_logits.mean():.2f} min={occ_logits.min():.2f} max={occ_logits.max():.2f} active(>{opt.ss_threshold})={n_active}")
+
+                coords = torch.argwhere(occ_logits > opt.ss_threshold)[:, [0, 2, 3, 4]].int()
                 print(f"  [SS] coords={coords.shape[0]}")
 
-                # 释放 SS 阶段大张量（20 步采样累积了大量中间激活）
+                # 释放 SS 阶段中间张量 + 卸 SS/SH 模型到 CPU（~590MB → spconv workspace 可用）
                 del z_s, occ_logits
+                flow_model.cpu()
+                head.cpu()
                 torch.cuda.empty_cache()
 
-                # 2) SLat Flow
+                # 2) SLat Flow（SS 和 SH 已在 CPU，SLat 仍在 GPU）
                 slat = pipeline.sample_slat(cond, coords,
                     sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
                 print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f}")
 
-                # 清理 SLat 采样中间激活，为 spconv decode 腾最大连续显存
+                # 卸 SLat（~300MB → 再给 spconv 腾一块）
+                slat_flow.cpu()
                 torch.cuda.empty_cache()
 
-                # 3) LATO VoxelVAE decode（spconv 需要额外 workspace，此处是显存峰值）
+                # 3) LATO VoxelVAE decode
+                #    此时 GPU 上只有 CLIP + VAE + ConnectionHead，spconv 有最大连续显存
                 outputs = pipeline.decode_slat(slat, formats=["mesh"])
                 dec = outputs.get("lato_decoded", [])
                 for i, level in enumerate(dec):
@@ -531,8 +567,9 @@ def main():
                 outputs, connection_head, model_cfg, device, opt.edge_threshold, opt.k_neighbors
             )
 
-            # 清理 VAE decode 产生的中间张量
+            # 清理 VAE decode 中间张量
             del outputs, dec, slat
+            vae.cpu()
             torch.cuda.empty_cache()
 
             if pred_mesh is None:
