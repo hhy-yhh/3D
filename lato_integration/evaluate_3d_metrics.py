@@ -395,7 +395,9 @@ def main():
     parser.add_argument("--cfg_strength", type=float, default=5.0)
     parser.add_argument("--lato_threshold", type=float, default=0.2)
     parser.add_argument("--ss_threshold", type=float, default=0.0,
-                        help="SS occupancy logits 阈值（调高=更少 voxels，缓解显存；默认0，建议试 0.5/1.0/2.0）")
+                        help="SS occupancy logits 阈值（调高=更少 voxels）")
+    parser.add_argument("--max_coords", type=int, default=0,
+                        help="最大 active voxel 数（0=不限制；超限取置信度最高的 K 个）")
     parser.add_argument("--edge_threshold", type=float, default=0.45)
     parser.add_argument("--k_neighbors", type=int, default=32,
                         help="KDTree 最近邻数，越小面越少")
@@ -518,6 +520,14 @@ def main():
                 print(f"  [SS] occ_logits mean={occ_logits.mean():.2f} min={occ_logits.min():.2f} max={occ_logits.max():.2f} active(>{opt.ss_threshold})={n_active}")
 
                 coords = torch.argwhere(occ_logits > opt.ss_threshold)[:, [0, 2, 3, 4]].int()
+
+                # 截断：只保留置信度最高的 K 个 voxel（防止 spconv int32 溢出）
+                if opt.max_coords > 0 and coords.shape[0] > opt.max_coords:
+                    active_logits = occ_logits[0, 0][coords[:, 1], coords[:, 2], coords[:, 3]]
+                    _, topk_idx = torch.topk(active_logits, opt.max_coords)
+                    coords = coords[topk_idx]
+                    print(f"  [SS] coords truncated: {coords.shape[0]} (top-{opt.max_coords} by confidence)")
+
                 print(f"  [SS] coords={coords.shape[0]}")
 
                 # 释放 SS 阶段中间张量
