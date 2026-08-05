@@ -40,7 +40,7 @@ if __name__ == '__main__':
         def worker(sha256):
             try:
                 feats = np.load(os.path.join(opt.output_dir, 'latents', opt.model, f'{sha256}.npz'))
-                feats = feats['feats']
+                feats = feats['feats'].astype(np.float64)  # float16→float64 避免累加溢出
                 means.append(feats.mean(axis=0))
                 mean2s.append((feats ** 2).mean(axis=0))
                 pbar.update()
