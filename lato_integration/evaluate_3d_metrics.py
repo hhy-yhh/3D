@@ -483,10 +483,17 @@ def main():
             prompt = _build_prompt_from_row(sample)
 
         try:
+            # ── 显存追踪 ──
+            def _mem(tag):
+                a = torch.cuda.memory_allocated() / 1024**3
+                r = torch.cuda.memory_reserved() / 1024**3
+                print(f"  [MEM] {tag}: allocated={a:.2f}GiB reserved={r:.2f}GiB")
+
             with torch.no_grad():
-                # ── 🔍 逐段诊断 ──
+                _mem("初始")
                 cond = pipeline.get_cond([prompt])
                 torch.manual_seed(opt.seed)
+                _mem("CLIP后")
                 torch.cuda.empty_cache()
 
                 # 1) SS Flow → StructureHead
@@ -533,6 +540,7 @@ def main():
                 # 释放 SS 阶段中间张量
                 del z_s, occ_logits
                 torch.cuda.empty_cache()
+                _mem("SS后")
 
                 # 2) SLat Flow
                 slat = pipeline.sample_slat(cond, coords,
@@ -541,6 +549,7 @@ def main():
 
                 # 清理 SLat 采样中间激活
                 torch.cuda.empty_cache()
+                _mem("SLat后")
 
                 # 3) LATO VoxelVAE decode（spconv 需要额外 workspace，此处是显存峰值）
                 outputs = pipeline.decode_slat(slat, formats=["mesh"])
@@ -558,6 +567,7 @@ def main():
             # 清理 VAE decode 中间张量
             del outputs, dec, slat
             torch.cuda.empty_cache()
+            _mem("VAE后")
 
             if pred_mesh is None:
                 failures.append({"sha": sha, "error": "Mesh extraction failed"})
