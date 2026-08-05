@@ -312,16 +312,10 @@ def load_pipeline(opt, device):
     pipeline.to(device)
     print(f"  模型: {list(pipeline.models.keys())}")
 
-    # 🔧 显存优化：保留模型引用用于逐阶段 GPU↔CPU 切换
-    #    VAE decode 时 spconv 需要大量连续 workspace，必须卸掉不用的模型
+    # 🔧 显存优化：依赖 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    #    让 PyTorch 用可扩展内存段，减少碎片化，spconv 能拿到连续大块。
     torch.cuda.empty_cache()
     print("  显存缓存已清理，准备就绪")
-
-    # 保存模型引用以便外部管理设备（不在 load_pipeline 内卸 CPU，避免首轮 device mismatch）
-    pipeline._ss_flow = pipeline.models.get('sparse_structure_flow_model')
-    pipeline._slat_flow = pipeline.models.get('slat_flow_model')
-    pipeline._sh = pipeline.models.get('lato_structure_head')
-    pipeline._vae = pipeline.models.get('lato_vae')
 
     return pipeline, connection_head, model_cfg
 
@@ -487,27 +481,15 @@ def main():
             prompt = _build_prompt_from_row(sample)
 
         try:
-            # ── 逐段诊断（显存优化：不用的模型卸到 CPU，为 spconv 腾 workspace）──
-            # 🔧 确保本轮模型都在 GPU（上轮末尾可能已卸至 CPU）
-            ss_flow = pipeline._ss_flow
-            sh = pipeline._sh
-            slat_flow = pipeline._slat_flow
-            vae = pipeline._vae
-            if next(ss_flow.parameters()).device.type != 'cuda':
-                ss_flow.to(device)
-                sh.to(device)
-                slat_flow.to(device)
-                vae.to(device)
-                torch.cuda.empty_cache()
-
             with torch.no_grad():
+                # ── 🔍 逐段诊断 ──
                 cond = pipeline.get_cond([prompt])
                 torch.manual_seed(opt.seed)
                 torch.cuda.empty_cache()
 
                 # 1) SS Flow → StructureHead
-                flow_model = ss_flow
-                head = sh
+                flow_model = pipeline.models['sparse_structure_flow_model']
+                head = pipeline.models['lato_structure_head']
                 dtype = next(flow_model.parameters()).dtype
                 noise = torch.randn(1, flow_model.in_channels, flow_model.resolution,
                                     flow_model.resolution, flow_model.resolution,
@@ -538,23 +520,19 @@ def main():
                 coords = torch.argwhere(occ_logits > opt.ss_threshold)[:, [0, 2, 3, 4]].int()
                 print(f"  [SS] coords={coords.shape[0]}")
 
-                # 释放 SS 阶段中间张量 + 卸 SS/SH 模型到 CPU（~590MB → spconv workspace 可用）
+                # 释放 SS 阶段中间张量
                 del z_s, occ_logits
-                flow_model.cpu()
-                head.cpu()
                 torch.cuda.empty_cache()
 
-                # 2) SLat Flow（SS 和 SH 已在 CPU，SLat 仍在 GPU）
+                # 2) SLat Flow
                 slat = pipeline.sample_slat(cond, coords,
                     sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
                 print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f}")
 
-                # 卸 SLat（~300MB → 再给 spconv 腾一块）
-                slat_flow.cpu()
+                # 清理 SLat 采样中间激活
                 torch.cuda.empty_cache()
 
-                # 3) LATO VoxelVAE decode
-                #    此时 GPU 上只有 CLIP + VAE + ConnectionHead，spconv 有最大连续显存
+                # 3) LATO VoxelVAE decode（spconv 需要额外 workspace，此处是显存峰值）
                 outputs = pipeline.decode_slat(slat, formats=["mesh"])
                 dec = outputs.get("lato_decoded", [])
                 for i, level in enumerate(dec):
@@ -569,7 +547,6 @@ def main():
 
             # 清理 VAE decode 中间张量
             del outputs, dec, slat
-            vae.cpu()
             torch.cuda.empty_cache()
 
             if pred_mesh is None:
