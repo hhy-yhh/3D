@@ -75,8 +75,8 @@
         "name": "TextConditionedSparseFlowMatchingCFGTrainer",
         "args": {
             "max_steps": 1000000,
-            "batch_size_per_gpu": 1,
-            "batch_split": 4,
+            "batch_size_per_gpu": 2,
+            "batch_split": 2,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
