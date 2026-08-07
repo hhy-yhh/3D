@@ -207,7 +207,7 @@ class BasicTrainer(Trainer):
             self.scaler.load_state_dict(misc_ckpt['scaler'])
         elif self.fp16_mode == 'inflat_all':
             self.log_scale = misc_ckpt['log_scale']
-        if self.lr_scheduler_config is not None:
+        if self.lr_scheduler_config is not None and 'lr_scheduler' in misc_ckpt:
             self.lr_scheduler.load_state_dict(misc_ckpt['lr_scheduler'])
         if self.elastic_controller_config is not None:
             self.elastic_controller.load_state_dict(misc_ckpt['elastic_controller'])
