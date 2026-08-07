@@ -76,12 +76,19 @@
         "args": {
             "max_steps": 1000000,
             "batch_size_per_gpu": 1,
-            "batch_split": 1,
+            "batch_split": 4,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
                     "lr": 0.0001,
                     "weight_decay": 0.0
+                }
+            },
+            "lr_scheduler": {
+                "name": "CosineAnnealingLR",
+                "args": {
+                    "T_max": 1000000,
+                    "eta_min": 0.000001
                 }
             },
             "ema_rate": [0.9999],

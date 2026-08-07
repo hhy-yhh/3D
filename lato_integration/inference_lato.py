@@ -610,7 +610,7 @@ def main():
         ).to(device)
 
         connection_head = LATOConnectionHead(
-            channels=512,
+            channels=768,
             out_channels=1,
             mlp_ratio=0.75,
         ).to(device)

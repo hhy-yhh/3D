@@ -2,7 +2,7 @@
 
 > **目标：** Encoder/Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS。SS/SLat Flow 均在刹车卡钳数据集上从零训练。
 
-**当前版本：v10 (2026-08-04)**
+**当前版本：v11 (2026-08-07)**
 
 ---
 
@@ -257,3 +257,116 @@ Step 1 ─ CLIP 文本编码
 | 21 | 08-04 | **SLat normalization std 错误 (0.05 应为 0.6~1.2)** → MSE 9.6 (应为 ~2) | stat_latent.py float16 累加溢出 + 用正确 stats 重算 config |
 | 22 | 08-04 | check_health.sh MSE 误匹配 bin_* 嵌套值 + log entries 语义错误 + 早期训练误报 | grep 非贪婪匹配 + wc -l + ckpts/ 目录检测 |
 | 23 | 08-04 | EnhancedSLatFlowModel._rebuild_blocks_with_swin() 未对 Swin blocks 做 xavier_uniform 初始化 | 添加 xavier_uniform + zero adaLN |
+| 24 | 08-06 | stats.json std 全部 ~0.05（正确 0.5~1.2）→ 推理反归一化无效 → 散块 | stat_latent.py 用 float64 重算 stats.json 覆盖 |
+| 25 | 08-07 | evaluate_3d_metrics.py ConnectionHead channels=512，ckpt 期望 768 → 半数 MLP 参数未加载 | 待修复 |
+| 26 | 08-07 | **LatoStructureHead 模块适配失败** — 16³→128³ nearest-neighbor 上采样，8× 压缩比下无法产生薄壳 occupancy（详见下方专项分析）| 架构需重新设计 |
+| 27 | 08-07 | SLat Flow 训练停滞 — 48 万步 MSE 对数收敛至 ~0.26，缺 LR scheduler + batch_split=1 | 加 CosineAnnealingLR + batch_split=4 |
+
+---
+
+## 专项分析：LatoStructureHead 模块适配失败 (Bug 26)
+
+### 现象
+
+SS Flow MSE=0.007（充分收敛），但推理时 128³ 网格中 50 万 voxel > 0（24%），GT 卡钳仅 ~5000（0.24%）。mesh 碎片化，CD=0.267，水密=False。
+
+### 逐模块排查结果
+
+| 模块 | 代码正确？ | 适配通过？ | 结论 |
+|------|:--:|:--:|------|
+| SS Flow | ✅ | ✅ | MSE 0.007，充分收敛 |
+| **LatoStructureHead** | ✅ | **❌** | 架构能力上限 |
+| SLat Flow | ✅ | ✅ | MSE 0.26，对数收敛中 |
+| VoxelVAE.decode() | ✅ | ✅ | GT latent 直通：57 万顶点，0% 稀疏 |
+| ConnectionHead | ❌ | — | channels 512≠768，半数参数未加载 |
+
+### 根因：物理上限，不是调参能解决的
+
+```
+TRELLIS 原版：16³ → 64³ (sparse transformer) → coords ×2 → 128³
+             4× 压缩，sparse 操作保持边界锐度
+
+LatoStructureHead：16³ → 128³ (nearest-neighbor upsample)
+                   8× 压缩，每个 16³ 网格点膨胀为 8×8×8 硬块
+```
+
+`nn.Upsample(scale_factor=2, mode='nearest')` 三次叠加后，16³ 的 1 个 voxel 在 128³ 中变成 512 个完全相同的 voxel。3×3 卷积只能在块边界做模糊，无法在块内部刻画 1 voxel 厚的曲面。
+
+**模型内部已经知道卡钳位置**（th>3 时 3075 个 voxel 的 X/Y/Z 范围合理），但 logits 被分散到周围 50 万 voxel 上，无法形成锐利边界。
+
+### GT 直通验证
+
+取任意训练集样本的 GT latent → VoxelVAE.decode()：
+
+| 指标 | GT latent | 说明 |
+|------|:--:|------|
+| VAE 顶点 | 57.3 万 | 多级 subdivision 正常输出 |
+| Level 0/1/2 | 0 / 7.2万 / 57.3万 | 层级结构正常 |
+| 最近邻中位数 | 0.004 | 顶点密实均匀 |
+| 稀疏率 (NN>0.03) | 0% | 无裂隙 |
+
+**VAE 完全正常。** 问题锁死在 SS Flow → LatoStructureHead → coords 这一段。
+
+### 正确的 coords 在哪里
+
+```python
+# 128³ 网格中 logits 分位数：
+P0=-91.91  P50=-11.34  P90=-5.09  P95=0.22  P99=4.54  P99.9=6.66
+
+# 不同阈值下的 voxel 数：
+th>0 = 504,886  (24%)   ← 全是实心块
+th>1 =  51,951  (2.5%)  ← 开始收敛
+th>2 =  12,509  (0.6%)  ← 接近真实数量
+th>3 =   3,075  (0.15%) ← 范围合理，卡钳形状
+th>5 =     153          ← 太少了
+```
+
+模型在 th>3 时能产出正确数量级和空间范围的 coords，但正样本的 logits 被压在 0~3 之间出不去。这是因为 nearest-neighbor 上采样在粗糙网格上的信息瓶颈导致 sigmoid 永远不敢出高分。
+
+### 修复方向
+
+| 方向 | 说明 |
+|------|------|
+| **A. 改架构** | 将 nearest-neighbor 上采样替换为 3D pixel shuffle（可学习上采样），让模型学会在 8×8×8 块内分配子体素特征 |
+| **B. 降压缩比** | 将 SS Flow 分辨率从 16³ 提升到 32³，StructureHead 只需 4× 上采样（32³→128³ = 2 阶段） |
+| **C. 推理端阈值补偿** | 不改训练架构，推理时用 `--ss_threshold > 2.0` 硬过滤低置信度 voxel。缺点：可能丢掉正确但低置信度的薄壳区域 |
+| **D. 回归 TRELLIS 路径** | 不在 128³ 做 dense occupancy，改为 16³→64³ sparse→coords×2（跟 TRELLIS 保持一致） |
+
+---
+
+## 专项分析：SLat Flow 训练对数收敛 (Bug 27)
+
+### 现象
+
+48.65 万步，MSE 缓慢对数下降而非真正停滞：
+
+```
+50k→100k:  0.51 → 0.44  (-31%)  快速
+100k→200k: 0.44 → 0.34  (-24%)  较快
+200k→300k: 0.34 → 0.28  (-18%)  放缓
+300k→400k: 0.28 → 0.27  (-15%)  更慢
+400k→480k: 0.27 → 0.26  (-15%)  对数收敛
+最近 3000 步均值: 0.22
+```
+
+没有 NaN，万步波动仅 ±0.004。模型在 lr=1e-4 + batch_size=1 下已经学到了优化上限，需要更精细的优化。
+
+### 原因
+
+- `lato_slat_flow_v9.json` 无 `lr_scheduler` → lr 恒定 1e-4
+- `batch_split: 1, batch_size_per_gpu: 1` → 单样本梯度方差大
+- Swin window attention 在 fp16 下精度有限
+
+### 修复（不改架构，不改 fp16）
+
+在 `lato_slat_flow_v9.json` 加：
+
+```json
+"batch_split": 4,
+"lr_scheduler": {
+    "name": "CosineAnnealingLR",
+    "args": { "T_max": 1000000, "eta_min": 1e-6 }
+}
+```
+
+从当前 48.65 万步 ckpt resume 即可，不需重训。
