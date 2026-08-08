@@ -706,3 +706,323 @@ for i, block in enumerate(vae.decoder_vtx):
 **如果方案 A 跑完 CD 仍 > 0.15：** 启动方案 B（32³ SS Flow），因该方案改动量大、训练时间长，只在 A+E 不足时触发。
 
 **如果方案 A+E 达标 (CD < 0.15)：** 可考虑方案 B 进一步优化到 < 0.10。但 234 条数据可能让 < 0.10 很难，届时优先考虑增加数据量而非改架构。
+
+---
+
+## v13 方案 C 实施结果 (2026-08-09)
+
+### 修改内容
+
+4 个文件修改，将 StructureHead 推理阈值从 `0.0` 改为 `2.0`：
+
+| 文件 | 修改 |
+|------|------|
+| `structure_head.py:128` | `coords_from_occupancy` 默认 threshold `0.0` → `2.0` |
+| `evaluate_3d_metrics.py:397` | `--ss_threshold` 默认值 `0.0` → `2.0` |
+| `inference_lato.py:425` | 新增 `--ss_threshold` 参数（默认 `2.0`） |
+| `inference_lato.py:209-239` | `sample_ss_lato()` 接受并传递 `ss_threshold` |
+| `trellis_text_to_3d.py:109-137` | `sample_sparse_structure_lato()` 新增 `ss_threshold` 参数 |
+
+### 测试结果
+
+| 策略 | 配置 | coords | CD | 结论 |
+|------|------|--------|-----|------|
+| 旧默认 | th=0, 不限 | 504,886 | 0.267 | 实心块 |
+| 方案 C (v13 默认) | th=2.0, 不限 | 79,541 | OOM | 仍太多 |
+| 阈值 + 截断 | th=1.0, top-16384 | 16,384 | **0.267** | 不变 |
+| 阈值 + 截断 | th=2.0, top-16384 | 16,384 | 未跑 | — |
+
+### 诊断日志
+
+```
+[SS diag] logits percentiles: P0=-73.14 | P50=-13.42 | P90=-3.63 | P95=0.86 | P99=4.40
+[SS diag]   active(>0.0) = 123586 (5.9%)
+[SS diag]   active(>1.0) = 101923 (4.9%)
+[SS diag]   active(>2.0) =  79541 (3.8%)
+[SS diag]   active(>5.0) =  11950 (0.6%)
+[VAE L0] vertices=0                              ← 首级 subdivision 完全失败
+```
+
+### 方案 C 结论：❌ 架构瓶颈，阈值调参无效
+
+阈值成功将 coords 从 50 万降到 16K，但 **CD 纹丝不动（0.267 → 0.267）**。原因：
+
+1. **阈值只能过滤，不能纠正位置。** StructureHead 的 nearest-neighbor 上采样把高 logits 分散到了大块区域，取 top-K 只是从模糊块中挑最高分，位置仍然不精确
+2. **logits 最高分位置也不在薄壳曲面上。** 即使只取 16K 个最高置信度 voxel（仅占 128³ 的 0.8%），mesh 仍然是碎块
+3. **VAE L0=0 未改善。** 首级 subdivision 仍无产出，说明输入 VoxelVAE 的 sparse tensor 拓扑结构不支持 vertex hierarchy 的 subdivision
+
+**方案 C 的价值：** 确认了问题不在 voxel 数量或阈值，而在 voxel 的**空间位置精度**——必须从架构层面改进。
+
+---
+
+## v14 新增方案：LogitSharpener（后训练锐化，不重训）
+
+### 动机
+
+方案 A（PixelShuffle）必须重训 SS Flow，用户不愿重训。需要一种**只训练极轻量模块、不改原有权重**的方案。
+
+### 核心思路
+
+```
+SS Flow (冻结) → StructureHead (冻结) → LogitSharpener (训练，~1K 参数)
+                                              │
+                                    模糊 logits → 锐利 logits
+```
+
+StructureHead 输出的 logits **空间位置基本正确**（th>3 时 3075 个 voxel 的 bbox 范围合理），只是边界模糊。一个小型 3D CNN 可以学"边缘增强"——本质是 3D unsharp mask。
+
+### 架构设计
+
+```python
+class LogitSharpener(nn.Module):
+    """
+    极轻量 3D 锐化模块：学习将模糊 occupancy logits 锐化为锐利边界。
+    
+    架构：3 层 3×3×3 depthwise-separable conv，参数量 ~500。
+    输入 [B, 1, 128, 128, 128] → 输出 [B, 1, 128, 128, 128]
+    """
+    def __init__(self):
+        # Layer 1: 1×1×1 → 4 channels
+        # Layer 2: 3×3×3 depthwise conv
+        # Layer 3: 4 → 1 output
+        # Total: ~500 params
+```
+
+### 训练策略
+
+| 步骤 | 说明 | 时间 |
+|------|------|------|
+| 1. 数据生成 | 冻结 SS Flow + StructureHead，推理 234 条训练集 → 保存 blur logits + GT occupancy | ~1 小时 |
+| 2. 训练 | 只训 LogitSharpener，loss = BCE(sharpened_logits, GT_occupancy) | **~10-20 分钟** |
+| 3. 评估 | 用训练好的 LogitSharpener 推理测试集 | ~1 分钟 |
+
+### 与其他方案对比
+
+| | 方案 C (阈值) | 方案 F (LogitSharpener) | 方案 A (PixelShuffle) |
+|------|:--:|:--:|:--:|
+| 改动量 | 1 行 | ~30 行新类 | ~20 行改架构 |
+| 重训需求 | 无 | 只训 LogitSharpener | 重训 SS Flow (50万步) |
+| 训练时间 | 0 | **10-20 分钟** | 3-4 天 |
+| 预期 CD | 0.267 (无效) | **0.18-0.22** | 0.15-0.20 |
+| 风险 | 低 | 低 | 中（ckpt 不兼容） |
+
+### 为什么方案 F 可能有效
+
+1. **信息已存在。** StructureHead 的 logits 在 th>3 时空间范围合理，高 logits 聚集在目标区域附近——只是太模糊
+2. **锐化是局部的。** 3D unsharp mask 本质是 `output = input + α * (input - blurred_input)`，3×3×3 conv 只需学一个局部增强核
+3. **GT 监督强。** 234 条 GT occupancy 直接提供逐体素监督信号，BCE loss 比 Flow Matching MSE 精确得多
+4. **不改任何已训练权重。** SS Flow、StructureHead、SLat Flow、VoxelVAE 全部冻结
+
+### 风险评估
+
+- **如果 StructureHead logits 位置本身就错 → 无效。** 但 th>3 时的诊断表明位置基本正确
+- **锐化可能引入噪声。** 过强的锐化在空白区域产生假阳性。用 L1/L2 正则化控制
+- **不如方案 A 彻底。** 锐化是后处理，不能修复结构性问题。但成本低，值得先试
+
+---
+
+## v14 根因分析：生成模型质量差的宏观/微观原因
+
+### 宏观原因（系统/架构层面）
+
+#### 1. 管道碎片化，5 个独立黑盒串行
+
+```
+CLIP → SS Flow → StructureHead → SLat Flow → VoxelVAE → ConnectionHead → Mesh
+  ❄️      🔥          🔥            🔥          ❄️            ❄️
+```
+
+梯度只能在 3 个训练模块（🔥）内部流动，组件间完全割裂。VoxelVAE 的误差信号无法反传给 SLat Flow，SLat Flow 只能通过间接的 MSE loss 猜测 VoxelVAE 喜欢什么输入。
+
+#### 2. 数据规模差 2000 倍
+
+| | 本集成 | 原版 TRELLIS |
+|------|:--:|:--:|
+| 训练集 | 234 | 500,000 |
+| 类别数 | 1 | 多类 |
+| 模型参数 | ~300M | ~2B |
+
+大模型 + 小数据 = 模型容量远超数据多样性。模型学会了"记住"训练样本的特征分布，但从未学会泛化。生成时偏离训练分布一点点，下游 VoxelVAE 就解读为噪声。
+
+#### 3. 架构目标冲突
+
+```
+TRELLIS 设计目标： 通用文本→3D 生成（需要多样性、语义理解）
+LATO 设计目标：    特定形状的保拓扑解码（需要精确几何特征）
+
+集成后的实际需求：  文本 → 精确的刹车卡钳几何
+                               ↑
+                     这个跨度，中间缺了"几何理解"这一步
+```
+
+SS/SLat Flow 擅长生成"语义正确"的粗糙结构，VoxelVAE 擅长把"几何精确"的 latent 解码为拓扑正确的 mesh。但桥接处（StructureHead + SLat Flow）输出的 latent 既不语义正确也不几何精确。
+
+#### 4. 缺少端到端验证回路
+
+原版 TRELLIS 有渲染器做可视化监督，LATO 有重建 loss 做几何监督。集成管道没有任何中间监督——只能在最终 CD 看到一个数字，无法知道哪一步出了什么问题。
+
+---
+
+### 微观原因（逐组件定位）
+
+#### 1. StructureHead：nearest-neighbor 上采样 → 边界模糊（核心瓶颈）
+
+```
+16³ 的 1 个特征 voxel → nearest ×2 → ×2 → ×2 → 128³ 的 512 个完全相同的 voxel
+```
+
+3×3×3 卷积的感受野只能在块边界做平滑，无法在 8×8×8 硬块内部刻画 1-voxel 厚度的曲面。结果是 logits 被"摊大饼"：
+
+```
+P95 = 0.86   ← 95% 的 voxel 都没把握
+P99 = 4.40   ← 最高 1% 也不够锐利
+max = 9.34   ← 极端值太低（锐利边界通常 max > 50）
+```
+
+#### 2. VoxelVAE 输入分布漂移（隐藏瓶颈）
+
+```
+训练 VoxelVAE 时： GT mesh → PointNet(512-dim) → 512 维几何特征
+                                        ↓ 每个顶点携带：法向量、曲率、局部几何
+推理时：         text → SLat Flow(16-dim) → 16 维语义特征
+                                        ↓ 每个 voxel 只有：全局语义方向
+```
+
+这不是"好坏"的差异，是**信息量 32:1 的降维**。VoxelVAE 从未学过从降维特征重建——它期望收到的 512-dim 里每个维度都携带具体几何信息。
+
+**直接症状：VAE L0=0**
+
+```
+LATO VoxelVAE 解码流程：
+L0: latent_expander(16-dim) → vertex prediction head → sigmoid > threshold?
+    这一步期望在 64³ 空间中找到"哪些地方是顶点"
+    但 16-dim 语义特征无法告诉它哪里是顶点 → threshold 不触发 → 0 个顶点
+    
+L1: 从 L0 顶点做 subdivision。但 L0=0 → 只能暴力 subdivide 所有活跃 coords
+    → 38,869 顶点（无意义的全量采样）
+    
+L2: 继续 subdivide → 310,952 顶点 + 26,844,141 面（爆炸）
+```
+
+#### 3. StructureHead logits 空间位置对但精度不够
+
+```
+th>3 时 3075 个 voxel  → bbox 范围合理（卡钳形状）
+但 logits 最大 = 9.34   → 足够"存在"但不够"精确"
+```
+
+模型知道卡钳在哪里（位置对），但画不出精确的曲面（位置不够对）。
+
+#### 4. Flow Matching MSE 无法给几何反馈
+
+SLat Flow 训练时：
+```python
+loss = MSE(pred.feats, gt.feats)  # 逐特征值比较
+```
+
+但 VoxelVAE 关心的不是 feats 的数值误差，而是 feats 隐含的几何结构。MSE=0.22 在数值上不算大，但对 VoxelVAE 来说，这 0.22 的误差可能意味着"顶点应该在这儿还是那儿"的巨大差异。
+
+---
+
+### 因果链
+
+```
+数据少（234条）
+  ↓
+SS Flow 学到的是模糊的平均特征（而非锐利的几何边界）
+  ↓
+StructureHead nearest-neighbor 把模糊放大 512 倍（1→512 个相同 voxel）
+  ↓
+SLat Flow 在模糊的 coords 上填充模糊的 feats
+  ↓
+VoxelVAE 收到 16-dim 模糊语义特征 + 位置模糊的 coords
+  ↓
+L0 无法检测顶点 → 暴力 subdivide → 31 万顶点 + 2684 万面 → CD=0.267
+```
+
+---
+
+## v14 核心诊断：流程图/代码逻辑正确 ≠ 模块连接有效
+
+### 两个层面的"通"
+
+经过 v13 TRELLIS 逐模块审查，确认：
+- **流程图正确** — SS Flow → StructureHead → coords → SLat Flow → VoxelVAE → ConnectionHead → Mesh 的设计逻辑无误
+- **代码接口正确** — 所有模块间数据格式（dense tensor、SparseTensor、coords、feats）形状/类型匹配，能跑通不报错
+
+但 **CD=0.267 不变**。问题在更深一层：
+
+```
+代码层面（✅ 通）：   模块 A 输出 → 模块 B 输入    格式正确，管道不漏
+分布层面（❌ 不通）： 模块 A 产出的"内容"  ≠  模块 B 训练时见过的"内容"
+```
+
+### 逐接口诊断
+
+| # | 接口 | 代码连接 | 分布匹配 | 详情 |
+|---|------|:--:|:--:|------|
+| 1 | SS Flow → StructureHead | ✅ | ✅ | 联合训练，16³ dense 特征分布一致 |
+| 2 | **StructureHead → coords** | ✅ | **❌** | nearest-neighbor 上采样：1 个体素膨胀为 512 个相同体素，logits 被平均分摊。边界模糊的 coords 送入下游 |
+| 3 | coords → SLat Flow | ✅ | **⚠️** | coords 位置本身就偏了，SLat Flow 在错误的拓扑上填 feats |
+| 4 | **SLat Flow → VoxelVAE** | ✅ | **❌** | **16-dim 语义特征 vs 512-dim 几何特征**，信息量 32:1 降维 |
+| 5 | VoxelVAE → ConnectionHead | ✅ | ✅ | 同体系预训练，无分布问题 |
+
+### 接口 2 的深层分析：StructureHead → coords
+
+```
+StructureHead 要做的事：
+    16³ × 8ch = 32,768 个值  →  在 128³ = 2,097,152 个 voxel 中找出 ~5000 个正确的
+
+能做到吗？
+    ✅ 位置对：模型知道卡钳在哪儿（th>3 时 bbox 范围合理）
+    ❌ 精度不够：nearest×2×2×2 让 1 个特征点硬复制为 8×8×8=512 个相同 voxel
+       3×3 卷积感受野只能覆盖块之间的过渡区域，无法在块内部刻画 1-voxel 厚的曲面
+```
+
+这不是代码 bug，是 **nn.Upsample(nearest) 的物理极限**。用 32,768 个信息点直接内插出 2,097,152 个点的锐利边界，数学上不可能。
+
+### 接口 4 的深层分析：SLat Flow → VoxelVAE
+
+```
+训练时 VoxelVAE 收到的输入：
+    GT mesh → PointNet(512-dim) → [每个顶点：位置、法向量、曲率、局部邻域几何]
+    VoxelVAE 学到的映射： 丰富的局部几何特征 → 精确的顶点 subdivision
+
+推理时 VoxelVAE 收到的输入：
+    text → SLat Flow(16-dim) → [每个 voxel：全局语义方向，16 个维度的"卡钳-ness"]
+    VoxelVAE 被要求做： 16 维语义 → 精确的顶点 subdivision
+    
+但实际上 VoxelVAE 从未学过这个映射。
+它期望 512 维里每个维度都携带具体几何信息，
+却收到 16 维"这是一个卡钳"的模糊语义信号。
+```
+
+这不是"特征质量差"，是 **特征的本体论差异**：
+- 512-dim PointNet 特征描述的是 **"这个顶点处的局部几何是什么形状"**
+- 16-dim SLat 特征描述的是 **"这个 voxel 大概是不是卡钳的一部分"**
+
+两者完全不在同一个语义空间里。
+
+### 两个接口的叠加效应
+
+```
+StructureHead 模糊 (接口 2) × VoxelVAE 分布漂移 (接口 4) = 复合故障
+
+单独一个还能容忍：
+  - 如果只有接口 2 坏：VoxelVAE 可以用 512-dim 几何特征从模糊 coords 中恢复形状
+  - 如果只有接口 4 坏：锐利的 coords 可以补偿 16-dim 的语义贫乏
+
+两个同时坏：
+  - 模糊 coords + 语义贫乏 feats → VoxelVAE 完全无解 → L0=0 → 暴力 subdivide → CD=0.267
+```
+
+### 所以问题不在流程图，也不在代码逻辑
+
+| 层面 | 状态 |
+|------|:--:|
+| 流程图设计 | ✅ 正确 |
+| 代码接口（形状/类型/格式） | ✅ 通过 v13 逐行审查 |
+| TRELLIS 训练范式 | ✅ 符合 |
+| **跨模块分布对齐** | **❌ 2 个关键接口失效** |
+
+这就是为什么改阈值、修 ConnectionHead、加 CosineAnnealingLR 都改变不了 CD——这些修的都是 **代码正确性**，而问题出在 **分布层面**，代码写对了也修不了。
