@@ -111,6 +111,7 @@ class TrellisTextTo3DPipeline(Pipeline):
         cond: dict,
         num_samples: int = 1,
         sampler_params: dict = {},
+        ss_threshold: float = 2.0,
     ) -> torch.Tensor:
         """
         v3: Sample sparse structure using LatoStructureHead (res128 directly).
@@ -133,7 +134,7 @@ class TrellisTextTo3DPipeline(Pipeline):
 
         # LatoStructureHead: 16^3 dense -> 128^3 occupancy -> coords
         occ_logits = structure_head(z_s)
-        coords = torch.argwhere(occ_logits > 0)[:, [0, 2, 3, 4]].int()
+        coords = torch.argwhere(occ_logits > ss_threshold)[:, [0, 2, 3, 4]].int()
         return coords
 
     def decode_slat_lato(

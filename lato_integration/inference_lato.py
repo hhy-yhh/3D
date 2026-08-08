@@ -211,6 +211,7 @@ def sample_ss_lato(
     cond: dict,
     num_samples: int = 1,
     sampler_params: dict = {},
+    ss_threshold: float = 2.0,
 ) -> torch.Tensor:
     """
     SS Flow 采样 + LatoStructureHead → coords@128³。
@@ -234,7 +235,7 @@ def sample_ss_lato(
 
     # LatoStructureHead: 16³ dense → 128³ occupancy
     occ_logits = structure_head(z_s)  # [B, 1, 128, 128, 128]
-    coords = coords_from_occupancy(occ_logits)  # [N, 4] 直接 res128！
+    coords = coords_from_occupancy(occ_logits, threshold=ss_threshold)  # [N, 4] 直接 res128！
 
     return coords
 
@@ -422,6 +423,8 @@ def main():
                         help="LATO VoxelVAE decode inference_threshold")
     parser.add_argument("--edge_threshold", type=float, default=0.45,
                         help="ConnectionHead 边概率阈值（低=更多边, 高=更少边）")
+    parser.add_argument("--ss_threshold", type=float, default=2.0,
+                        help="SS occupancy logits 阈值（调高=更少 voxels，v13 默认 2.0）")
     parser.add_argument("--k_neighbors", type=int, default=32,
                         help="KDTree 最近邻数（影响候选边数量）")
 
@@ -679,6 +682,7 @@ def main():
                     "steps": opt.ss_steps,
                     "cfg_strength": opt.cfg_strength,
                 },
+                ss_threshold=opt.ss_threshold,
             )
         print(f"\n{'='*60}")
         print(f"  SS-only 完成! (v6: LatoStructureHead @ res128)")
@@ -694,7 +698,8 @@ def main():
             cond = pipeline.get_cond([opt.prompt])
             torch.manual_seed(opt.seed)
             coords = sample_ss_lato(pipeline, cond, num_samples=1,
-                sampler_params={"steps": opt.ss_steps, "cfg_strength": opt.cfg_strength})
+                sampler_params={"steps": opt.ss_steps, "cfg_strength": opt.cfg_strength},
+                ss_threshold=opt.ss_threshold)
             print(f"  [A] SS → coords: {coords.shape[0]} active voxels @ res128")
             slat = pipeline.sample_slat(cond, coords,
                 sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})

@@ -394,8 +394,8 @@ def main():
     parser.add_argument("--slat_steps", type=int, default=20)
     parser.add_argument("--cfg_strength", type=float, default=5.0)
     parser.add_argument("--lato_threshold", type=float, default=0.2)
-    parser.add_argument("--ss_threshold", type=float, default=0.0,
-                        help="SS occupancy logits 阈值（调高=更少 voxels）")
+    parser.add_argument("--ss_threshold", type=float, default=2.0,
+                        help="SS occupancy logits 阈值（调高=更少 voxels，v13 默认 2.0）")
     parser.add_argument("--max_coords", type=int, default=0,
                         help="最大 active voxel 数（0=不限制；超限取置信度最高的 K 个）")
     parser.add_argument("--edge_threshold", type=float, default=0.45)

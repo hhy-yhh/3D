@@ -123,7 +123,7 @@ class LatoStructureHead(nn.Module):
 
 def coords_from_occupancy(
     logits: torch.Tensor,
-    threshold: float = 0.0,
+    threshold: float = 2.0,
 ) -> torch.Tensor:
     """
     从 occupancy logits 提取稀疏坐标（INT 类型，兼容 TRELLIS pipeline）。
