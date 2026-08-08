@@ -13,32 +13,25 @@ class ConnectionHead(nn.Module):
     """
     Small MLP head for edge or connection logits between vertex pairs.
 
-    Adapted from LATO: vertex_encoder.py lines 55-68.
+    Identical to LATO: vertex_encoder.py lines 55-68.
 
     Given features of two vertices [feat_u | feat_v], predicts the logit
     for whether an edge exists between them.
 
     Args:
-        channels: Input feature dimension (per vertex, so 2*channels after concat).
+        channels: Concatenated vertex pair feature dim (feat_dim * 2).
         out_channels: Output dimension (typically 1 for binary edge logit).
         mlp_ratio: Hidden layer multiplier.
     """
 
-    def __init__(self, channels: int, out_channels: int = 1, mlp_ratio: float = 4.0):
+    def __init__(self, channels: int, out_channels: int, mlp_ratio: float = 4.0):
         super().__init__()
-        hidden_channels = int(channels * 2 * mlp_ratio)
+        hidden_channels = int(channels * mlp_ratio)
         self.mlp = nn.Sequential(
-            nn.Linear(channels * 2, hidden_channels),
-            nn.SiLU(),
+            nn.Linear(channels, hidden_channels),
+            nn.GELU(approximate="tanh"),
             nn.Linear(hidden_channels, out_channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Concatenated vertex pair features [P, channels * 2].
-
-        Returns:
-            Edge logits [P, out_channels].
-        """
         return self.mlp(x)
