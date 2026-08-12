@@ -115,7 +115,7 @@ sh = LatoStructureHead(in_channels=8, base_channels=256, num_res_blocks=1).to(d)
 
 # 验证 PixelShuffle 架构：conv 权重的 out_channels 应为 base*8
 for name, p in sh.named_parameters():
-    if "conv" in name and "weight" in p and p.ndim == 5:
+    if "conv" in name and "weight" in name and p.ndim == 5:
         cout = p.shape[0]
         if cout % 8 == 0:
             print(f"[SH Arch] ✅ PixelShuffle: {name} out_ch={cout} (={cout//8}×8)")
