@@ -31,7 +31,7 @@ Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
 ## 当前训练
 
 ```
-SS Flow v5 (GPU 4)                   SLat Flow v10 (GPU 7)
+SS Flow v6 (GPU 4)                   SLat Flow v10 (GPU 7)
 ─────────────────────                ──────────────────────
 config: lato_ss_flow_v3.json         config: lato_slat_flow_v9.json
 data:   database_lato/               data:   lato_latents_v2/
@@ -66,8 +66,8 @@ loss:   FlowMSE + occBCE(λ=0.1)     target: 3D latent feats@128
 | 模型 | 路径 |
 |------|------|
 | SS config | `configs/generation/lato_ss_flow_v3.json` |
-| SS Flow ckpt | `outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt` |
-| StructureHead ckpt | `outputs/lato_ss_flow_v5/ckpts/structure_head_step*.pt` |
+| SS Flow ckpt | `outputs/lato_ss_flow_v6/ckpts/denoiser_step*.pt` |
+| StructureHead ckpt | `outputs/lato_ss_flow_v6/ckpts/structure_head_step*.pt` |
 | SLat config | `configs/generation/lato_slat_flow_v9.json` |
 | SLat Flow ckpt | `outputs/lato_slat_flow_v10/ckpts/denoiser_step*.pt` |
 | SLat stats | `lato_latents_v2/latents/lato_vae_16dim_128/stats.json` |
@@ -82,11 +82,11 @@ loss:   FlowMSE + occBCE(λ=0.1)     target: 3D latent feats@128
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 
-# SS Flow v5（GPU 4）
+# SS Flow v6（GPU 4）
 CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
     --config configs/generation/lato_ss_flow_v3.json \
     --data_dir /data/huanghaoyang/3D/database_lato \
-    --output_dir outputs/lato_ss_flow_v5 \
+    --output_dir outputs/lato_ss_flow_v6 \
     --num_gpus 1
 
 # SLat Flow v10（GPU 7）
@@ -115,7 +115,7 @@ export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYT
 export ATTN_BACKEND=sdpa
 export SPARSE_ATTN_BACKEND=xformers
 
-SS_CKPT=$(ls outputs/lato_ss_flow_v5/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SS_CKPT=$(ls outputs/lato_ss_flow_v6/ckpts/denoiser_step*.pt | sort -V | tail -1)
 SLAT_CKPT=$(ls outputs/lato_slat_flow_v10/ckpts/denoiser_step*.pt | sort -V | tail -1)
 
 # 单条快速测试（调试用：--limit 1 --save_meshes）
@@ -146,17 +146,29 @@ python lato_integration/evaluate_3d_metrics.py \
 
 ### 健康检查
 
+**自动检测训练类型：** 目录下有 `structure_head_step*.pt` → SS Flow，否则 → SLat Flow。
+
 ```bash
 cd /data/huanghaoyang/3D/TRELLIS
 
-# SS Flow（自动检测：目录下有 structure_head_step*.pt）
-bash check_health.sh outputs/lato_ss_flow_v5 0 --data_dir /data/huanghaoyang/3D/database_lato
+# SS Flow v6（GPU 4）— 自动检测为 ss 类型
+bash check_health.sh outputs/lato_ss_flow_v6 4 --data_dir /data/huanghaoyang/3D/database_lato
 
-# SLat Flow（自动检测：无 structure_head ckpt）
-bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
+# SLat Flow v10（GPU 7）— 自动检测为 slat 类型（无 structure_head ckpt）
+bash check_health.sh outputs/lato_slat_flow_v10 7
 
-# 不占训练 GPU，每 10000 步跑一次（~30 秒）
+# 也可手动指定类型（--type ss|slat）
+# 每 10000 步跑一次（~30 秒），不占训练 GPU
 ```
+
+**v16 新增检查项：**
+
+| 新增项 | 位置 | 说明 |
+|--------|------|------|
+| PixelShuffle 架构验证 | SS 专项 | 检查 conv 权重 `out_ch = base×8`，确认是 PixelShuffle 而非旧 nearest |
+| StructureHead 权重匹配 | SS 专项 | 报告 "已加载 N/M 匹配"，缺失则警示架构不兼容 |
+| lr_scheduler 配置 | SLat 专项 | 验证 CosineAnnealingLR 的 T_max 和 eta_min 是否正确 |
+| 从零训练友好提示 | 通用 | 早期无 log/ckpt 时提示"从零训练，早期正常"，不误报 |
 
 #### 判断标准
 
@@ -164,6 +176,8 @@ bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
 
 | 指标 | 正常 | 异常 |
 |------|:--:|:--:|
+| SH Arch (PixelShuffle) | `out_ch = base×8` | `out_ch = base` (旧 nearest 架构) |
+| SH Wt | 全部匹配 | 缺失参数（架构不兼容） |
 | SH 3D | X/Y/Z span > 10, n > 0 | 全负或任一轴 span=0 |
 | occ_bce | > 0.01 | 趋近 0 或不存在 |
 | MSE | 持续下降 | 不降或上升 |
@@ -173,6 +187,7 @@ bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
 
 | 指标 | 正常 | 异常 |
 |------|:--:|:--:|
+| lr_scheduler | CosineAnnealingLR 已配置 | 未配置 |
 | SLat Forward | mean∈[-10,10], NaN=0, Inf=0 | NaN/Inf |
 | MSE | 持续下降 | 不降或上升 |
 | NaN | 0 | > 0 |
@@ -387,7 +402,7 @@ th>5 =     153          ← 太少了
 
 | 模型 | 步数 | MSE | 趋势 | 状态 |
 |------|------|------|------|:--:|
-| SS Flow v5 | 530k | ~0.012 | 📉 持续下降 | ✅ |
+| SS Flow v6 | 530k | ~0.012 | 📉 持续下降 | ✅ |
 | SLat Flow v9 | 527k | ~0.22 | 缓慢下降（CosineAnnealingLR 衰减中） | ✅ |
 | LatoStructureHead | 530k | occ_bce ~0.02 | 活跃 | ⚠️ 架构瓶颈 |
 | VoxelVAE | LATO 预训练 | — | 冻结 | ✅ |
@@ -1088,4 +1103,144 @@ Text → CLIP → SS Flow ──→ LatoStructureHead(自写) → coords
         ├─ 单独一个还勉强：模糊 coords + 好特征 或 好 coords + 弱特征 都能凑合
         ├─ 同时出现：模糊 coords + 错类型特征 → L0=0 → 暴力填充
         └─ 精度差 3 倍（CD=0.218 vs 充分收敛 0.08）
+```
+
+---
+
+## v16 代码改造 + 训练流程 (2026-08-12)
+
+### 改造目标
+
+修复 v15 识别的两个模块不对齐问题：
+
+```
+问题一: StructureHead nearest-neighbor 硬复制 → 边界模糊
+    → 改为 PixelShuffle 可学习上采样（与 TRELLIS 原版对齐）
+
+问题二: VoxelVAE decoder 不适应 SLat Flow 特征
+    → 加噪微调 decoder 最后 2 层，让 VoxelVAE 容忍 SLat Flow 误差
+```
+
+### 代码改动清单
+
+| # | 文件 | 改动 | 原因 |
+|---|------|------|------|
+| 1 | `structure_head.py` | `UpsampleBlock3d` 从 `nn.Upsample(nearest)` 改为 `Conv3d(in, out*8) → pixel_shuffle_3d(2)` | 子体素特征可学习分配，不再硬复制 512 份 |
+| 2 | `structure_head.py` | `convert_to_fp16/32` 从空操作改为 `self.half()/float()` | PixelShuffle 有可学习参数，需真实转换 |
+| 3 | `finetune_vae.py` | **新文件** — VoxelVAE decoder 微调脚本 | 加噪训练最后 2 层，适配 SLat Flow 特征 |
+| 4 | `lato_ss_flow_v3.json` | `lambda_occupancy: 1.0` → `0.1` | 辅助 loss 权重过高会拖慢主 loss 收敛 |
+| 5 | `evaluate_3d_metrics.py` | 新增 `--vae_ft_ckpt` 参数 | 支持加载微调后的 VoxelVAE |
+| 6 | `evaluate_3d_metrics.py` | StructureHead 权重加载加 ⚠️ 警告 | 旧 ckpt 与新架构不匹配时提醒用户 |
+
+### 架构兼容性
+
+| 组件 | 架构变了？ | 旧 ckpt 兼容？ | 策略 |
+|------|:--:|:--:|------|
+| SS Flow | ❌ | — | 从零训 |
+| StructureHead | ✅ Conv3d(in, out*8) | ❌ 权重形状不同 | 从零训 |
+| SLat Flow | ❌ | — | 从零训（v10） |
+| VoxelVAE | ❌ (微调后覆盖) | — | 微调覆盖 decoder |
+
+### 训练流程
+
+**数据不变**，和 v5/v9 用同一份：
+
+| 数据 | 路径 | 说明 |
+|------|------|------|
+| metadata | `database_lato/metadata.csv` | 训练集 234 条 |
+| occupancy | `database_lato/ss_occupancy_128_v2/` | GT mesh → 体素化 |
+| GT latents | `database_lato/lato_latents_v2/latents/lato_vae_16dim_128/` | GT mesh → VoxelVAE.encode() |
+
+#### 环境变量
+
+```bash
+# SS Flow
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+
+# SLat Flow
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export SPARSE_ATTN_BACKEND=xformers
+
+# 推理（两个 backend 都设）
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=xformers
+```
+
+#### 第 1 步：SS Flow v6 + StructureHead 从零训练（GPU 4）
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+
+CUDA_VISIBLE_DEVICES=4 python lato_integration/run_train.py \
+    --config configs/generation/lato_ss_flow_v3.json \
+    --data_dir /data/huanghaoyang/3D/database_lato \
+    --output_dir outputs/lato_ss_flow_v6 \
+    --num_gpus 1
+```
+
+#### 第 2 步（并行）：SLat Flow v10 从零训练（GPU 7）
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export SPARSE_ATTN_BACKEND=xformers
+
+CUDA_VISIBLE_DEVICES=7 python lato_integration/run_train.py \
+    --config configs/generation/lato_slat_flow_v9.json \
+    --data_dir /data/huanghaoyang/3D/database_lato/lato_latents_v2 \
+    --output_dir outputs/lato_slat_flow_v10 \
+    --num_gpus 1
+```
+
+#### 第 3 步：VoxelVAE 微调（SS Flow 训完后）
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+
+python lato_integration/finetune_vae.py \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --gt_latents /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/ \
+    --output_dir outputs/vae_finetuned \
+    --epochs 50
+```
+
+#### 第 4 步：全量推理评估
+
+```bash
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=xformers
+
+SS_CKPT=$(ls outputs/lato_ss_flow_v6/ckpts/denoiser_step*.pt | sort -V | tail -1)
+SLAT_CKPT=$(ls outputs/lato_slat_flow_v10/ckpts/denoiser_step*.pt | sort -V | tail -1)
+
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" \
+    --slat_ckpt "$SLAT_CKPT" \
+    --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --vae_ft_ckpt outputs/vae_finetuned/vae_finetuned.pt \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/eval_v6_v10 \
+    --ss_threshold 2.0 \
+    --max_coords 16384
+```
+
+### 时间线
+
+```
+GPU 4: SS Flow v6 从零训 ──────────────── 3-4 天 ──→ 完成
+GPU 7: SLat Flow v10 从零训 ────────────── 3-4 天 ──→ 完成
+                                                    │
+                                            VoxelVAE 微调 (~3h)
+                                                    │
+                                                推理评估
 ```

@@ -1,11 +1,12 @@
 #!/bin/bash
 # check_health.sh — 训练健康自检（支持 SS Flow / SLat Flow）
+# v16: SS Flow v6 (PixelShuffle) + SLat Flow v10 (从零训)
 # 用法:
 #   bash check_health.sh [ckpt_dir] [gpu_id] [--type ss|slat] [--data_dir PATH]
-#   bash check_health.sh outputs/lato_ss_flow_v5 0
+#   bash check_health.sh outputs/lato_ss_flow_v6 0
 #   bash check_health.sh outputs/lato_slat_flow_v10 0 --type slat
 
-CKPT_DIR=${1:-outputs/lato_ss_flow_v5}
+CKPT_DIR=${1:-outputs/lato_ss_flow_v6}
 GPU=${2:-0}
 TRAIN_TYPE=""
 DATA_DIR=""
@@ -95,7 +96,7 @@ if [ "$TRAIN_TYPE" = "ss" ]; then
         echo "  ⚠️  occ_bce 未出现或趋零 — StructureHead 可能未参与训练"
     fi
 
-    # StructureHead 3D 检查
+    # StructureHead 3D 检查 (v16 PixelShuffle 架构)
     python3 << 'PYEOF'
 import torch, glob, numpy as np, sys, os, json
 ckpt_dir = os.environ["CKPT_DIR"] + "/ckpts"
@@ -107,12 +108,24 @@ from lato_integration.structure_head import LatoStructureHead
 sc = sorted(glob.glob(f"{ckpt_dir}/denoiser_step*.pt"))
 shc = sorted(glob.glob(f"{ckpt_dir}/structure_head_step*.pt"))
 if not sc:
-    print("[SH 3D] ⏳ 无 checkpoint")
+    print("[SH 3D] ⏳ 无 checkpoint — 从零训练，早期正常")
     exit(0)
 
 sh = LatoStructureHead(in_channels=8, base_channels=256, num_res_blocks=1).to(d)
+
+# 验证 PixelShuffle 架构：conv 权重的 out_channels 应为 base*8
+for name, p in sh.named_parameters():
+    if "conv" in name and "weight" in p and p.ndim == 5:
+        cout = p.shape[0]
+        if cout % 8 == 0:
+            print(f"[SH Arch] ✅ PixelShuffle: {name} out_ch={cout} (={cout//8}×8)")
+        break
+
 if shc:
-    sh.load_state_dict(torch.load(shc[-1], map_location=d, weights_only=True), strict=False)
+    sd = torch.load(shc[-1], map_location=d, weights_only=True)
+    miss, unexp = sh.load_state_dict(sd, strict=False)
+    n_loaded = len(sd) - len(miss)
+    print(f"[SH Wt] 已加载: {n_loaded}/{len(sd)} 匹配" + (f", 缺失: {len(miss)}" if miss else " (全部匹配)"))
 sh.eval()
 
 real_latents = []
@@ -265,6 +278,28 @@ if model_loaded:
         print(f"[SLat Forward] ❌ 前向失败: {e}")
 PYEOF
 
+    # 检查 lr_scheduler 是否正确配置（v10 关键新增）
+    echo ""
+    echo "  ── 训练配置检查 ──"
+    python3 << 'PYEOF'
+import json, os
+cfg_path = os.path.join(os.environ["CKPT_DIR"], "config.json")
+if os.path.exists(cfg_path):
+    cfg = json.load(open(cfg_path))
+    lr_sch = cfg.get("trainer", {}).get("args", {}).get("lr_scheduler", {})
+    if lr_sch:
+        name = lr_sch.get("name", "?")
+        t_max = lr_sch.get("args", {}).get("T_max", "?")
+        eta_min = lr_sch.get("args", {}).get("eta_min", "?")
+        print(f"  lr_scheduler:     ✅ {name}")
+        print(f"    T_max:          {t_max}")
+        print(f"    eta_min:        {eta_min}")
+    else:
+        print("  lr_scheduler:     ⚠️  未配置 (v10 建议 CosineAnnealingLR)")
+else:
+    print("  ⚠️  无 config.json")
+PYEOF
+
     # SLat VAE 兼容性检查（用 stats.json 模拟 denormalize）
     echo ""
     echo "  ── VAE 兼容性预估 ──"
@@ -325,7 +360,7 @@ ISSUES=0
 if [ "$NAN" -gt 0 ]; then echo "  ❌ 有 NaN"; ISSUES=$((ISSUES+1)); fi
 if [ "$MSE_AVG" = "N/A" ]; then
     if [ -d "$CKPT_SUBDIR" ]; then
-        echo "  ℹ️  无 log 数据 — 训练处于早期阶段 (< i_log 步)，或正在运行中，属正常现象"
+            echo "  ℹ️  无 log 数据 — 从零训练，早期 (< i_log 步) 或运行中，属正常现象"
     else
         echo "  ⚠️  无 log 且 ckpts/ 目录不存在 — 训练可能尚未初始化"
         ISSUES=$((ISSUES+1))
