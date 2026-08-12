@@ -221,8 +221,14 @@ def load_pipeline(opt, device):
     if any(k.startswith(sh_prefix) for k in ss_ckpt_state.keys()):
         sh_state = {k[len(sh_prefix):]: v for k, v in ss_ckpt_state.items()
                    if k.startswith(sh_prefix)}
-        structure_head.load_state_dict(sh_state, strict=False)
-        print("  LatoStructureHead: 从 SS checkpoint 加载")
+        loaded, expected = 0, len(sh_state)
+        sh_missing, sh_unexpected = structure_head.load_state_dict(sh_state, strict=False)
+        loaded = expected - len(sh_missing)
+        if loaded < expected:
+            print(f"  ⚠️  LatoStructureHead: 仅加载 {loaded}/{expected} 个参数 "
+                  f"({len(sh_missing)} 缺失 — 架构可能不匹配，需重训)")
+        else:
+            print("  LatoStructureHead: 从 SS checkpoint 加载")
     else:
         # v2: 尝试加载独立 structure_head_step*.pt（训练时单独保存）
         import glob as _glob
@@ -238,7 +244,10 @@ def load_pipeline(opt, device):
                     sh_state = sh_state['denoiser']
                 elif 'state_dict' in sh_state:
                     sh_state = sh_state['state_dict']
-            structure_head.load_state_dict(sh_state, strict=False)
+            sh_missing, sh_unexpected = structure_head.load_state_dict(sh_state, strict=False)
+            loaded = len(sh_state) - len(sh_missing)
+            if loaded < len(sh_state):
+                print(f"  ⚠️  LatoStructureHead: 独立文件仅加载 {loaded}/{len(sh_state)} 参数 — 架构可能不匹配")
         else:
             print("  LatoStructureHead: 使用随机初始化（未找到预训练权重）")
     structure_head.eval()
@@ -300,6 +309,16 @@ def load_pipeline(opt, device):
     ).to(device)
     connection_head = LATOConnectionHead(channels=1024, out_channels=1, mlp_ratio=0.75).to(device)
     load_pretrained_woself(opt.lato_ckpt, vae=lato_vae, connection_head=connection_head)
+    # 如果用微调权重覆盖 VoxelVAE
+    if opt.vae_ft_ckpt and os.path.exists(opt.vae_ft_ckpt):
+        ft_data = torch.load(opt.vae_ft_ckpt, map_location=device, weights_only=True)
+        ft_state = ft_data.get("model_state_dict", ft_data)
+        missing, unexpected = lato_vae.load_state_dict(ft_state, strict=False)
+        print(f"  VoxelVAE 微调权重已覆盖: {opt.vae_ft_ckpt}")
+        if missing:
+            print(f"    微调权重缺失 keys: {len(missing)}")
+        if unexpected:
+            print(f"    微调权重多余 keys: {len(unexpected)}")
     lato_vae.eval()
     connection_head.eval()
 
@@ -379,6 +398,8 @@ def main():
                         help="LATO VAE checkpoint")
     parser.add_argument("--lato_config", type=str, required=True,
                         help="LATO VAE 配置文件")
+    parser.add_argument("--vae_ft_ckpt", type=str, default=None,
+                        help="（可选）VoxelVAE 微调后权重，覆盖 --lato_ckpt 中的 VAE 部分")
     parser.add_argument("--trellis_pretrained", type=str,
                         default="microsoft/TRELLIS-text-base")
     parser.add_argument("--test_metadata", type=str, required=True,

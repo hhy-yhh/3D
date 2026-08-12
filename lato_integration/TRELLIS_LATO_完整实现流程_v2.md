@@ -1026,3 +1026,66 @@ StructureHead 模糊 (接口 2) × VoxelVAE 分布漂移 (接口 4) = 复合故�
 | **跨模块分布对齐** | **❌ 2 个关键接口失效** |
 
 这就是为什么改阈值、修 ConnectionHead、加 CosineAnnealingLR 都改变不了 CD——这些修的都是 **代码正确性**，而问题出在 **分布层面**，代码写对了也修不了。
+
+---
+
+## v15 设计与实现偏离分析 (2026-08-09)
+
+### 设计目标回顾
+
+```
+Encoder/Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS
+```
+
+### 实际现状
+
+```
+Text → CLIP → SS Flow ──→ LatoStructureHead(自写) → coords
+             (TRELLIS)   (既不是TRELLIS也不是LATO)
+                                │
+                                ▼
+              SLat Flow ──→ VoxelVAE.decode() → ConnectionHead → Mesh
+              (TRELLIS)     (LATO一半)            (LATO)
+                            ↑
+                      训练收512-dim PointNet几何特征
+                      推理收16-dim Flow语义特征 ← 不对齐
+```
+
+### 三个设计偏离
+
+| # | 设计目标 | 实际 | 后果 |
+|---|---------|------|------|
+| 1 | 结构解码用 LATO | 自写 LatoStructureHead (nearest 上采样) | 64:1 压缩，边界模糊，既非 TRELLIS 也非 LATO |
+| 2 | LATO encoder 产出特征 | 没有 LATO encoder，特征来自 SLat Flow | 512-dim 几何 vs 16-dim 语义，VoxelVAE 收不认识的语言 |
+| 3 | Decoder 用 LATO | 只用了 VoxelVAE 解码器一半，缺其配对编码器 | 解码器期望的几何特征无人提供 |
+
+### 问题定性
+
+**不是代码 bug，不是 TRELLIS 和 LATO 接口不兼容，而是设计适配不到位。**
+
+- v13 已确认：代码逻辑正确，TRELLIS 和 LATO 的接口格式也对齐（张量形状、Flow Matching 范式、CFG 推理均与原版一致）
+- 三个模块的适配层过于简陋，连接处存在"语言不通"——模块 A 说几何，模块 B 说语义，模块 C 两边都不搭
+
+### 生成质量不佳的根因总结（设计视角）
+
+```
+问题一 ─ 结构解码是临时桥接，不是任何一个体系的标准模块
+        │
+        ├─ TRELLIS 原版用 SparseStructureDecoder (PixelShuffle 可学习上采样)
+        ├─ LATO 体系根本没有这个模块（LATO 只做保拓扑编解码）
+        └─ 自写的 nearest-neighbor 上采样 16³→128³ 信息冲淡 512 倍
+           │
+           ▼
+问题二 ─ VoxelVAE 缺了配对编码器，特征来源不对
+        │
+        ├─ 训练时代: GT mesh → PointNet(512-dim) → VoxelVAE.encode → latent → decode
+        ├─ 推理时代: text → CLIP → SS/SLat Flow(16-dim) → VoxelVAE.decode
+        └─ 16-dim 语义 ≠ 512-dim 几何，解码器从未学过这个映射
+           │
+           ▼
+问题三 ─ 两个偏离叠加，框架图虽窄但宽在错误的地方
+        │
+        ├─ 单独一个还勉强：模糊 coords + 好特征 或 好 coords + 弱特征 都能凑合
+        ├─ 同时出现：模糊 coords + 错类型特征 → L0=0 → 暴力填充
+        └─ 精度差 3 倍（CD=0.218 vs 充分收敛 0.08）
+```
