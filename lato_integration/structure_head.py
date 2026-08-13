@@ -97,8 +97,10 @@ class LatoStructureHead(nn.Module):
         in_channels: int,
         base_channels: int = 256,
         num_res_blocks: int = 1,
+        use_fp16: bool = False,
     ):
         super().__init__()
+        self.use_fp16 = use_fp16
         # 三级 2× PixelShuffle 上采样：16 → 32 → 64 → 128
         c0 = base_channels
         c1 = base_channels // 2   # 128
@@ -125,7 +127,18 @@ class LatoStructureHead(nn.Module):
         return self.out_conv(h)  # → [B, 1, 128, 128, 128]
 
     def convert_to_fp16(self) -> None:
-        """转换为 fp16（PixelShuffle 使用可学习参数，需真正转换）。"""
+        """
+        转换为 fp16。
+
+        🔧 与 EnhancedSSFlowModel.convert_to_fp16() 对齐：
+        BasicTrainer.load() 在 fp16_mode='inflat_all' 时会无条件调用
+        model.convert_to_fp16()。但 SS Flow 本管线用 fp32（use_fp16=false），
+        StructureHead 输入直接来自 SS Flow 输出，必须保持 fp32 与之匹配，
+        否则出现 "Input type (float) and bias type (c10::Half)" 错误。
+        """
+        if not self.use_fp16:
+            self.float()
+            return
         self.half()
 
     def convert_to_fp32(self) -> None:
