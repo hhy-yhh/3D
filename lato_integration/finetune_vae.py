@@ -26,7 +26,7 @@ import torch.nn as nn
 import numpy as np
 
 _TRELLIS_ROOT = os.environ.get("TRELLIS_ROOT", os.path.dirname(os.path.dirname(__file__)))
-_LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(os.path.dirname(os.path.dirname(__file__)), "LATO"))
+_LATO_ROOT = os.environ.get("LATO_ROOT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "LATO"))
 for p in [os.path.abspath(_TRELLIS_ROOT), os.path.abspath(_LATO_ROOT)]:
     if p not in sys.path:
         sys.path.insert(0, p)
