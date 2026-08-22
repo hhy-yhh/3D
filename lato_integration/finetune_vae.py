@@ -132,7 +132,7 @@ def main():
         for npz_path in tqdm(data_files, desc=f"Epoch {epoch+1}"):
             data = np.load(npz_path)
             coords = torch.from_numpy(data["coords"]).to(device)
-            feats = torch.from_numpy(data["feats"].float()).to(device)
+            feats = torch.from_numpy(data["feats"].astype(np.float32)).to(device)
 
             # 干净输入 → 干净输出（detach, 作为 GT 目标）
             clean_slat = LATOSparseTensor(coords=coords, feats=feats)
