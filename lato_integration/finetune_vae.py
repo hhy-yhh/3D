@@ -174,6 +174,8 @@ def main():
     parser.add_argument("--noise_std", type=float, default=0.0,
                         help="输入 feats 加噪 std（0=干净 GT latent；>0 模拟 SLat Flow 误差增强鲁棒）")
     parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="（可选）续训：从 vae_ft_epoch{N}.pt 继续（读 model + optimizer + epoch）")
     parser.add_argument("--device", default="cuda")
     opt = parser.parse_args()
 
@@ -192,6 +194,20 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=opt.lr, weight_decay=opt.wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=opt.epochs)
 
+    # ── 断点续训 ──
+    start_epoch = 0
+    if opt.resume:
+        ckpt = torch.load(opt.resume, map_location=device, weights_only=True)
+        vae.load_state_dict(ckpt["model_state_dict"], strict=False)
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception as e:
+            print(f"  ⚠️ optimizer 状态不匹配，使用新 optimizer（LR 从头）: {e}")
+        start_epoch = int(ckpt.get("epoch", 0))
+        for _ in range(start_epoch):
+            scheduler.step()
+        print(f"  [resume] 从 epoch {start_epoch} 继续（总 {opt.epochs} epoch）")
+
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
     # ── 2. 数据 + 预计算 gt_vertex_voxels_list ──
@@ -205,19 +221,29 @@ def main():
     # 分辨率链 128 → 256 → 512（与 decoder_blocks_vtx [128, 256] 的 out_resolution 对应）
     resolutions = [128, 256, 512]
 
-    print("[3/4] 预计算 gt_vertex_voxels_list（每样本体素化 128/256/512 薄表面）...")
+    print("[3/4] 预计算 gt_vertex_voxels_list（每样本体素化 128/256/512 薄表面，带磁盘缓存）...")
+    cache_dir = os.path.join(opt.output_dir, "gt_cache")
+    os.makedirs(cache_dir, exist_ok=True)
     cache = {}  # key -> (npz_path, gt_list_on_cpu)
     valid_keys = []
     for npz_path in tqdm(data_files, desc="voxelize"):
         key = os.path.splitext(os.path.basename(npz_path))[0]
-        mesh_path = find_mesh_file(opt.gt_meshes, key)
-        if mesh_path is None:
-            tqdm.write(f"  [SKIP] 无 mesh: {key}")
-            continue
-        gt_list_cpu = build_gt_vertex_voxels_list(mesh_path, resolutions, torch.device("cpu"))
-        if gt_list_cpu is None:
-            tqdm.write(f"  [SKIP] 体素化失败: {key}")
-            continue
+        cache_file = os.path.join(cache_dir, key + ".npz")
+
+        if os.path.exists(cache_file):
+            g = np.load(cache_file)
+            gt_list_cpu = [torch.from_numpy(g[f"g{i}"]).long() for i in range(len(resolutions))]
+        else:
+            mesh_path = find_mesh_file(opt.gt_meshes, key)
+            if mesh_path is None:
+                tqdm.write(f"  [SKIP] 无 mesh: {key}")
+                continue
+            gt_list_cpu = build_gt_vertex_voxels_list(mesh_path, resolutions, torch.device("cpu"))
+            if gt_list_cpu is None:
+                tqdm.write(f"  [SKIP] 体素化失败: {key}")
+                continue
+            np.savez(cache_file, **{f"g{i}": gt_list_cpu[i].numpy() for i in range(len(resolutions))})
+
         cache[key] = (npz_path, gt_list_cpu)
         valid_keys.append(key)
     print(f"  有效样本: {len(valid_keys)} / {len(data_files)}")
@@ -225,7 +251,7 @@ def main():
     # ── 4. 训练 ──
     print(f"[4/4] Fine-tuning ({opt.epochs} epochs, noise_std={opt.noise_std}) ...")
 
-    for epoch in range(opt.epochs):
+    for epoch in range(start_epoch, opt.epochs):
         vae.train()
         epoch_loss = 0.0
         n_valid = 0

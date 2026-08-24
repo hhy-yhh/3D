@@ -1367,6 +1367,29 @@ python lato_integration/finetune_vae.py \
 - 耗时 ~2.5~3 小时（体素化 ~14 min + 训练 ~5.5 min/epoch）。
 - 启动应打印 `Trainable: ~4,470,787 / 165,884,963 (2.7%)`。
 
+### 断点续训 + 体素化缓存
+
+`finetune_vae.py` 支持 `--resume`（断点续训）与体素化磁盘缓存：
+
+- **`--resume <vae_ft_epoch{N}.pt>`**：恢复 模型权重 + optimizer 动量 + cosine 学习率相位。加载后手动把 scheduler 步进到 `start_epoch`，LR 与从头跑到该 epoch 完全一致。**只能从 `vae_ft_epoch{N}.pt` 续**（含 optimizer/epoch），不能从 `vae_finetuned.pt` 续（只有 `model_state_dict`）。
+- **体素化缓存**：预计算循环先查 `output_dir/gt_cache/<key>.npz`，命中直接读，不再重跑 open3d 体素化（省 ~14 min）。第一次跑完自动生成。
+
+续训命令：
+
+```bash
+python lato_integration/finetune_vae.py \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --gt_latents /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/ \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/vae_finetuned_bce \
+    --max_coords 8000 \
+    --epochs 30 \
+    --resume outputs/vae_finetuned_bce/vae_ft_epoch10.pt
+```
+
+- **`--output_dir` 必须与原来一致**，否则找不到 `gt_cache` 和要续的 checkpoint。
+
 ### 生效方式
 
 微调产物是「补丁」，加载顺序：预训练 `vae_128to512.pt` → `load_state_dict(微调权重, strict=False)` 覆盖 3 个头。
@@ -1386,5 +1409,5 @@ python lato_integration/finetune_vae.py \
 
 - **OOM**：训练模式细分不剪枝（`lato_vae.py:94` 只在 `not training` 剪枝），窗口注意力 O(N×邻域)，需 `--max_coords` 压输入（8000 起，OOM 降到 5000）。
 - **微调无效**：`--lr` 提到 3e-5；或加 `--noise_std 0.15` 模拟 SLat Flow 误差增强鲁棒。
-- **断点续训**：当前不支持，中断从头开始（体素化 ~14 min 也重做）；可后续加 `--resume` + 体素化落盘缓存。
+- **断点续训**：已支持 `--resume` + 体素化落盘缓存，见上方「断点续训 + 体素化缓存」。
 - **边界**：只修剪枝头，不修 SLat Flow latent 误差（MSE≈0.17 信息瓶颈），几何精度仍受 latent 质量限制，不会完美还原 GT。
