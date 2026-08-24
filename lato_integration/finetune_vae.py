@@ -169,8 +169,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--wd", type=float, default=1e-4)
-    parser.add_argument("--max_coords", type=int, default=20000,
-                        help="输入 latent coords 上限（0=不裁剪；防 OOM，随机子采样保持表面/非表面比例）")
+    parser.add_argument("--max_coords", type=int, default=8000,
+                        help="输入 latent coords 上限（0=不裁剪；训练模式细分不剪枝，窗口注意力 O(N×邻域)，需压小防 OOM）")
     parser.add_argument("--noise_std", type=float, default=0.0,
                         help="输入 feats 加噪 std（0=干净 GT latent；>0 模拟 SLat Flow 误差增强鲁棒）")
     parser.add_argument("--save_every", type=int, default=10)
