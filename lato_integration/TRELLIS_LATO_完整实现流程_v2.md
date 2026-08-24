@@ -1294,3 +1294,97 @@ Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
 | VoxelVAE.decode() | 冻结预训练 | **微调 decoder 末 2 层**（加噪自蒸馏） |
 
 > 说明：表中"512 份"= 16³→128³ 每维放大 8 倍（128÷16=8），体积膨胀 8×8×8=512；与 VoxelVAE 的 128→512（解码分辨率）、PointNet 的 512-dim（特征维度）是三个不同的"512"，勿混淆。
+
+---
+
+## v17 VAE 剪枝头微调（BCE 方案）(2026-08-24)
+
+### 背景与问题
+
+v16 的 VoxelVAE 微调（feats-L1 加噪自蒸馏）**无效**——它只对齐顶点特征、不监督顶点选择，且从未解冻 `vtx_head_64`。评估结果：
+
+```
+[VAE L1] vertices=35754
+[VAE L2] vertices=199964   # L2/L1 = 5.59×（理想 ≈ 1×）
+v=199961  f=17646706  CD=0.2700
+```
+
+三个叠加 bug：
+
+| # | 问题 | 状态 |
+|---|---|---|
+| ① | `decode_slat_lato` 没传 `vis_last_layer=False` → 末层 force_no_prune → 保证 8× 爆炸 | ✅ 已修 `trellis_text_to_3d.py` |
+| ② | 坐标缩放 ÷256 应为 ÷512 → mesh 放大 2×，CD 虚高 | ✅ 已修 `evaluate_3d_metrics.py`/`inference_lato.py` |
+| ③ | **pruning_head 未校准** → 每级细分 ~70% 子体素被保留，剪枝失效 | ⬅️ 本方案解决 |
+
+③ 的本质：剪枝头在「encoder 精确 latent」上训练，推理却喂「SLat Flow 带噪 latent」（MSE≈0.17），分布漂移 → 剪枝头输出全高分 → 不剪枝。
+
+### 方案
+
+用 `decode(training=True) + gt_vertex_voxels_list`（GT mesh 薄表面体素化）做 occupancy BCE：
+
+```
+decode(training=True, gt_vertex_voxels_list=[gt_128, gt_256, gt_512])
+  ├─ L0: BCE(vtx_head_64, vertex_mask)        # 顶点选择：表面=1 / 膨胀区=0
+  ├─ L1: BCE(pruning_head[0], prune_labels)   # 128→256 剪枝
+  └─ L2: BCE(pruning_head[1], prune_labels)   # 256→512 剪枝
+```
+
+只解冻 3 个决策头（**2.7% 参数**），各级之间隔着冻结的 decoder，梯度本就传不过去。
+
+### 代码改动清单
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `finetune_vae.py` | **重写**：feats-L1 → occupancy BCE；新增 `voxelize_mesh_surface`（薄表面体素化）、`bce_with_balance`（pos_weight 平衡）；只解冻 3 个头；`--max_coords` 防 OOM |
+| 2 | `inference_lato.py` | 新增 `--vae_ft_ckpt` 参数（覆盖加载微调权重） |
+| 3 | `evaluate_3d_metrics.py` | 无需改（v16 已有 `--vae_ft_ckpt`） |
+
+关键实现细节：
+
+- `voxelize_mesh_surface()`：`o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds` 只体素化三角面（薄表面），**不做点云膨胀**，保证薄表面 ⊆ 厚壳 latent coords。
+- `occ_probs`/`vtx_feats` 用 `BCE_with_logits`：源码确认 `SparsePredictionHead` 直接 `return self.mlp(x)`（无 sigmoid），`SparseVertexSubdivideBlock3d` 的 sigmoid 只在推理阈值时用，返回的 `occ_prob` 是原始 logits。
+- `freeze_for_ft()` 只解冻 `vtx_head_64` + `decoder_vtx[i].upsample.pruning_head`（~450 万参数 / 2.7%）。
+
+### 训练
+
+```bash
+cd /data/huanghaoyang/3D/TRELLIS
+export PYTHONPATH="/data/huanghaoyang/3D/LATO:/data/huanghaoyang/3D/TRELLIS:$PYTHONPATH"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python lato_integration/finetune_vae.py \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --gt_latents /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/ \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/vae_finetuned_bce \
+    --max_coords 8000 \
+    --epochs 30
+```
+
+- 产出：`vae_finetuned.pt`（最终）+ `vae_ft_epoch{N}.pt`（每 10 epoch 快照，可提前验证）。
+- 耗时 ~2.5~3 小时（体素化 ~14 min + 训练 ~5.5 min/epoch）。
+- 启动应打印 `Trainable: ~4,470,787 / 165,884,963 (2.7%)`。
+
+### 生效方式
+
+微调产物是「补丁」，加载顺序：预训练 `vae_128to512.pt` → `load_state_dict(微调权重, strict=False)` 覆盖 3 个头。
+
+- **评估**：`evaluate_3d_metrics.py` 加 `--vae_ft_ckpt outputs/vae_finetuned_bce/vae_finetuned.pt`
+- **生成**：`inference_lato.py` 加 `--vae_ft_ckpt ...`（v17 新增该参数）
+
+### 判断是否生效
+
+| 指标 | 微调前 | 微调后（预期） |
+|---|---|---|
+| L2/L1 顶点比值 | 5.59× | ~1× |
+| 顶点数 | ~200,000 | 30,000~50,000 |
+| 面数 | ~17,600,000 | 大幅下降 |
+
+### 注意事项
+
+- **OOM**：训练模式细分不剪枝（`lato_vae.py:94` 只在 `not training` 剪枝），窗口注意力 O(N×邻域)，需 `--max_coords` 压输入（8000 起，OOM 降到 5000）。
+- **微调无效**：`--lr` 提到 3e-5；或加 `--noise_std 0.15` 模拟 SLat Flow 误差增强鲁棒。
+- **断点续训**：当前不支持，中断从头开始（体素化 ~14 min 也重做）；可后续加 `--resume` + 体素化落盘缓存。
+- **边界**：只修剪枝头，不修 SLat Flow latent 误差（MSE≈0.17 信息瓶颈），几何精度仍受 latent 质量限制，不会完美还原 GT。

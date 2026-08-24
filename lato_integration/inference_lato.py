@@ -398,6 +398,8 @@ def main():
     parser.add_argument("--lato_config", type=str,
                         default=None,
                         help="LATO VAE config yaml 路径")
+    parser.add_argument("--vae_ft_ckpt", type=str, default=None,
+                        help="（可选）VoxelVAE 微调后权重，覆盖预训练中的剪枝头/顶点头")
 
     # ── TRELLIS 预训练部件 ──
     parser.add_argument("--trellis_pretrained", type=str,
@@ -623,6 +625,15 @@ def main():
             vae=lato_vae,
             connection_head=connection_head,
         )
+        if opt.vae_ft_ckpt and os.path.exists(opt.vae_ft_ckpt):
+            ft_data = torch.load(opt.vae_ft_ckpt, map_location=device, weights_only=True)
+            ft_state = ft_data.get("model_state_dict", ft_data)
+            missing, unexpected = lato_vae.load_state_dict(ft_state, strict=False)
+            print(f"  VoxelVAE 微调权重已覆盖: {opt.vae_ft_ckpt}")
+            if missing:
+                print(f"    微调权重缺失 keys: {len(missing)}")
+            if unexpected:
+                print(f"    微调权重多余 keys: {len(unexpected)}")
         lato_vae.eval()
         connection_head.eval()
         print(f"  VoxelVAE: latent_dim={model_cfg['latent_dim']}")
