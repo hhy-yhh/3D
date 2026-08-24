@@ -754,7 +754,9 @@ def main():
 
     # 归一化坐标到 [-0.5, 0.5]
     if vertex_coords_3d.max() > 1.0:
-        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"]
+        # 解码链 128³→256³→512³，末级块 out_resolution = resolution * 2，
+        # 必须除输出分辨率 512（官方 infer_vae_512.py 写死 /512），除 256 会放大 2 倍
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
         vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
 
     print(f"  顶点数: {len(vertex_coords_3d)}")
