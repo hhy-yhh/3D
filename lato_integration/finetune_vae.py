@@ -71,26 +71,27 @@ def load_vae(lato_ckpt: str, lato_config: str, device):
     return vae, head
 
 
-def freeze_for_ft(vae, num_decoder_blocks: int = 2):
-    """冻结 encoder 与大部分 decoder，仅保留:
-       - vtx_head_64 / vtx_proj (L0 顶点选择，关键新增)
-       - decoder_vtx / decoder_vtx_ca 最后 num_decoder_blocks 块 (含 pruning_head)
+def freeze_for_ft(vae):
+    """冻结 encoder 与全部 decoder 结构，只解冻三个「决策头」:
+       - vtx_head_64              (L0 顶点选择)   —— 由 loss_l0 训练
+       - decoder_vtx[i].upsample.pruning_head (L1/L2 剪枝) —— 由 loss_l1/l2 训练
+
+       各级之间隔着冻结的 decoder block，梯度传不过去，所以 vtx_proj / decoder
+       结构解冻了也白费显存。三个头都是 2 层 MLP，反传图极小（~3% 参数）。
     """
     for p in vae.parameters():
         p.requires_grad = False
 
-    # 1) L0 顶点头 + 投影（旧版从未训练，这是关键）
-    for m in [vae.vtx_head_64, vae.vtx_proj]:
-        for p in m.parameters():
-            p.requires_grad = True
+    # 1) L0 顶点头
+    for p in vae.vtx_head_64.parameters():
+        p.requires_grad = True
 
-    # 2) 各级 subdivision 块（内含 pruning_head）
-    for name in ["decoder_vtx", "decoder_vtx_ca"]:
-        module = getattr(vae, name, None)
-        if module is not None:
-            for block in module[-num_decoder_blocks:]:
-                for p in block.parameters():
-                    p.requires_grad = True
+    # 2) 各级 pruning_head（只解冻剪枝头本身）
+    for block in vae.decoder_vtx:
+        ph = getattr(block, "upsample", None)
+        if ph is not None and hasattr(ph, "pruning_head"):
+            for p in ph.pruning_head.parameters():
+                p.requires_grad = True
 
     trainable = [p for p in vae.parameters() if p.requires_grad]
     n_total = sum(p.numel() for p in vae.parameters())
@@ -168,8 +169,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--wd", type=float, default=1e-4)
-    parser.add_argument("--ft_decoder_blocks", type=int, default=2,
-                        help="解冻 decoder_vtx/decoder_vtx_ca 最后 N 块（默认 2 = 全部）")
+    parser.add_argument("--max_coords", type=int, default=20000,
+                        help="输入 latent coords 上限（0=不裁剪；防 OOM，随机子采样保持表面/非表面比例）")
     parser.add_argument("--noise_std", type=float, default=0.0,
                         help="输入 feats 加噪 std（0=干净 GT latent；>0 模拟 SLat Flow 误差增强鲁棒）")
     parser.add_argument("--save_every", type=int, default=10)
@@ -187,7 +188,7 @@ def main():
         p.requires_grad = False
 
     print("[2/4] 冻结 encoder，解冻 L0 头 + decoder 末 N 块 ...")
-    trainable_params = freeze_for_ft(vae, num_decoder_blocks=opt.ft_decoder_blocks)
+    trainable_params = freeze_for_ft(vae)
     optimizer = torch.optim.AdamW(trainable_params, lr=opt.lr, weight_decay=opt.wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=opt.epochs)
 
@@ -234,6 +235,12 @@ def main():
             data = np.load(npz_path)
             coords = torch.from_numpy(data["coords"]).to(device)          # [N,4] int
             feats = torch.from_numpy(data["feats"].astype(np.float32)).to(device)  # [N,16]
+
+            # 防 OOM：随机子采样到 max_coords（保持表面/非表面比例，即真实分布）
+            if opt.max_coords > 0 and coords.shape[0] > opt.max_coords:
+                keep = torch.randperm(coords.shape[0], device=device)[:opt.max_coords]
+                coords = coords[keep]
+                feats = feats[keep]
 
             # 可选加噪（模拟 SLat Flow 误差；coords 保持干净用于 teacher forcing）
             if opt.noise_std > 0:
