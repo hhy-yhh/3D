@@ -7,7 +7,9 @@ VoxelVAE Decoder Fine-Tuning — 适配 SLat Flow 的 16-dim 语义特征
 
 策略:
   使用 GT latent（从 VoxelVAE.encode 产生），加噪声模拟 SLat Flow 误差，
-  训练 decoder 在噪声输入下仍产出与干净输入相同的顶点。
+  训练 decoder 在噪声输入下仍产出与干净输入一致的顶点特征（按顶点坐标对齐）。
+  注意: 用 decode(training=False) 阈值选择顶点, 无需 gt_vertex_voxels_list;
+       loss 作用在可微分的 feats 上（整数 coords 无梯度, 不能直接 L1）。
 
 用法:
   python lato_integration/finetune_vae.py \
@@ -79,6 +81,26 @@ def freeze_for_ft(vae, num_layers_to_train: int = 2):
     return trainable
 
 
+def _coord_keys(coords: torch.Tensor) -> torch.Tensor:
+    """[N, 3] int 坐标 -> [N] int64 唯一键 (x,y,z 均 < 1024)。"""
+    return (coords[:, 0].long() * 1024 + coords[:, 1].long()) * 1024 + coords[:, 2].long()
+
+
+def _coord_match(clean_coords: torch.Tensor, noisy_coords: torch.Tensor):
+    """返回 (ic, inz) 行索引列表：clean 与 noisy 共有的顶点坐标。"""
+    if clean_coords.numel() == 0 or noisy_coords.numel() == 0:
+        return [], []
+    kc = _coord_keys(clean_coords.cpu()).tolist()
+    kn = _coord_keys(noisy_coords.cpu()).tolist()
+    idx = {k: i for i, k in enumerate(kc)}
+    ic, inz = [], []
+    for j, k in enumerate(kn):
+        if k in idx:
+            ic.append(idx[k])
+            inz.append(j)
+    return ic, inz
+
+
 def main():
     parser = argparse.ArgumentParser(description="VoxelVAE Decoder Fine-Tuning")
     parser.add_argument("--lato_ckpt", required=True)
@@ -134,36 +156,46 @@ def main():
             coords = torch.from_numpy(data["coords"]).to(device)
             feats = torch.from_numpy(data["feats"].astype(np.float32)).to(device)
 
-            # 干净输入 → 干净输出（detach, 作为 GT 目标）
+            # 干净输入 → 干净输出（教师, detach）
             clean_slat = LATOSparseTensor(coords=coords, feats=feats)
             with torch.no_grad():
                 clean_out = vae.decode(clean_slat, training=False)
                 if isinstance(clean_out, list):
                     clean_v = clean_out[-1].get("vertex", {})
                     clean_coords = clean_v.get("coords")
+                    clean_feats = clean_v.get("feats")
                 else:
                     continue
 
-            if clean_coords is None or clean_coords.numel() == 0:
+            if clean_coords is None or clean_coords.numel() == 0 or clean_feats is None:
                 continue
 
-            # 加噪输入 → 解码（梯度流经 decoder）
+            # 加噪输入 → 解码（梯度流经 decoder 末 N 层）
+            # 注意: 这里 training=False 仅控制顶点选择逻辑, 不阻断梯度;
+            #       decoder_vtx / decoder_vtx_ca 的可训练权重仍会收到梯度。
             noise = torch.randn_like(feats) * opt.noise_std
             noisy_slat = LATOSparseTensor(coords=coords, feats=feats + noise)
-            noisy_out = vae.decode(noisy_slat, training=True)
+            noisy_out = vae.decode(noisy_slat, training=False)
             if isinstance(noisy_out, list):
                 noisy_v = noisy_out[-1].get("vertex", {})
                 noisy_coords = noisy_v.get("coords")
+                noisy_feats = noisy_v.get("feats")
             else:
                 continue
 
-            if noisy_coords is None or noisy_coords.numel() == 0:
+            if noisy_coords is None or noisy_coords.numel() == 0 or noisy_feats is None:
                 continue
 
-            # L1 损失：顶点坐标应对噪声鲁棒
-            loss = nn.functional.l1_loss(
-                noisy_coords.float(), clean_coords.detach().float()
-            )
+            # 一致性损失: 按顶点坐标对齐后, 让带噪输入的顶点特征逼近干净输入。
+            # (顶点 coords 是整数索引, 无梯度; 可微分的是 feats)
+            ic, inz = _coord_match(clean_coords, noisy_coords)
+            if len(ic) > 0:
+                ic = torch.tensor(ic, device=device)
+                inz = torch.tensor(inz, device=device)
+                loss = nn.functional.l1_loss(noisy_feats[inz], clean_feats[ic].detach())
+            else:
+                # 退化情形: 无共有顶点时用质心一致性兜底, 避免梯度饥饿
+                loss = nn.functional.l1_loss(noisy_feats.mean(0), clean_feats.detach().mean(0))
 
             optimizer.zero_grad()
             loss.backward()

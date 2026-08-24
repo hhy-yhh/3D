@@ -2,7 +2,7 @@
 
 > **目标：** Encoder/Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS。SS/SLat Flow 均在刹车卡钳数据集上从零训练。
 
-**当前版本：v13 (2026-08-09)**
+**当前版本：v16 (2026-08-12)**
 
 ---
 
@@ -10,20 +10,21 @@
 
 ```
 Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
-              (训练)       (训练, 16³→128³)
+              (训练)       (训练, 16³→128³)     ① PixelShuffle 可学习上采样
                                 │
                                 ▼
               SLat Flow ──→ LATO VoxelVAE.decode() → ConnectionHead → Mesh
-              (训练)         (冻结预训练)             (冻结预训练)
+              (训练)         (微调 decoder 末2层)     (冻结预训练)
+                             ② 原"冻结"→现"微调"
 ```
 
 | 组件 | 来源 | 状态 |
 |------|------|:--:|
 | CLIP | `openai/clip-vit-large-patch14` | 冻结 |
 | SS Flow | `EnhancedSSFlowModel` (512ch × 24 blocks) | **训练** |
-| LatoStructureHead | 3D CNN 16³→128³ (~1-2M 参数) | **训练** |
+| LatoStructureHead | 3D CNN 16³→128³ | **训练**（① nearest → PixelShuffle） |
 | SLat Flow | `EnhancedSLatFlowModel` (384ch × 12 blocks, Swin) | **训练** |
-| LATO VoxelVAE | 预训练 128→512 | 冻结 |
+| LATO VoxelVAE | 预训练 128→512 | **微调**（② 冻结 encoder，微调 decoder 末 2 层） |
 | ConnectionHead | LATO 预训练边预测器 | 冻结 |
 
 ---
@@ -1244,3 +1245,52 @@ GPU 7: SLat Flow v10 从零训 ────────────── 3-4 �
                                                     │
                                                 推理评估
 ```
+
+---
+
+## v16 改进总结（表格 + 当前流程图）
+
+> 相对 v13 旧图，仅改两处模块内部实现，数据流/连线/分辨率均不变。
+
+### 当前流程图
+
+```
+Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
+              (训练)       (训练, 16³→128³)     ① PixelShuffle 可学习上采样
+                                │
+                                ▼
+              SLat Flow ──→ LATO VoxelVAE.decode() → ConnectionHead → Mesh
+              (训练)         (微调 decoder 末2层)     (冻结预训练)
+                             ② 原"冻结"→现"微调"
+```
+
+### 组件状态（当前）
+
+| 组件 | 来源 | 当前状态 | 备注 |
+|------|------|:--:|------|
+| CLIP | `openai/clip-vit-large-patch14` | 冻结 | 不变 |
+| SS Flow | `EnhancedSSFlowModel` (512ch×24) | **训练** | v6 从零重训 |
+| LatoStructureHead | 3D CNN 16³→128³ | **训练** | ① nearest → PixelShuffle |
+| SLat Flow | `EnhancedSLatFlowModel` (384ch×12, Swin) | **训练** | v10 从零重训 |
+| LATO VoxelVAE | 预训练 128→512 | **微调** | ② 冻结 encoder，只微调 decoder 末 2 层 |
+| ConnectionHead | LATO 预训练边预测器 | 冻结 | 不变 |
+
+### 主要改进总表
+
+| 优先级 | 模块（流程图位置） | 改进内容 | 改进目的 / 预期效果 |
+|:--:|------|---------|-------------------|
+| ⭐ | **LatoStructureHead** | nearest 上采样 → **PixelShuffle 可学习上采样** | 消除"1 体素硬复制 512 份"的边界模糊 → CD 0.267 → **0.15~0.20** |
+| ⭐ | **VoxelVAE.decode()** | 冻结 → **微调 decoder 末 2 层**（加噪自蒸馏） | 适配 16-dim 语义特征，L0 正常触发、避免暴力细分 → CD → **0.12~0.18** |
+| — | SS Flow config | `λ_occupancy` 1.0 → **0.1** | 降低辅助 loss 权重，加速主 loss 收敛 |
+| — | 推理脚本 | 新增 `--vae_ft_ckpt` / `--ss_threshold` / `--max_coords` | 加载微调 VAE + 控制 coords 数量防 OOM |
+| — | structure_head.py | `convert_to_fp16/32` 空操作 → 真实转换 | PixelShuffle 有可学习参数，需真实精度切换 |
+| — | check_health.sh | 新增 PixelShuffle 架构 / 权重匹配检查 | 训练健康可见，确认架构正确 |
+
+### 与旧图（v13）差异
+
+| 位置 | v13 旧图 | v16 现图 |
+|------|---------|---------|
+| LatoStructureHead | `nn.Upsample(nearest)`，硬复制 | **PixelShuffle** 可学习上采样 |
+| VoxelVAE.decode() | 冻结预训练 | **微调 decoder 末 2 层**（加噪自蒸馏） |
+
+> 说明：表中"512 份"= 16³→128³ 每维放大 8 倍（128÷16=8），体积膨胀 8×8×8=512；与 VoxelVAE 的 128→512（解码分辨率）、PointNet 的 512-dim（特征维度）是三个不同的"512"，勿混淆。
