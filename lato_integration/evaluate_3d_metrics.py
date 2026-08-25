@@ -287,11 +287,21 @@ def load_pipeline(opt, device):
 
     # Normalization
     pipeline.ss_normalization = {"mean": [0.0]*8, "std": [1.0]*8}
-    if opt.slat_stats and os.path.exists(opt.slat_stats):
+    # 🔧 SLat 反归一化必须与训练用同一组 stats。
+    #    训练用的是 config 里的硬编码归一化（run_train.py 会存 output_dir/config.json），
+    #    所以推理优先从训练 config 读，而不是 --slat_stats（stats.json 与 config 不一致，~1.5% 偏差）。
+    if os.path.exists(slat_config_path):
+        with open(slat_config_path, "r") as f:
+            _slat_cfg = json.load(f)
+        pipeline.slat_normalization = _slat_cfg["dataset"]["args"]["normalization"]
+        print(f"  SLat 归一化: 从训练 config 读取（与训练一致）")
+    elif opt.slat_stats and os.path.exists(opt.slat_stats):
         with open(opt.slat_stats, "r") as f:
             pipeline.slat_normalization = json.load(f)
+        print(f"  SLat 归一化: 从 --slat_stats 读取")
     else:
         pipeline.slat_normalization = {"mean": [0.0]*16, "std": [1.0]*16}
+        print(f"  SLat 归一化: 使用 identity（未找到 config/stats）")
 
     # LATO VAE
     print("[4/5] 加载 LATO VoxelVAE ...")
@@ -568,7 +578,7 @@ def main():
                 # 2) SLat Flow
                 slat = pipeline.sample_slat(cond, coords,
                     sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
-                print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f}")
+                print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f} feats_std={slat.feats.std():.4f}")
 
                 # 清理 SLat 采样中间激活
                 torch.cuda.empty_cache()
