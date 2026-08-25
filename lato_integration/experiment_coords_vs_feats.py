@@ -120,7 +120,8 @@ def main():
     with open(opt.metadata, encoding="utf-8") as f:
         samples = list(csv.DictReader(f))
     sample = samples[opt.sample_idx]
-    sha = sample.get("file_identifier", sample.get("ID"))
+    sha256 = sample.get("sha256")  # .npz 文件名 = sha256（不是 file_identifier）
+    fid = sample.get("file_identifier", sample.get("ID"))
     if opt.prompt:
         prompt = opt.prompt
     elif "captions" in sample and sample.get("captions"):
@@ -128,16 +129,22 @@ def main():
         prompt = caps[0] if isinstance(caps, list) and len(caps) > 0 else str(caps)
     else:
         prompt = _build_prompt_from_row(sample)
-    print(f"样本: sha={sha}")
+    print(f"样本: file_identifier={fid} sha256={sha256}")
     print(f"prompt: {prompt}\n")
 
     # ── 2. 加载 GT latent ──
-    npz_path = os.path.join(opt.gt_latents, f"{sha}.npz")
+    npz_path = os.path.join(opt.gt_latents, f"{sha256}.npz")
     if not os.path.exists(npz_path):
         files = sorted(os.listdir(opt.gt_latents))
         npz_path = os.path.join(opt.gt_latents, files[opt.sample_idx])
-        print(f"[WARN] 未找到 {sha}.npz，改用 {files[opt.sample_idx]}")
+        print(f"[WARN] 未找到 {sha256}.npz，改用 {files[opt.sample_idx]}")
     coords_gt, feats_gt = load_gt_latent(npz_path)
+    # 🔧 GT latent 可能远超 spconv 的 int32 上限（本样本 52416 voxels），
+    #    截断到 max_coords（与 SS coords 一致），否则 spconv 报 int32 overflow
+    if opt.max_coords > 0 and coords_gt.shape[0] > opt.max_coords:
+        coords_gt = coords_gt[:opt.max_coords]
+        feats_gt = feats_gt[:opt.max_coords]
+        print(f"[TRUNC] GT latent 截断到 {opt.max_coords} voxels（防 spconv int32 溢出）")
     print(f"GT latent: coords={tuple(coords_gt.shape)} feats={tuple(feats_gt.shape)} "
           f"feats_mean={feats_gt.mean():.4f} feats_std={feats_gt.std():.4f}\n")
 
