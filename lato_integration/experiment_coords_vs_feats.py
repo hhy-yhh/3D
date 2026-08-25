@@ -1,31 +1,29 @@
 """
-experiment_coords_vs_feats.py — 隔离 L0=0 的根因：coords 还是 feats？
+experiment_coords_vs_feats.py — 隔离碎片化根因：coords 还是 feats？(v2: 测 CD)
 
-背景:
-  VAE decode L0=0（顶点选择头不触发），导致 L1/L2 暴力细分 → 33 万顶点。
-  本脚本用一条训练集样本做 4 组对照，定位是「coords 太糊」还是「feats 带噪」:
+v2 改动：上一版只数 L0/L1/L2 顶点数，结果四组几乎一样——证明顶点数不是关键指标。
+        本版每组 decode 后接 ConnectionHead 建 mesh、算 Chamfer Distance，
+        直接对比「几何质量」，这才是区分 good/bad 的指标。
 
-    A: GT coords + GT feats    → VAE  (基线，应触发 L0)
-    B: GT coords + SLat feats  → VAE  (只换 feats：SLat Flow 在 GT coords 上采样)
-    C: SS coords + GT feats    → VAE  (只换 coords：GT feats 经 NN 映射到 SS coords)
-    D: SS coords + SLat feats  → VAE  (当前状态，L0=0)
+  4 组对照：
+    A: GT coords + GT feats    → 基线（应 CD 低、无碎片）
+    B: GT coords + SLat feats  → 只换 feats
+    C: SS coords + GT feats    → 只换 coords
+    D: SS coords + SLat feats  → 当前状态
 
-  判断:
-    A 应 L0>0（基线）。若 A 也 L0=0 → VAE 加载/输入格式有问题，先修这个。
-    B 触发、D 不触发  → coords 是主因（feats 在正确拓扑上没问题）
-    B 不触发          → feats 是主因（正确拓扑也救不回 L0）
-    C 触发、D 不触发  → 进一步确认 feats 是主因
-    C 不触发          → coords 单独就能破坏 L0
+  判读：
+    A 低、B 高            → feats 是碎片化主因
+    A 低、C 高            → coords 是碎片化主因
+    A 本身也高            → 截断(52416→16384)/输入格式有问题，先修基线
+    B、C 都高、D 更高     → 两者叠加
 
 用法 (在 TRELLIS 目录下):
   python lato_integration/experiment_coords_vs_feats.py \
       --ss_ckpt "$SS_CKPT" --slat_ckpt "$SLAT_CKPT" \
-      --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
-      --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
-      --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
-      --vae_ft_ckpt outputs/vae_finetuned_bce/vae_finetuned.pt \
-      --metadata /data/huanghaoyang/3D/database_lato/metadata.csv \
-      --gt_latents /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128 \
+      --slat_stats ... --lato_ckpt ... --lato_config ... --vae_ft_ckpt ... \
+      --metadata .../metadata.csv \
+      --gt_latents .../lato_vae_16dim_128 \
+      --gt_meshes .../meshes \
       --sample_idx 0
 """
 
@@ -38,6 +36,7 @@ import argparse
 
 import numpy as np
 import torch
+import trimesh
 from scipy.spatial import KDTree
 
 # ── 路径设置（与 evaluate_3d_metrics.py 保持一致）──
@@ -48,8 +47,10 @@ for _p in [_TRELLIS_ROOT, _LATO_ROOT]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 复用 eval 的模型加载（含归一化修复 + 微调 VAE 覆盖）
-from lato_integration.evaluate_3d_metrics import load_pipeline, _build_prompt_from_row
+from lato_integration.evaluate_3d_metrics import (
+    load_pipeline, _build_prompt_from_row, compute_all_metrics,
+)
+from lato_integration.inference_lato import predict_edges_batched, edges_to_mesh
 
 
 def load_gt_latent(npz_path):
@@ -67,11 +68,41 @@ def to_4d(coords):
     return torch.cat([torch.zeros(coords.shape[0], 1, dtype=torch.int32), coords], dim=1)
 
 
-def feed_vae(vae, coords_4d, feats, device, label, threshold=0.2):
-    """喂一组 (coords, feats) 给 VAE，打印 L0/L1/L2。"""
+def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
+                            edge_threshold=0.45, k_neighbors=32):
+    """从 VAE decode 输出构建 trimesh（逻辑同 evaluate_3d_metrics.extract_mesh_from_output）。"""
+    vertex_result = decoded[-1].get("vertex")
+    if vertex_result is None:
+        return None
+    vertex_coords_4d = vertex_result["coords"]
+    vertex_feats = vertex_result["feats"]
+    if vertex_coords_4d.shape[-1] == 4:
+        vertex_coords_3d = vertex_coords_4d[:, 1:].float()
+    else:
+        vertex_coords_3d = vertex_coords_4d.float()
+    if vertex_coords_3d.numel() == 0:
+        return None
+    if vertex_coords_3d.max() > 1.0:
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
+
+    edges = predict_edges_batched(
+        connection_head, vertex_feats.float(), vertex_coords_3d.float(),
+        threshold=edge_threshold, device=device, k_neighbors=k_neighbors,
+    )
+    if len(edges) == 0:
+        return None
+    mesh = edges_to_mesh(vertex_coords_3d.cpu().numpy(), edges)
+    return mesh
+
+
+def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
+                      device, label, threshold=0.2, edge_threshold=0.45,
+                      k_neighbors=32, n_points=20000):
+    """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。"""
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
-    torch.cuda.empty_cache()  # 每组实验前清缓存，防累积
+    torch.cuda.empty_cache()
     lato_slat = LATOSparseTensor(
         feats=feats.contiguous().float().to(device),
         coords=coords_4d.contiguous().to(device),
@@ -81,18 +112,37 @@ def feed_vae(vae, coords_4d, feats, device, label, threshold=0.2):
             lato_slat, training=False,
             inference_threshold=threshold, vis_last_layer=False,
         )
+
     parts = [f"  {label}"]
     for i, level in enumerate(decoded):
         vr = level.get("vertex", {})
         vc = vr.get("coords")
         nv = vc.shape[0] if vc is not None else 0
         parts.append(f"L{i}={nv}")
+
+    # 建 mesh（慢，~2-5 min，主要花在 KDTree 边候选）
+    mesh = build_mesh_from_decoded(
+        decoded, connection_head, model_cfg, device,
+        edge_threshold=edge_threshold, k_neighbors=k_neighbors,
+    )
+    del decoded
+    torch.cuda.empty_cache()
+
+    if mesh is None:
+        parts.append("CD=N/A(mesh失败)")
+    else:
+        try:
+            metrics = compute_all_metrics(mesh, gt_mesh, n_points)
+            parts.append(f"CD={metrics['chamfer_distance']:.4f}")
+            parts.append(f"v={len(mesh.vertices)} f={len(mesh.faces)}")
+        except Exception as e:
+            parts.append(f"CD=ERR({e})")
+        del mesh
     print("  ".join(parts))
-    return decoded
 
 
 def main():
-    ap = argparse.ArgumentParser(description="隔离 L0=0 根因：coords vs feats")
+    ap = argparse.ArgumentParser(description="隔离碎片化根因：coords vs feats（测 CD）")
     ap.add_argument("--ss_ckpt", required=True)
     ap.add_argument("--slat_ckpt", required=True)
     ap.add_argument("--slat_stats", default=None)
@@ -102,6 +152,7 @@ def main():
     ap.add_argument("--trellis_pretrained", default="microsoft/TRELLIS-text-base")
     ap.add_argument("--metadata", required=True, help="训练集 metadata.csv")
     ap.add_argument("--gt_latents", required=True, help="GT latent .npz 目录")
+    ap.add_argument("--gt_meshes", required=True, help="GT mesh 目录")
     ap.add_argument("--sample_idx", type=int, default=0, help="用第几条训练样本")
     ap.add_argument("--prompt", default=None, help="覆盖 prompt（可选）")
     ap.add_argument("--ss_threshold", type=float, default=2.0)
@@ -111,6 +162,8 @@ def main():
     ap.add_argument("--cfg_strength", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--lato_threshold", type=float, default=0.2)
+    ap.add_argument("--edge_threshold", type=float, default=0.45)
+    ap.add_argument("--k_neighbors", type=int, default=32)
     ap.add_argument("--use_fp16", action="store_true", default=False)
     opt = ap.parse_args()
 
@@ -120,7 +173,7 @@ def main():
     with open(opt.metadata, encoding="utf-8") as f:
         samples = list(csv.DictReader(f))
     sample = samples[opt.sample_idx]
-    sha256 = sample.get("sha256")  # .npz 文件名 = sha256（不是 file_identifier）
+    sha256 = sample.get("sha256")  # .npz 文件名 = sha256
     fid = sample.get("file_identifier", sample.get("ID"))
     if opt.prompt:
         prompt = opt.prompt
@@ -139,8 +192,7 @@ def main():
         npz_path = os.path.join(opt.gt_latents, files[opt.sample_idx])
         print(f"[WARN] 未找到 {sha256}.npz，改用 {files[opt.sample_idx]}")
     coords_gt, feats_gt = load_gt_latent(npz_path)
-    # 🔧 GT latent 可能远超 spconv 的 int32 上限（本样本 52416 voxels），
-    #    截断到 max_coords（与 SS coords 一致），否则 spconv 报 int32 overflow
+    # 截断到 max_coords（防 spconv int32 溢出）
     if opt.max_coords > 0 and coords_gt.shape[0] > opt.max_coords:
         coords_gt = coords_gt[:opt.max_coords]
         feats_gt = feats_gt[:opt.max_coords]
@@ -148,10 +200,23 @@ def main():
     print(f"GT latent: coords={tuple(coords_gt.shape)} feats={tuple(feats_gt.shape)} "
           f"feats_mean={feats_gt.mean():.4f} feats_std={feats_gt.std():.4f}\n")
 
-    # ── 3. 加载模型管线 ──
+    # ── 2.5 加载 GT mesh ──
+    gt_path = sample.get("file_path", "")
+    if not (gt_path and os.path.exists(gt_path)):
+        gt_path = os.path.join(opt.gt_meshes, f"{fid}.stl")
+    if not os.path.exists(gt_path):
+        for ext in [".obj", ".ply", ".glb"]:
+            alt = os.path.join(opt.gt_meshes, f"{fid}{ext}")
+            if os.path.exists(alt):
+                gt_path = alt
+                break
+    print(f"GT mesh: {gt_path}")
+    gt_mesh = trimesh.load(gt_path, force="mesh")
+    print(f"  GT mesh vertices={len(gt_mesh.vertices)} faces={len(gt_mesh.faces)}\n")
+
+    # ── 3. 加载模型管线（保留 connection_head + model_cfg，mesh 建图要用）──
     print("加载管线 ...")
     pipeline, connection_head, model_cfg = load_pipeline(opt, device)
-    del connection_head, model_cfg  # 实验不需要边预测头，立即释放
     vae = pipeline.models["lato_vae"]
     flow_model = pipeline.models["sparse_structure_flow_model"]
     head = pipeline.models["lato_structure_head"]
@@ -177,7 +242,7 @@ def main():
         coords_ss = coords_ss[topk]
     print(f"SS coords: {coords_ss.shape[0]}\n")
 
-    # 🔧 释放 SS Flow + StructureHead（后续只用 coords），给 VAE decode 腾显存
+    # 释放 SS Flow + StructureHead
     pipeline.models.pop("sparse_structure_flow_model", None)
     pipeline.models.pop("lato_structure_head", None)
     del flow_model, head, z_s, occ_logits
@@ -196,10 +261,10 @@ def main():
     slat_ss = pipeline.sample_slat(cond, coords_ss_4d, sampler_params=slat_params)
     slat_feats_ss = slat_ss.feats
 
-    # 🔧 释放 SLat Flow + CLIP 文本模型（采样已完成，只留 VAE decode）
+    # 释放 SLat Flow + CLIP
     pipeline.models.pop("slat_flow_model", None)
     pipeline.text_cond_model = None
-    del cond
+    del cond, slat_gt, slat_ss
     torch.cuda.empty_cache()
 
     # ── 6. C 实验: GT feats 经最近邻映射到 SS coords ──
@@ -207,22 +272,31 @@ def main():
     _, nn_idx = tree.query(coords_ss[:, 1:].cpu().numpy().astype(np.float64))
     feats_gt_mapped = feats_gt[nn_idx]  # [N_ss, 16]
 
-    # ── 7. 4 组对照实验 ──
+    # ── 7. 4 组对照实验（每组建 mesh + 算 CD）──
     print("\n" + "=" * 64)
     print(f"VAE decode 对照实验 (inference_threshold={opt.lato_threshold:.2f})")
+    print("每组含建 mesh + CD，预计共 ~8-20 分钟 ...")
     print("=" * 64)
-    feed_vae(vae, coords_gt_4d, feats_gt, device, "A: GT coords + GT feats   ", opt.lato_threshold)
-    feed_vae(vae, coords_gt_4d, slat_feats_gt, device, "B: GT coords + SLat feats", opt.lato_threshold)
-    feed_vae(vae, coords_ss_4d, feats_gt_mapped, device, "C: SS coords + GT feats   ", opt.lato_threshold)
-    feed_vae(vae, coords_ss_4d, slat_feats_ss, device, "D: SS coords + SLat feats ", opt.lato_threshold)
+    feed_vae_and_eval(vae, connection_head, model_cfg, coords_gt_4d, feats_gt,
+                      gt_mesh, device, "A: GT coords + GT feats   ",
+                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
+    feed_vae_and_eval(vae, connection_head, model_cfg, coords_gt_4d, slat_feats_gt,
+                      gt_mesh, device, "B: GT coords + SLat feats",
+                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
+    feed_vae_and_eval(vae, connection_head, model_cfg, coords_ss_4d, feats_gt_mapped,
+                      gt_mesh, device, "C: SS coords + GT feats   ",
+                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
+    feed_vae_and_eval(vae, connection_head, model_cfg, coords_ss_4d, slat_feats_ss,
+                      gt_mesh, device, "D: SS coords + SLat feats ",
+                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
     print("=" * 64)
 
     # ── 8. 判读提示 ──
     print("\n判读:")
-    print("  A 应 L0>0（基线）；若 A 也 L0=0 → VAE 加载/输入格式有问题，先修这个")
-    print("  B 触发、D 不触发 → coords 是主因")
-    print("  B 不触发          → feats 是主因")
-    print("  C 触发、D 不触发 → 进一步确认 feats 是主因")
+    print("  A CD 低、B CD 高    → feats 是碎片化主因")
+    print("  A CD 低、C CD 高    → coords 是碎片化主因")
+    print("  A 本身 CD 就高      → 截断(52416→16384)/输入格式有问题，先修基线")
+    print("  B、C 都高、D 更高   → 两者叠加")
 
 
 if __name__ == "__main__":
