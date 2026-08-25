@@ -71,6 +71,7 @@ def feed_vae(vae, coords_4d, feats, device, label, threshold=0.2):
     """喂一组 (coords, feats) 给 VAE，打印 L0/L1/L2。"""
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
+    torch.cuda.empty_cache()  # 每组实验前清缓存，防累积
     lato_slat = LATOSparseTensor(
         feats=feats.contiguous().float().to(device),
         coords=coords_4d.contiguous().to(device),
@@ -142,7 +143,8 @@ def main():
 
     # ── 3. 加载模型管线 ──
     print("加载管线 ...")
-    pipeline, _, _ = load_pipeline(opt, device)
+    pipeline, connection_head, model_cfg = load_pipeline(opt, device)
+    del connection_head, model_cfg  # 实验不需要边预测头，立即释放
     vae = pipeline.models["lato_vae"]
     flow_model = pipeline.models["sparse_structure_flow_model"]
     head = pipeline.models["lato_structure_head"]
@@ -168,6 +170,12 @@ def main():
         coords_ss = coords_ss[topk]
     print(f"SS coords: {coords_ss.shape[0]}\n")
 
+    # 🔧 释放 SS Flow + StructureHead（后续只用 coords），给 VAE decode 腾显存
+    pipeline.models.pop("sparse_structure_flow_model", None)
+    pipeline.models.pop("lato_structure_head", None)
+    del flow_model, head, z_s, occ_logits
+    torch.cuda.empty_cache()
+
     # ── 5. SLat Flow 采样（GT coords 和 SS coords 各跑一次）──
     slat_params = {"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength}
     coords_gt_4d = to_4d(coords_gt).to(device)
@@ -180,6 +188,12 @@ def main():
     print("SLat Flow 采样 @ SS coords ...")
     slat_ss = pipeline.sample_slat(cond, coords_ss_4d, sampler_params=slat_params)
     slat_feats_ss = slat_ss.feats
+
+    # 🔧 释放 SLat Flow + CLIP 文本模型（采样已完成，只留 VAE decode）
+    pipeline.models.pop("slat_flow_model", None)
+    pipeline.text_cond_model = None
+    del cond
+    torch.cuda.empty_cache()
 
     # ── 6. C 实验: GT feats 经最近邻映射到 SS coords ──
     tree = KDTree(coords_gt.numpy().astype(np.float64))
