@@ -2,7 +2,7 @@
 
 > **目标：** Encoder/Decoder 全部用 LATO VoxelVAE，只有中间 Flow 生成用 TRELLIS。SS/SLat Flow 均在刹车卡钳数据集上从零训练。
 
-**当前版本：v16 (2026-08-12)**
+**当前版本：v18 (2026-08-26)**
 
 ---
 
@@ -1411,3 +1411,69 @@ python lato_integration/finetune_vae.py \
 - **微调无效**：`--lr` 提到 3e-5；或加 `--noise_std 0.15` 模拟 SLat Flow 误差增强鲁棒。
 - **断点续训**：已支持 `--resume` + 体素化落盘缓存，见上方「断点续训 + 体素化缓存」。
 - **边界**：只修剪枝头，不修 SLat Flow latent 误差（MSE≈0.17 信息瓶颈），几何精度仍受 latent 质量限制，不会完美还原 GT。
+
+---
+
+## v18 用 LATO 完整 encoder/decoder 精化草稿 mesh (2026-08-26)
+
+### 背景与动机
+
+项目目标：**纯 TRELLIS 生成不理想，LATO 效果好 → 直接用 LATO 的 encoder/decoder 增强生成效果**（Encoder/Decoder 用 LATO，中间 Flow 生成保留 TRELLIS）。
+
+排查发现（**修正 `诊断与修改总结_2026-08-26.md` 的结论**）：
+
+1. **fp16 不需要**。`database_lato/lato_latents/latents/lato_vae_16dim_128/*.npz` 全部 234 个 GT latent 的 coords 都是 **16384**（编码硬上限），**不存在「52416 被截断」**。诊断总结的「fp16 喂 52416」前提不成立。
+2. 实验 A（GT coords + GT feats 完美输入）在 16384 下 CD=0.307 → **瓶颈不在 voxel 数量**。
+3. 真正的瓶颈是 **「VAE 输入分布不匹配」+「顶点云→mesh 粗糙」**（即旧文档「局限 2」）：
+   - LATO VoxelVAE 训练时吃 **PointNet 1024 维几何特征 encode 出的 16 维 latent**；
+   - 现有管线却把 **SLat Flow 的 16 维语义 latent** 直接喂给 decoder → VAE 从未学过从语义特征重建 → decode 出的顶点云散乱/多层 → 再用 KDTree 乱连边建 mesh → 「没有完整的面、全是细小三角」。
+
+### 思路：两阶段「LATO 精化」
+
+```
+Stage 1（现有，不动）: TRELLIS 生成草稿 mesh
+  Text → SS Flow → StructureHead → coords@128³ → SLat Flow → VAE.decode → ConnectionHead → 草稿 mesh
+
+Stage 2（新增，LATO 完整 encoder/decoder）:
+  草稿 mesh → load_quantized_mesh_original(体素化+点特征[P,15])
+           → VoxelFeatureEncoder_active_pointnet → 1024 维几何特征
+           → VAE.encode → 16 维 latent（LATO 原生分布！）
+           → VAE.decode → 干净顶点层级 → ConnectionHead → 精化 mesh
+```
+
+Stage 2 让 VAE decoder 拿到它**训练时见过的输入类型**（PointNet 几何特征 → encode → decode），绕开分布不匹配——这是「让 LATO 发挥」缺失的 encoder 半边。
+
+**零重训、零 fp16**：voxel_encoder / VAE / ConnectionHead 全用 LATO 预训练权重；Stage 2 输入经 LATO 预处理天然 ≤16384 voxel，不撞 spconv int32。
+
+### 代码改动清单
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `lato_integration/refine_lato.py`（**新增**） | `build_voxel_encoder()`（构建 + `.eval()`）+ `refine_mesh_with_lato()`（草稿 mesh → 体素化 → PointNet → VAE.encode → decode → ConnectionHead），改编自 LATO 官方 `scripts/infer_vae_512.py` 的 `reconstruct_mesh`。LATO 的 `vertex_encoder` 用 `importlib` 按绝对路径加载，避开本地同名模块 |
+| 2 | `lato_integration/evaluate_3d_metrics.py` | ① `load_pipeline` 在 `--refine_lato` 时加载 voxel_encoder（`load_pretrained_woself` 加 `voxel_encoder=`）；② 新增 `--refine_lato` 参数；③ 草稿 mesh 提取后精化，用精化 mesh 算指标/保存 |
+| 3 | `lato_integration/inference_lato.py` | 同 evaluate：加载 voxel_encoder + `--refine_lato` + 草稿 mesh 构建后精化再导出 |
+
+实现要点：
+- `vertex_threshold` 跟随 `--lato_threshold`（默认 0.2），避免 LATO 官方 0.5 在原生路径触发 L0=0 → top-2 兜底 → 57万+ 顶点 → 建 mesh 极慢。
+- 精化后尽早 `del decoded + empty_cache`，KDTree 建 mesh 阶段不占 GPU 显存。
+- 默认关闭（`--refine_lato` 不加 = 行为与之前完全一致）。
+
+### 用法
+
+```bash
+# 单条验证（仿原文档，只加 --refine_lato）
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" --slat_ckpt "$SLAT_CKPT" \
+    --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/eval_refine_test --limit 1 --save_meshes --refine_lato
+```
+
+### 注意事项
+
+- **voxel_encoder 权重必须加载成功**：日志 `--- Loading status for 'VoxelEncoder' ---` 必须是 `Success: All weights loaded perfectly`，否则随机初始化 → 精化结果是垃圾。
+- **Stage 2 修 mesh 质量、不修形状**：LATO 重构的是草稿的「形状」——草稿形状对则精化干净完整，草稿形状烂则精化后仍是烂形状（只是变干净）。
+- **性能**：每样本多一次 体素化(CPU) + PointNet encode + VAE encode→decode + KDTree 建 mesh，批量评估会明显变慢。

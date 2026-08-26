@@ -432,6 +432,9 @@ def main():
     parser.add_argument("--refine_lato", action="store_true",
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
+    parser.add_argument("--mesh_mode", type=str, default="grid", choices=["grid", "knn"],
+                        help="建 mesh 方式: grid=格点相邻+四边形化（推荐，出完整面），"
+                             "knn=KDTree 三角汤（旧，千万面）")
 
     # ── 设备 & 精度 ──
     parser.add_argument("--device", type=str, default="cuda")
@@ -772,46 +775,63 @@ def main():
 
     if vertex_coords_4d.shape[-1] == 4:
         # [batch, x, y, z] → [x, y, z]
-        vertex_coords_3d = vertex_coords_4d[:, 1:].float()
+        vertex_coords_int = vertex_coords_4d[:, 1:].long()
     else:
-        vertex_coords_3d = vertex_coords_4d.float()
+        vertex_coords_int = vertex_coords_4d.long()
 
-    if vertex_coords_3d.numel() == 0:
+    if vertex_coords_int.numel() == 0:
         print("[ERROR] 模型输出空顶点（欠训练或 prompt 偏差过大），无法构建 mesh")
         sys.exit(1)
 
-    # 归一化坐标到 [-0.5, 0.5]
-    if vertex_coords_3d.max() > 1.0:
-        # 解码链 128³→256³→512³，末级块 out_resolution = resolution * 2，
-        # 必须除输出分辨率 512（官方 infer_vae_512.py 写死 /512），除 256 会放大 2 倍
-        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
-        vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
-
+    vertex_coords_3d = vertex_coords_int.float()
     print(f"  顶点数: {len(vertex_coords_3d)}")
     print(f"  特征维度: {vertex_feats.shape[-1]}")
-    print(f"  坐标范围: [{vertex_coords_3d.min():.3f}, {vertex_coords_3d.max():.3f}]")
 
-    # 预测边
-    print(f"  预测顶点边 (threshold={opt.edge_threshold}, k={opt.k_neighbors})...")
-    edges = predict_edges_batched(
-        connection_head,
-        vertex_feats.float(),
-        vertex_coords_3d.float(),
-        threshold=opt.edge_threshold,
-        device=device,
-        k_neighbors=opt.k_neighbors,
-    )
-    print(f"  预测边数: {len(edges)}")
-    if len(edges) == 0:
-        print("[ERROR] 未预测到任何边！尝试降低 --edge_threshold（如 0.3）")
-        sys.exit(1)
+    # ── 建 mesh：grid（格点相邻+四边形化，优先）或 knn（KDTree 三角汤）──
+    mesh = None
+    if opt.mesh_mode == "grid":
+        from lato_integration.mesh_grid import build_mesh_from_grid
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_grid(
+            vertex_coords_int, vertex_feats.float(), connection_head, device,
+            last_res=last_res, edge_threshold=opt.edge_threshold,
+        )
+        if mesh is not None and len(mesh.faces) > 1000:
+            print(f"  格点建 mesh 完成: v={len(mesh.vertices)} f={len(mesh.faces)}")
+        else:
+            print(f"  [WARN] 格点建 mesh 过稀/失败 (f={len(mesh.faces) if mesh is not None else 0})，回退 KDTree")
+            mesh = None
 
-    # 三角面片化
-    print("  三角面片化 ...")
-    mesh = edges_to_mesh(
-        vertex_coords_3d.cpu().numpy(),
-        edges,
-    )
+    if mesh is None:
+        # 归一化坐标到 [-0.5, 0.5]
+        if vertex_coords_3d.max() > 1.0:
+            # 解码链 128³→256³→512³，末级块 out_resolution = resolution * 2，
+            # 必须除输出分辨率 512（官方 infer_vae_512.py 写死 /512），除 256 会放大 2 倍
+            last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+            vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
+
+        print(f"  坐标范围: [{vertex_coords_3d.min():.3f}, {vertex_coords_3d.max():.3f}]")
+        # 预测边
+        print(f"  预测顶点边 (threshold={opt.edge_threshold}, k={opt.k_neighbors})...")
+        edges = predict_edges_batched(
+            connection_head,
+            vertex_feats.float(),
+            vertex_coords_3d.float(),
+            threshold=opt.edge_threshold,
+            device=device,
+            k_neighbors=opt.k_neighbors,
+        )
+        print(f"  预测边数: {len(edges)}")
+        if len(edges) == 0:
+            print("[ERROR] 未预测到任何边！尝试降低 --edge_threshold（如 0.3）")
+            sys.exit(1)
+
+        # 三角面片化
+        print("  三角面片化 ...")
+        mesh = edges_to_mesh(
+            vertex_coords_3d.cpu().numpy(),
+            edges,
+        )
 
     if mesh is None:
         print("[ERROR] Mesh 构建失败")

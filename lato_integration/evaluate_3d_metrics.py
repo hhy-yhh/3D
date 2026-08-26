@@ -367,8 +367,15 @@ def load_pipeline(opt, device):
 # Mesh 后处理（从 pipeline 输出提取）
 # ============================================================================
 
-def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_threshold=0.45, k_neighbors=32):
-    """从 pipeline.run() 输出提取 trimesh 对象。"""
+def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
+                             edge_threshold=0.45, k_neighbors=32, mesh_mode="grid"):
+    """从 pipeline.run() 输出提取 trimesh 对象。
+
+    mesh_mode:
+      - "grid": 格点 6-邻域连边 + 四边形化（LATO 拓扑，出完整面）。
+                失败/过稀时自动回退 KDTree。
+      - "knn":  原 KDTree 32 近邻 + 公共邻居三角枚举。
+    """
     from lato_integration.inference_lato import predict_edges_batched, edges_to_mesh
 
     if "lato_decoded" not in outputs:
@@ -383,13 +390,27 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device, edge_t
     vertex_feats = vertex_result["feats"]
 
     if vertex_coords_4d.shape[-1] == 4:
-        vertex_coords_3d = vertex_coords_4d[:, 1:].float()
+        vertex_coords_int = vertex_coords_4d[:, 1:].long()
     else:
-        vertex_coords_3d = vertex_coords_4d.float()
+        vertex_coords_int = vertex_coords_4d.long()
 
-    if vertex_coords_3d.numel() == 0:
+    if vertex_coords_int.numel() == 0:
         return None
 
+    # ── grid 模式：格点相邻 + 四边形化 ──
+    if mesh_mode == "grid":
+        from lato_integration.mesh_grid import build_mesh_from_grid
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_grid(
+            vertex_coords_int, vertex_feats.float(), connection_head, device,
+            last_res=last_res, edge_threshold=edge_threshold,
+        )
+        if mesh is not None and len(mesh.faces) > 1000:
+            return mesh
+        print(f"  [WARN] 格点建 mesh 过稀/失败 (f={len(mesh.faces) if mesh is not None else 0})，回退 KDTree")
+
+    # ── knn 模式（原逻辑）／grid 回退 ──
+    vertex_coords_3d = vertex_coords_int.float()
     if vertex_coords_3d.max() > 1.0:
         # 解码链 128³→256³→512³，末级块 out_resolution = resolution * 2，
         # 必须除输出分辨率 512（官方 infer_vae_512.py 写死 /512），除 256 会放大 2 倍
@@ -454,6 +475,9 @@ def main():
     parser.add_argument("--refine_lato", action="store_true", default=False,
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
+    parser.add_argument("--mesh_mode", type=str, default="grid", choices=["grid", "knn"],
+                        help="建 mesh 方式: grid=格点相邻+四边形化（推荐，出完整面），"
+                             "knn=KDTree 三角汤（旧，千万面）")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
     parser.add_argument("--save_meshes", action="store_true", default=False,
@@ -611,7 +635,8 @@ def main():
                     print(f"  [VAE L{i}] vertices={nv}")
 
             pred_mesh = extract_mesh_from_output(
-                outputs, connection_head, model_cfg, device, opt.edge_threshold, opt.k_neighbors
+                outputs, connection_head, model_cfg, device,
+                opt.edge_threshold, opt.k_neighbors, opt.mesh_mode,
             )
 
             # 清理 VAE decode 中间张量
