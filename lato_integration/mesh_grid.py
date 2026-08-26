@@ -102,7 +102,7 @@ def _postprocess_mesh(mesh, smooth_iterations=2, smooth_lambda=0.5):
 
 def build_mesh_from_grid(vertex_coords_int, vertex_feats, connection_head, device,
                          last_res=512, edge_threshold=0.45, batch_size=8192,
-                         smooth_iterations=2, smooth_lambda=0.5):
+                         smooth_iterations=0, smooth_lambda=0.5):
     """格点拓扑建 mesh：6-邻域边 → ConnectionHead 打分 → 四边形化 → 三角面。
 
     Args:
