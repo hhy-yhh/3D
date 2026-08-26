@@ -98,13 +98,17 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
 
 def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
                       device, label, threshold=0.2, edge_threshold=0.45,
-                      k_neighbors=32, n_points=20000):
+                      k_neighbors=32, n_points=20000, use_fp16=False):
     """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。"""
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
     torch.cuda.empty_cache()
+    if use_fp16:
+        feats_in = feats.contiguous().half().to(device)
+    else:
+        feats_in = feats.contiguous().float().to(device)
     lato_slat = LATOSparseTensor(
-        feats=feats.contiguous().float().to(device),
+        feats=feats_in,
         coords=coords_4d.contiguous().to(device),
     )
     with torch.no_grad():
@@ -164,6 +168,10 @@ def main():
     ap.add_argument("--lato_threshold", type=float, default=0.2)
     ap.add_argument("--edge_threshold", type=float, default=0.45)
     ap.add_argument("--k_neighbors", type=int, default=32)
+    ap.add_argument("--only", default=None, choices=["A", "B", "C", "D"],
+                    help="只跑单组实验（A/B/C/D），用于多卡并行或快速验证")
+    ap.add_argument("--vae_fp16", action="store_true", default=False,
+                    help="VAE decode 用 fp16（int32 上限翻倍，可喂更多 voxel）")
     ap.add_argument("--use_fp16", action="store_true", default=False)
     opt = ap.parse_args()
 
@@ -218,6 +226,10 @@ def main():
     print("加载管线 ...")
     pipeline, connection_head, model_cfg = load_pipeline(opt, device)
     vae = pipeline.models["lato_vae"]
+    if opt.vae_fp16:
+        vae = vae.half()
+        pipeline.models["lato_vae"] = vae
+        print("  VAE 已转 fp16（int32 上限翻倍）")
     flow_model = pipeline.models["sparse_structure_flow_model"]
     head = pipeline.models["lato_structure_head"]
 
@@ -272,23 +284,28 @@ def main():
     _, nn_idx = tree.query(coords_ss[:, 1:].cpu().numpy().astype(np.float64))
     feats_gt_mapped = feats_gt[nn_idx]  # [N_ss, 16]
 
-    # ── 7. 4 组对照实验（每组建 mesh + 算 CD）──
+    # ── 7. 对照实验（每组建 mesh + 算 CD）──
+    experiments = {
+        "A": (coords_gt_4d, feats_gt, "A: GT coords + GT feats   "),
+        "B": (coords_gt_4d, slat_feats_gt, "B: GT coords + SLat feats"),
+        "C": (coords_ss_4d, feats_gt_mapped, "C: SS coords + GT feats   "),
+        "D": (coords_ss_4d, slat_feats_ss, "D: SS coords + SLat feats "),
+    }
+    keys = [opt.only] if opt.only else ["A", "B", "C", "D"]
+
     print("\n" + "=" * 64)
     print(f"VAE decode 对照实验 (inference_threshold={opt.lato_threshold:.2f})")
-    print("每组含建 mesh + CD，预计共 ~8-20 分钟 ...")
+    if opt.only:
+        print(f"只跑 {opt.only} 组")
+    else:
+        print("每组含建 mesh + CD，预计共 ~8-20 分钟 ...")
     print("=" * 64)
-    feed_vae_and_eval(vae, connection_head, model_cfg, coords_gt_4d, feats_gt,
-                      gt_mesh, device, "A: GT coords + GT feats   ",
-                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
-    feed_vae_and_eval(vae, connection_head, model_cfg, coords_gt_4d, slat_feats_gt,
-                      gt_mesh, device, "B: GT coords + SLat feats",
-                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
-    feed_vae_and_eval(vae, connection_head, model_cfg, coords_ss_4d, feats_gt_mapped,
-                      gt_mesh, device, "C: SS coords + GT feats   ",
-                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
-    feed_vae_and_eval(vae, connection_head, model_cfg, coords_ss_4d, slat_feats_ss,
-                      gt_mesh, device, "D: SS coords + SLat feats ",
-                      opt.lato_threshold, opt.edge_threshold, opt.k_neighbors)
+    for k in keys:
+        coords, feats, label = experiments[k]
+        feed_vae_and_eval(vae, connection_head, model_cfg, coords, feats,
+                          gt_mesh, device, label,
+                          opt.lato_threshold, opt.edge_threshold, opt.k_neighbors,
+                          use_fp16=opt.vae_fp16)
     print("=" * 64)
 
     # ── 8. 判读提示 ──
