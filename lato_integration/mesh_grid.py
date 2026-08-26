@@ -81,7 +81,8 @@ def predict_edges_grid(connection_head, vertex_coords_int, vertex_feats, thresho
 
 
 def build_mesh_from_poisson(vertex_coords_int, device, last_res=512,
-                            depth=9, knn=30, crop_density_quantile=0.1):
+                            depth=9, knn=30, crop_density_quantile=0.1,
+                            smooth_iterations=2, smooth_lambda=0.5):
     """用 open3d Poisson 从解码顶点云重建光滑、水密、流形曲面。
 
     绕开「512³ 格点四边形」的方块感/非流形问题，直接从点云光滑重建。
@@ -137,10 +138,9 @@ def build_mesh_from_poisson(vertex_coords_int, device, last_res=512,
         print("[mesh_grid] Poisson 输出空面")
         return None
     mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
-    try:
-        trimesh.repair.fix_normals(mesh)
-    except Exception:
-        pass
+    # Poisson 输出是流形网格 → 平滑安全（不会像非流形 grid 网格那样炸尖刺），
+    # 抹平「纸糊」的细碎小面
+    mesh = _postprocess_mesh(mesh, smooth_iterations=smooth_iterations, smooth_lambda=smooth_lambda)
     print(f"[mesh_grid] Poisson 重建: v={len(mesh.vertices)} f={len(mesh.faces)}")
     return mesh
 
