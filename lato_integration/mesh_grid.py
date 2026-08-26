@@ -80,8 +80,29 @@ def predict_edges_grid(connection_head, vertex_coords_int, vertex_feats, thresho
     return edges
 
 
+def _postprocess_mesh(mesh, smooth_iterations=2, smooth_lambda=0.5):
+    """修复法线 + 轻量 Laplacian 平滑。
+
+    - fix_normals：统一面的绕向/法线，消除黑面、破碎感（NC 偏低的主因）。
+    - 轻量平滑：把 512³ 格点阶梯抹平，表面从「方块」变「光滑」，几何主体不变（CD 几乎不变）。
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+    try:
+        import trimesh
+        trimesh.repair.fix_normals(mesh)
+        if smooth_iterations > 0:
+            from trimesh.smoothing import filter_laplacian
+            filter_laplacian(mesh, iterations=smooth_iterations, lamb=smooth_lambda)
+        print(f"[mesh_grid] 后处理: fix_normals + 平滑({smooth_iterations}次, λ={smooth_lambda})")
+    except Exception as e:
+        print(f"[mesh_grid] 后处理跳过: {e}")
+    return mesh
+
+
 def build_mesh_from_grid(vertex_coords_int, vertex_feats, connection_head, device,
-                         last_res=512, edge_threshold=0.45, batch_size=8192):
+                         last_res=512, edge_threshold=0.45, batch_size=8192,
+                         smooth_iterations=2, smooth_lambda=0.5):
     """格点拓扑建 mesh：6-邻域边 → ConnectionHead 打分 → 四边形化 → 三角面。
 
     Args:
@@ -152,4 +173,6 @@ def build_mesh_from_grid(vertex_coords_int, vertex_feats, connection_head, devic
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     mesh.remove_unreferenced_vertices()
     print(f"[mesh_grid] 格点建 mesh: v={len(mesh.vertices)} f={len(mesh.faces)}")
+    # 后处理：修复法线 + 轻量平滑（改善观感，几何主体不变）
+    mesh = _postprocess_mesh(mesh, smooth_iterations=smooth_iterations, smooth_lambda=smooth_lambda)
     return mesh
