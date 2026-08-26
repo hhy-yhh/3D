@@ -69,19 +69,35 @@ def to_4d(coords):
 
 
 def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
-                            edge_threshold=0.45, k_neighbors=32):
-    """从 VAE decode 输出构建 trimesh（逻辑同 evaluate_3d_metrics.extract_mesh_from_output）。"""
+                            edge_threshold=0.45, k_neighbors=32, mesh_mode="grid"):
+    """从 VAE decode 输出构建 trimesh（逻辑同 evaluate_3d_metrics.extract_mesh_from_output）。
+
+    mesh_mode: "grid"=格点相邻+四边形化（默认，出完整面）；"knn"=旧 KDTree 三角汤。
+    """
     vertex_result = decoded[-1].get("vertex")
     if vertex_result is None:
         return None
     vertex_coords_4d = vertex_result["coords"]
     vertex_feats = vertex_result["feats"]
     if vertex_coords_4d.shape[-1] == 4:
-        vertex_coords_3d = vertex_coords_4d[:, 1:].float()
+        vertex_coords_int = vertex_coords_4d[:, 1:].long()
     else:
-        vertex_coords_3d = vertex_coords_4d.float()
-    if vertex_coords_3d.numel() == 0:
+        vertex_coords_int = vertex_coords_4d.long()
+    if vertex_coords_int.numel() == 0:
         return None
+
+    if mesh_mode == "grid":
+        from lato_integration.mesh_grid import build_mesh_from_grid
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_grid(
+            vertex_coords_int, vertex_feats.float(), connection_head, device,
+            last_res=last_res, edge_threshold=edge_threshold,
+        )
+        if mesh is not None and len(mesh.faces) > 1000:
+            return mesh
+        print(f"  [WARN] 格点建 mesh 过稀/失败 (f={len(mesh.faces) if mesh is not None else 0})，回退 KDTree")
+
+    vertex_coords_3d = vertex_coords_int.float()
     if vertex_coords_3d.max() > 1.0:
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
         vertex_coords_3d = vertex_coords_3d / float(last_res) - 0.5
@@ -98,7 +114,7 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
 
 def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
                       device, label, threshold=0.2, edge_threshold=0.45,
-                      k_neighbors=32, n_points=20000, use_fp16=False):
+                      k_neighbors=32, n_points=20000, use_fp16=False, mesh_mode="grid"):
     """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。"""
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
@@ -124,10 +140,10 @@ def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh
         nv = vc.shape[0] if vc is not None else 0
         parts.append(f"L{i}={nv}")
 
-    # 建 mesh（慢，~2-5 min，主要花在 KDTree 边候选）
+    # 建 mesh（grid 模式快；knn 模式慢，~2-5 min，主要花在 KDTree 边候选）
     mesh = build_mesh_from_decoded(
         decoded, connection_head, model_cfg, device,
-        edge_threshold=edge_threshold, k_neighbors=k_neighbors,
+        edge_threshold=edge_threshold, k_neighbors=k_neighbors, mesh_mode=mesh_mode,
     )
     del decoded
     torch.cuda.empty_cache()
@@ -173,6 +189,8 @@ def main():
     ap.add_argument("--vae_fp16", action="store_true", default=False,
                     help="VAE decode 用 fp16（int32 上限翻倍，可喂更多 voxel）")
     ap.add_argument("--use_fp16", action="store_true", default=False)
+    ap.add_argument("--mesh_mode", type=str, default="grid", choices=["grid", "knn"],
+                    help="建 mesh 方式: grid=格点相邻+四边形化（默认），knn=旧 KDTree 三角汤")
     opt = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -305,7 +323,7 @@ def main():
         feed_vae_and_eval(vae, connection_head, model_cfg, coords, feats,
                           gt_mesh, device, label,
                           opt.lato_threshold, opt.edge_threshold, opt.k_neighbors,
-                          use_fp16=opt.vae_fp16)
+                          use_fp16=opt.vae_fp16, mesh_mode=opt.mesh_mode)
     print("=" * 64)
 
     # ── 8. 判读提示 ──
