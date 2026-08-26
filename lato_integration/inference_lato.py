@@ -429,6 +429,9 @@ def main():
                         help="SS occupancy logits 阈值（调高=更少 voxels，v13 默认 2.0）")
     parser.add_argument("--k_neighbors", type=int, default=32,
                         help="KDTree 最近邻数（影响候选边数量）")
+    parser.add_argument("--refine_lato", action="store_true",
+                        help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
+                             "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
 
     # ── 设备 & 精度 ──
     parser.add_argument("--device", type=str, default="cuda")
@@ -589,6 +592,7 @@ def main():
         lato_vae = None
         connection_head = None
         model_cfg = None
+        voxel_encoder = None
     else:
         print("[4/6] 加载 LATO VoxelVAE + ConnectionHead ...")
         if not os.path.exists(opt.lato_ckpt):
@@ -620,11 +624,24 @@ def main():
             mlp_ratio=0.75,
         ).to(device)
 
-        result = load_pretrained_woself(
-            opt.lato_ckpt,
-            vae=lato_vae,
-            connection_head=connection_head,
-        )
+        # --refine_lato: 额外加载 LATO voxel_encoder（PointNet），用于 Stage 2 精化
+        voxel_encoder = None
+        if opt.refine_lato:
+            from lato_integration.refine_lato import build_voxel_encoder
+            voxel_encoder = build_voxel_encoder(device)
+            result = load_pretrained_woself(
+                opt.lato_ckpt,
+                vae=lato_vae,
+                connection_head=connection_head,
+                voxel_encoder=voxel_encoder,
+            )
+            print("  LATO voxel_encoder 已加载（用于 --refine_lato 精化）")
+        else:
+            result = load_pretrained_woself(
+                opt.lato_ckpt,
+                vae=lato_vae,
+                connection_head=connection_head,
+            )
         if opt.vae_ft_ckpt and os.path.exists(opt.vae_ft_ckpt):
             ft_data = torch.load(opt.vae_ft_ckpt, map_location=device, weights_only=True)
             ft_state = ft_data.get("model_state_dict", ft_data)
@@ -799,6 +816,22 @@ def main():
     if mesh is None:
         print("[ERROR] Mesh 构建失败")
         sys.exit(1)
+
+    # ── Stage 2：用 LATO 完整 encoder/decoder 精化草稿 mesh ──
+    if opt.refine_lato and lato_vae is not None and voxel_encoder is not None:
+        from lato_integration.refine_lato import refine_mesh_with_lato
+        print("  [LATO-refine] 用 LATO encoder/decoder 精化草稿 mesh ...")
+        refined = refine_mesh_with_lato(
+            mesh, lato_vae, voxel_encoder, connection_head, device, model_cfg,
+            vertex_threshold=opt.lato_threshold,
+            edge_threshold=opt.edge_threshold, k_neighbors=opt.k_neighbors,
+        )
+        if refined is not None:
+            print(f"  草稿: v={len(mesh.vertices)} f={len(mesh.faces)} "
+                  f"→ 精化: v={len(refined.vertices)} f={len(refined.faces)}")
+            mesh = refined
+        else:
+            print("  精化失败，保留草稿 mesh")
 
     # 保存
     os.makedirs(os.path.dirname(opt.output) or ".", exist_ok=True)

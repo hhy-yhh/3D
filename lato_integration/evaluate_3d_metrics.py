@@ -318,7 +318,18 @@ def load_pipeline(opt, device):
         using_attn=model_cfg.get("using_attn", False),
     ).to(device)
     connection_head = LATOConnectionHead(channels=1024, out_channels=1, mlp_ratio=0.75).to(device)
-    load_pretrained_woself(opt.lato_ckpt, vae=lato_vae, connection_head=connection_head)
+    # --refine_lato: 额外加载 LATO voxel_encoder（PointNet），用于 Stage 2 精化。
+    # 默认不加载，省显存。getattr 兼容 experiment_coords_vs_feats.py（无该参数）。
+    voxel_encoder = None
+    if getattr(opt, "refine_lato", False):
+        from lato_integration.refine_lato import build_voxel_encoder
+        voxel_encoder = build_voxel_encoder(device)
+        load_pretrained_woself(
+            opt.lato_ckpt, vae=lato_vae,
+            connection_head=connection_head, voxel_encoder=voxel_encoder,
+        )
+    else:
+        load_pretrained_woself(opt.lato_ckpt, vae=lato_vae, connection_head=connection_head)
     # 如果用微调权重覆盖 VoxelVAE
     if opt.vae_ft_ckpt and os.path.exists(opt.vae_ft_ckpt):
         ft_data = torch.load(opt.vae_ft_ckpt, map_location=device, weights_only=True)
@@ -333,6 +344,9 @@ def load_pipeline(opt, device):
     connection_head.eval()
 
     pipeline.models["lato_vae"] = lato_vae
+    if voxel_encoder is not None:
+        pipeline.models["lato_voxel_encoder"] = voxel_encoder
+        print("  LATO voxel_encoder 已加载（用于 --refine_lato 精化）")
     pipeline.lato_inference_threshold = opt.lato_threshold
     for key in ["slat_decoder_mesh", "slat_decoder_gs", "slat_decoder_rf"]:
         pipeline.models.pop(key, None)
@@ -437,6 +451,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use_fp16", action="store_true", default=False,
                     help="启用 FP16 推理（默认 FP32，与训练一致）")
+    parser.add_argument("--refine_lato", action="store_true", default=False,
+                        help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
+                             "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
     parser.add_argument("--save_meshes", action="store_true", default=False,
@@ -605,6 +622,27 @@ def main():
             if pred_mesh is None:
                 failures.append({"sha": sha, "error": "Mesh extraction failed"})
                 continue
+
+            # ── Stage 2：用 LATO 完整 encoder/decoder 精化草稿 mesh ──
+            if opt.refine_lato:
+                from lato_integration.refine_lato import refine_mesh_with_lato
+                voxel_encoder = pipeline.models.get("lato_voxel_encoder")
+                vae = pipeline.models.get("lato_vae")
+                if voxel_encoder is not None and vae is not None:
+                    print(f"  [LATO-refine] 用 LATO encoder/decoder 精化草稿 mesh ...")
+                    _refined = refine_mesh_with_lato(
+                        pred_mesh, vae, voxel_encoder, connection_head, device, model_cfg,
+                        vertex_threshold=opt.lato_threshold,
+                        edge_threshold=opt.edge_threshold, k_neighbors=opt.k_neighbors,
+                    )
+                    if _refined is not None:
+                        print(f"    草稿: v={len(pred_mesh.vertices)} f={len(pred_mesh.faces)} "
+                              f"→ 精化: v={len(_refined.vertices)} f={len(_refined.faces)}")
+                        pred_mesh = _refined
+                    else:
+                        print("    精化失败，保留草稿 mesh")
+                else:
+                    print("  [WARN] --refine_lato 已开启但未加载 voxel_encoder/vae，跳过精化")
 
             # 保存生成 mesh
             if opt.save_meshes:
