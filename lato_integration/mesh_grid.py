@@ -80,6 +80,71 @@ def predict_edges_grid(connection_head, vertex_coords_int, vertex_feats, thresho
     return edges
 
 
+def build_mesh_from_poisson(vertex_coords_int, device, last_res=512,
+                            depth=9, knn=30, crop_density_quantile=0.1):
+    """用 open3d Poisson 从解码顶点云重建光滑、水密、流形曲面。
+
+    绕开「512³ 格点四边形」的方块感/非流形问题，直接从点云光滑重建。
+    几何主体不变（CD 基本保持），观感从「方块」变「光滑卡钳」。
+
+    Args:
+        vertex_coords_int: [N,3] int64 格点坐标（512³ 网格）。
+        device: 设备（仅用于日志，Poisson 在 CPU 跑）。
+        last_res: 输出分辨率（归一化用，通常 512）。
+        depth: Poisson 八叉树深度（~200K 点用 9-10）。
+        knn: 法线估计近邻数。
+        crop_density_quantile: 裁剪掉密度低于该分位数的顶点（去掉 Poisson 膨胀部分）。
+    Returns:
+        trimesh.Trimesh（顶点归一化到 [-0.5,0.5]），失败返回 None。
+    """
+    import open3d as o3d
+    import trimesh
+    import numpy as np
+
+    N = vertex_coords_int.shape[0]
+    if N < 10:
+        print("[mesh_grid] 顶点过少，跳过 Poisson")
+        return None
+
+    coords_np = vertex_coords_int.cpu().numpy().astype(np.float64)
+    pts = coords_np / float(last_res) - 0.5  # 归一化到 [-0.5, 0.5]
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+
+    # 1. 估计法线（PCA）
+    k = min(knn, N - 1)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
+
+    # 2. 统一法线方向：远离质心（对居中形状近似 outward）
+    center = pts.mean(axis=0)
+    norms = np.asarray(pcd.normals).copy()
+    dot = np.sum(norms * (pts - center), axis=1)
+    norms[dot < 0] *= -1
+    pcd.normals = o3d.utility.Vector3dVector(norms)
+
+    print(f"[mesh_grid] Poisson: {N} 点, depth={depth}, k={k}")
+    mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+
+    # 3. 裁剪低密度膨胀部分（Poisson 常带一个向外鼓的气球）
+    densities = np.asarray(densities)
+    thresh = np.quantile(densities, crop_density_quantile)
+    mesh_o3d.remove_vertices_by_mask(densities < thresh)
+
+    verts = np.asarray(mesh_o3d.vertices)
+    tris = np.asarray(mesh_o3d.triangles)
+    if len(tris) == 0:
+        print("[mesh_grid] Poisson 输出空面")
+        return None
+    mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    try:
+        trimesh.repair.fix_normals(mesh)
+    except Exception:
+        pass
+    print(f"[mesh_grid] Poisson 重建: v={len(mesh.vertices)} f={len(mesh.faces)}")
+    return mesh
+
+
 def _postprocess_mesh(mesh, smooth_iterations=2, smooth_lambda=0.5):
     """修复法线 + 轻量 Laplacian 平滑。
 

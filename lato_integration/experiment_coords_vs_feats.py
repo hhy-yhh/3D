@@ -86,6 +86,14 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
     if vertex_coords_int.numel() == 0:
         return None
 
+    if mesh_mode == "poisson":
+        from lato_integration.mesh_grid import build_mesh_from_poisson
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_poisson(vertex_coords_int, device, last_res=last_res)
+        if mesh is not None and len(mesh.faces) > 100:
+            return mesh
+        print(f"  [WARN] Poisson 重建失败/过稀，回退 grid/knn")
+
     if mesh_mode == "grid":
         from lato_integration.mesh_grid import build_mesh_from_grid
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
@@ -189,8 +197,10 @@ def main():
     ap.add_argument("--vae_fp16", action="store_true", default=False,
                     help="VAE decode 用 fp16（int32 上限翻倍，可喂更多 voxel）")
     ap.add_argument("--use_fp16", action="store_true", default=False)
-    ap.add_argument("--mesh_mode", type=str, default="grid", choices=["grid", "knn"],
-                    help="建 mesh 方式: grid=格点相邻+四边形化（默认），knn=旧 KDTree 三角汤")
+    ap.add_argument("--mesh_mode", type=str, default="grid",
+                    choices=["grid", "knn", "poisson"],
+                    help="建 mesh 方式: grid=格点四边形化（默认），knn=旧 KDTree 三角汤，"
+                         "poisson=open3d 光滑重建")
     opt = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

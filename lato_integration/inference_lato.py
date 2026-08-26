@@ -432,9 +432,10 @@ def main():
     parser.add_argument("--refine_lato", action="store_true",
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
-    parser.add_argument("--mesh_mode", type=str, default="grid", choices=["grid", "knn"],
-                        help="建 mesh 方式: grid=格点相邻+四边形化（推荐，出完整面），"
-                             "knn=KDTree 三角汤（旧，千万面）")
+    parser.add_argument("--mesh_mode", type=str, default="grid",
+                        choices=["grid", "knn", "poisson"],
+                        help="建 mesh 方式: grid=格点四边形化（出完整面），"
+                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好）")
 
     # ── 设备 & 精度 ──
     parser.add_argument("--device", type=str, default="cuda")
@@ -787,9 +788,19 @@ def main():
     print(f"  顶点数: {len(vertex_coords_3d)}")
     print(f"  特征维度: {vertex_feats.shape[-1]}")
 
-    # ── 建 mesh：grid（格点相邻+四边形化，优先）或 knn（KDTree 三角汤）──
+    # ── 建 mesh：poisson（光滑重建）→ grid（格点四边形化）→ knn（KDTree 三角汤）──
     mesh = None
-    if opt.mesh_mode == "grid":
+    if opt.mesh_mode == "poisson":
+        from lato_integration.mesh_grid import build_mesh_from_poisson
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_poisson(vertex_coords_int, device, last_res=last_res)
+        if mesh is not None and len(mesh.faces) > 100:
+            print(f"  Poisson 重建完成: v={len(mesh.vertices)} f={len(mesh.faces)}")
+        else:
+            print(f"  [WARN] Poisson 重建失败/过稀，回退 grid/knn")
+            mesh = None
+
+    if mesh is None and opt.mesh_mode == "grid":
         from lato_integration.mesh_grid import build_mesh_from_grid
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
         mesh = build_mesh_from_grid(
