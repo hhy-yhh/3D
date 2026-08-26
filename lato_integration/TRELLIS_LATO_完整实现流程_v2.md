@@ -1477,3 +1477,62 @@ python lato_integration/evaluate_3d_metrics.py \
 - **voxel_encoder 权重必须加载成功**：日志 `--- Loading status for 'VoxelEncoder' ---` 必须是 `Success: All weights loaded perfectly`，否则随机初始化 → 精化结果是垃圾。
 - **Stage 2 修 mesh 质量、不修形状**：LATO 重构的是草稿的「形状」——草稿形状对则精化干净完整，草稿形状烂则精化后仍是烂形状（只是变干净）。
 - **性能**：每样本多一次 体素化(CPU) + PointNet encode + VAE encode→decode + KDTree 建 mesh，批量评估会明显变慢。
+
+---
+
+## v19 真正根因：CD 度量 bug + KDTree 三角汤 (2026-08-26 深夜)
+
+### 结论（推翻 v18 方向）
+
+v18 的「LATO encoder/decoder 精化」解决的是**不存在的问题**。排查后确认真正的根因有两个，都与生成本身无关：
+
+1. **CD 评估坐标系不匹配**（主因，骗了所有人）
+2. **KDTree 建 mesh 三角汤**（视觉主因）
+
+### 问题 1：CD 坐标系 bug
+
+```
+decode 输出: 归一化空间 [-0.5, 0.5]（span ~1）
+GT mesh:     原始毫米单位（span ~350，例如卡钳 355×212×126 mm）
+```
+
+旧 `compute_all_metrics` 把 pred 和 GT **都除以 GT 的毫米对角线（~430）** → pred 被缩成针尖大的点（span ~0.002）→ CD 量的是「大 GT 面到一个小点」的距离 → **恒 ~0.27，与生成质量完全无关**。
+
+- 后果：所有实验（A/B/C/D、refine、grid、40K voxel）CD 全 ≈0.27——因为全在量同一个垃圾，怎么改都动不了。
+- **验证**：用真实 GT mesh（毫米）+ 完美重建（和 GT 同形状）在旧方法下得 **0.26 分**，新方法得 **0.000**。旧 CD 是坏的，不是编的。
+- **修复**：`_normalize_to_unit`（pred 和 GT 各自居中 + 缩放到单位 bbox 对角线）→ 修复后 GT 输入 0.0093、SS 生成路径 **0.0022**。
+
+### 问题 2：KDTree 三角汤
+
+`predict_edges_batched`（KDTree k=32 乱连边）+ 公共邻居三角枚举，对 512³ 上 20 万顶点 → **1790 万面**细小三角——这就是「没有完整的面、全是细小三角形」的直接来源。
+
+- **修复**：`mesh_grid.py` 格点 6-邻域连边 + ConnectionHead 打分 + 四边形化 → **47 万完整面**。
+
+### 问题 3：观感（方块 / 纸糊）
+
+- grid 格点网格**非流形** → Laplacian 平滑炸出尖刺（射线），已撤销平滑。
+- 512³ 粒度 → 表面阶梯/方块感。
+- **修复**：**Poisson 表面重建**（open3d，流形、水密、光滑）→ 对流形网格再平滑（安全）→ 从「方块/纸糊」变「光滑卡钳」。
+
+### 最终结果
+
+| 场景 | CD | NC |
+|---|---|---|
+| A 组（GT 完美输入） | 0.0093 | — |
+| SS 生成路径（grid 四边形化） | 0.0022 | 0.46 |
+| SS 生成路径（Poisson 重建） | 0.0019 | **0.66** |
+
+**结论：生成管线几何是正确的（CD 0.002）。「生成质量差」是 CD bug + 三角汤造成的假象，不是架构/训练/生成能力问题。**
+
+### 代码改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `evaluate_3d_metrics.py` | `compute_all_metrics` 归一化修复 + pred/GT bbox/CD 分解诊断；`--mesh_mode grid/knn/poisson`；`--refine_lato`（已证无用但保留）；`extract_mesh_from_output` 支持三种模式 |
+| `mesh_grid.py`（新增） | `predict_edges_grid`（格点 6-邻域候选边）、`build_mesh_from_grid`（四边形化）、`build_mesh_from_poisson`（Poisson + 平滑）、`_postprocess_mesh`（fix_normals + Laplacian） |
+| `inference_lato.py` | 接入 `--mesh_mode` / poisson 分支 |
+| `experiment_coords_vs_feats.py` | 接入 `--mesh_mode` / poisson 分支 |
+| `refine_lato.py`（新增，已证无用） | LATO encoder/decoder 精化（v18 方案，无效） |
+
+### 待办 / 可选
+- 「纯 TRELLIS vs 当前 LATO 管线」对比**未做**——要回答「LATO 集成是否必要」需在修复指标下跑原版 TRELLIS 对照。
