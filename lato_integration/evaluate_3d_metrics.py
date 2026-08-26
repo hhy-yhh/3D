@@ -136,6 +136,21 @@ def normal_consistency(
     return float(dot.mean())
 
 
+def _normalize_to_unit(points: np.ndarray) -> np.ndarray:
+    """居中 + 缩放到 bbox 对角线 = 1。
+
+    🔧 修复坐标系不匹配：pred 在 [-0.5, 0.5]，GT mesh 是原始毫米单位（~355mm），
+    只按 GT 缩放会让 pred 变成原点附近的小点，CD 完全失真。
+    各自居中缩放到单位框架后再比较，才是形状相似度。
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    center = (pts.max(axis=0) + pts.min(axis=0)) / 2.0
+    scale = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
+    if scale > 1e-12:
+        return (pts - center) / scale
+    return pts - center
+
+
 def compute_all_metrics(
     pred_mesh: trimesh.Trimesh,
     gt_mesh: trimesh.Trimesh,
@@ -146,17 +161,27 @@ def compute_all_metrics(
     pred_pts_raw, pred_norms = sample_points_and_normals(pred_mesh, n_points)
     gt_pts_raw, gt_norms = sample_points_and_normals(gt_mesh, n_points)
 
-    # 归一化到同一尺度：用 GT bbox 对角线统一缩放
-    gt_scale = np.linalg.norm(gt_pts_raw.max(axis=0) - gt_pts_raw.min(axis=0))
-    if gt_scale > 0:
-        pred_pts = pred_pts_raw / gt_scale
-        gt_pts = gt_pts_raw / gt_scale
-    else:
-        pred_pts, gt_pts = pred_pts_raw, gt_pts_raw
+    # 各自居中 + 缩放到单位 bbox 对角线，消除 pred([-0.5,0.5]) vs GT(毫米) 的坐标系差异
+    pred_pts = _normalize_to_unit(pred_pts_raw)
+    gt_pts = _normalize_to_unit(gt_pts_raw)
+
+    # 🔧 诊断：看坐标系/形状是否对齐
+    p_span = pred_pts.max(axis=0) - pred_pts.min(axis=0)
+    g_span = gt_pts.max(axis=0) - gt_pts.min(axis=0)
+    print(f"  [CD] 原始 pred span={pred_pts_raw.max(axis=0)-pred_pts_raw.min(axis=0)}  gt span={gt_pts_raw.max(axis=0)-gt_pts_raw.min(axis=0)}")
+    print(f"  [CD] 归一化后 pred span={p_span}  gt span={g_span}")
 
     cd = chamfer_distance(pred_pts, gt_pts)
     hd = hausdorff_distance(pred_pts, gt_pts)
     nc = normal_consistency(pred_pts, pred_norms, gt_pts, gt_norms)
+
+    # CD 双向分解：哪边拉高了 CD
+    from scipy.spatial import KDTree as _KDTree
+    _t_g = _KDTree(gt_pts)
+    _d_p2g, _ = _t_g.query(pred_pts)
+    _t_p = _KDTree(pred_pts)
+    _d_g2p, _ = _t_p.query(gt_pts)
+    print(f"  [CD] p2g={(_d_p2g**2).mean():.4f}  g2p={(_d_g2p**2).mean():.4f}  total={cd:.4f}")
 
     return {
         "chamfer_distance": cd,
