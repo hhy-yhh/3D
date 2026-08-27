@@ -122,8 +122,9 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
 
 def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
                       device, label, threshold=0.2, edge_threshold=0.45,
-                      k_neighbors=32, n_points=20000, use_fp16=False, mesh_mode="grid"):
-    """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。"""
+                      k_neighbors=32, n_points=20000, use_fp16=False, mesh_mode="grid",
+                      save_path=None):
+    """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。save_path 非空则导出 mesh。"""
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
     torch.cuda.empty_cache()
@@ -165,6 +166,11 @@ def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh
             parts.append(f"v={len(mesh.vertices)} f={len(mesh.faces)}")
         except Exception as e:
             parts.append(f"CD=ERR({e})")
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            mesh.export(save_path)
+            parts.append(f"saved={save_path}")
         del mesh
     print("  ".join(parts))
 
@@ -201,6 +207,8 @@ def main():
                     choices=["grid", "knn", "poisson"],
                     help="建 mesh 方式: grid=格点四边形化（默认），knn=旧 KDTree 三角汤，"
                          "poisson=open3d 光滑重建")
+    ap.add_argument("--save_mesh", type=str, default=None,
+                    help="把实验组的解码 mesh 导出到此 .obj 路径（如 outputs/a_mesh.obj）")
     opt = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -333,7 +341,8 @@ def main():
         feed_vae_and_eval(vae, connection_head, model_cfg, coords, feats,
                           gt_mesh, device, label,
                           opt.lato_threshold, opt.edge_threshold, opt.k_neighbors,
-                          use_fp16=opt.vae_fp16, mesh_mode=opt.mesh_mode)
+                          use_fp16=opt.vae_fp16, mesh_mode=opt.mesh_mode,
+                          save_path=opt.save_mesh)
     print("=" * 64)
 
     # ── 8. 判读提示 ──
