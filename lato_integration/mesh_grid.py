@@ -241,3 +241,63 @@ def build_mesh_from_grid(vertex_coords_int, vertex_feats, connection_head, devic
     # 后处理：修复法线 + 轻量平滑（改善观感，几何主体不变）
     mesh = _postprocess_mesh(mesh, smooth_iterations=smooth_iterations, smooth_lambda=smooth_lambda)
     return mesh
+
+
+def fill_mesh_holes(mesh, max_hole_size=None):
+    """用 trimesh.repair.fill_holes 补洞（作用于最终 mesh，可选）。
+
+    Args:
+        mesh: trimesh.Trimesh。
+        max_hole_size: trimesh 补洞的孔大小上限（None=默认）。
+    Returns:
+        trimesh.Trimesh（失败/无需补时原样返回）。
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+    try:
+        import trimesh
+        before = len(mesh.faces)
+        trimesh.repair.fill_holes(mesh, max_hole_size=max_hole_size)
+        print(f"[mesh_grid] 补洞: faces {before} → {len(mesh.faces)}")
+    except Exception as e:
+        print(f"[mesh_grid] 补洞跳过: {e}")
+    return mesh
+
+
+def decimate_mesh(mesh, target_faces):
+    """用 open3d quadric 边坍缩把 mesh 压到 ~target_faces 面。
+
+    target_faces 大于等于当前面数时跳过（不动）；失败回退原 mesh。
+    Args:
+        mesh: trimesh.Trimesh。
+        target_faces: 目标面数。
+    Returns:
+        trimesh.Trimesh。
+    """
+    if mesh is None or len(mesh.faces) == 0 or target_faces is None or target_faces <= 0:
+        return mesh
+    current = len(mesh.faces)
+    if current <= target_faces:
+        print(f"[mesh_grid] 降面跳过: f={current} ≤ target={target_faces}")
+        return mesh
+    try:
+        import numpy as np
+        import open3d as o3d
+        import trimesh
+        o3d_mesh = o3d.geometry.TriangleMesh(
+            vertices=o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64)),
+            triangles=o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32)),
+        )
+        o3d_mesh = o3d_mesh.simplify_quadric_decimation(
+            target_number_of_triangles=int(target_faces))
+        verts = np.asarray(o3d_mesh.vertices)
+        tris = np.asarray(o3d_mesh.triangles)
+        if len(tris) == 0:
+            print("[mesh_grid] 降面输出空面，回退原 mesh")
+            return mesh
+        print(f"[mesh_grid] 降面: v {len(mesh.vertices)}→{len(verts)}, "
+              f"f {current}→{len(tris)}")
+        return trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    except Exception as e:
+        print(f"[mesh_grid] 降面失败回退原 mesh: {e}")
+        return mesh

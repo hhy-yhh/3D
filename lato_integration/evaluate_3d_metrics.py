@@ -393,13 +393,16 @@ def load_pipeline(opt, device):
 # ============================================================================
 
 def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
-                             edge_threshold=0.45, k_neighbors=32, mesh_mode="grid"):
+                             edge_threshold=0.45, k_neighbors=32, mesh_mode="grid",
+                             poisson_depth=9, poisson_crop=0.1,
+                             smooth_iters=None, smooth_lambda=0.5):
     """从 pipeline.run() 输出提取 trimesh 对象。
 
     mesh_mode:
       - "grid": 格点 6-邻域连边 + 四边形化（LATO 拓扑，出完整面）。
                 失败/过稀时自动回退 KDTree。
       - "knn":  原 KDTree 32 近邻 + 公共邻居三角枚举。
+    smooth_iters: 覆盖平滑次数；None/-1 时按模式默认（poisson=2, grid=0）。
     """
     from lato_integration.inference_lato import predict_edges_batched, edges_to_mesh
 
@@ -426,7 +429,12 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
     if mesh_mode == "poisson":
         from lato_integration.mesh_grid import build_mesh_from_poisson
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
-        mesh = build_mesh_from_poisson(vertex_coords_int, device, last_res=last_res)
+        _smooth = smooth_iters if (smooth_iters is not None and smooth_iters >= 0) else 2
+        mesh = build_mesh_from_poisson(
+            vertex_coords_int, device, last_res=last_res,
+            depth=poisson_depth, crop_density_quantile=poisson_crop,
+            smooth_iterations=_smooth, smooth_lambda=smooth_lambda,
+        )
         if mesh is not None and len(mesh.faces) > 100:
             return mesh
         print(f"  [WARN] Poisson 重建失败/过稀 (f={len(mesh.faces) if mesh is not None else 0})，回退 grid/knn")
@@ -435,9 +443,11 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
     if mesh_mode == "grid":
         from lato_integration.mesh_grid import build_mesh_from_grid
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        _smooth = smooth_iters if (smooth_iters is not None and smooth_iters >= 0) else 0
         mesh = build_mesh_from_grid(
             vertex_coords_int, vertex_feats.float(), connection_head, device,
             last_res=last_res, edge_threshold=edge_threshold,
+            smooth_iterations=_smooth, smooth_lambda=smooth_lambda,
         )
         if mesh is not None and len(mesh.faces) > 1000:
             return mesh
@@ -513,6 +523,18 @@ def main():
                         choices=["grid", "knn", "poisson"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
                              "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好）")
+    parser.add_argument("--poisson_depth", type=int, default=9,
+                        help="Poisson 重建八叉树深度（大=细节细，小=更光滑面少）")
+    parser.add_argument("--poisson_crop", type=float, default=0.1,
+                        help="Poisson 密度裁剪分位（低=少裁剪，保留薄孔/翅片）")
+    parser.add_argument("--smooth_iters", type=int, default=-1,
+                        help="Laplacian 平滑次数；-1=按模式默认(poisson=2, grid=0)")
+    parser.add_argument("--smooth_lambda", type=float, default=0.5,
+                        help="Laplacian 平滑强度")
+    parser.add_argument("--target_faces", type=int, default=0,
+                        help=">0 时把最终 mesh quadric 降面到目标面数（0=不降）")
+    parser.add_argument("--fill_holes", action="store_true", default=False,
+                        help="输出前用 trimesh 填补孔洞")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
     parser.add_argument("--save_meshes", action="store_true", default=False,
@@ -672,6 +694,9 @@ def main():
             pred_mesh = extract_mesh_from_output(
                 outputs, connection_head, model_cfg, device,
                 opt.edge_threshold, opt.k_neighbors, opt.mesh_mode,
+                poisson_depth=opt.poisson_depth, poisson_crop=opt.poisson_crop,
+                smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
+                smooth_lambda=opt.smooth_lambda,
             )
 
             # 清理 VAE decode 中间张量
@@ -703,6 +728,14 @@ def main():
                         print("    精化失败，保留草稿 mesh")
                 else:
                     print("  [WARN] --refine_lato 已开启但未加载 voxel_encoder/vae，跳过精化")
+
+            # ── 后处理（可选，作用于最终 mesh）：补洞 → 目标面数降面 ──
+            if pred_mesh is not None and opt.fill_holes:
+                from lato_integration.mesh_grid import fill_mesh_holes
+                pred_mesh = fill_mesh_holes(pred_mesh)
+            if pred_mesh is not None and opt.target_faces > 0:
+                from lato_integration.mesh_grid import decimate_mesh
+                pred_mesh = decimate_mesh(pred_mesh, opt.target_faces)
 
             # 保存生成 mesh
             if opt.save_meshes:
