@@ -257,7 +257,11 @@ def fill_mesh_holes(mesh, max_hole_size=None):
     try:
         import trimesh
         before = len(mesh.faces)
-        trimesh.repair.fill_holes(mesh, max_hole_size=max_hole_size)
+        # 兼容不同 trimesh 版本：新版支持 max_hole_size，旧版不支持
+        try:
+            trimesh.repair.fill_holes(mesh, max_hole_size=max_hole_size)
+        except TypeError:
+            trimesh.repair.fill_holes(mesh)
         print(f"[mesh_grid] 补洞: faces {before} → {len(mesh.faces)}")
     except Exception as e:
         print(f"[mesh_grid] 补洞跳过: {e}")
