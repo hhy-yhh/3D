@@ -1614,3 +1614,81 @@ v19 修复了 CD 度量 + 三角汤，几何正确（CD 0.002）。但**观感�
    - 16384→30000：CD **-22%**（16384 截断过度）；30000→40000 只 -11%（**饱和**）；**60000 触发 spconv int32 溢出**（fp32 上限 ~40-60K）。
    - **数量是局部瓶颈，30-40K 即饱和**；fp16 突破 int32 无收益，不必上。
    - 建议 `--max_coords` 默认 30000~40000。剩余瓶颈（HD 0.098 / NC 0.44）来自重建层 + 结构 16³ + latent 误差，与数量无关。
+
+---
+
+## v22 mesh 后处理增量改进：降面 / 参数 CLI 化 (2026-09-07)
+
+### 动机
+
+- v21 已定论：几何正确（CD ~0.001-0.002），剩余「面多/观感」瓶颈在**重建层 + 结构 16³ + latent 误差**。
+- 治「面多 + 观感」的 **方案1（VAE 剪枝头微调，2026-09-06）已废弃**：评估时 decode 在测试集 **5/5 spconv int32 溢出**（`--max_coords 30000`；原版 VAE 同参数全部正常 → 溢出系微调补丁引起，剪枝头在稠密/带噪输入上改变了解码中间量）。
+- 转向**不动 decode、不重训**的 **mesh 输出层**改进。
+
+### 病灶量化（原版 VAE，评估实测）
+
+```
+[VAE L0] vertices=0            ← 首级层级为空（老问题）
+[VAE L1] vertices≈63,000       ┐ L2/L1 ≈ 6.3×（剪枝基本没生效）
+[VAE L2] vertices≈399,000      ┘ decode 出 ~40 万点（厚糊团）
+Poisson(depth=9) → f ≈ 1,050,000   ← 每条样本 ~105 万面
+```
+
+### 代码改动（本地 `D:\code\TRELLIS_linux\3D\lato_integration\`，需同步服务器）
+
+| 文件 | 改动 |
+|---|---|
+| `mesh_grid.py` | 新增 `fill_mesh_holes()`（trimesh 补洞，兼容新旧版：`max_hole_size` kwarg 不存在时降级）、`decimate_mesh()`（open3d quadric 降面，`target≥当前面数` 自动跳过、异常回退原 mesh） |
+| `evaluate_3d_metrics.py` | 新增 6 个 CLI 参数；`extract_mesh_from_output()` 加形参透传 `depth/crop/smooth`；`main` 在 `refine_lato` 之后、保存之前插 `补洞 → 降面`，作用于**最终** mesh |
+
+**新增 CLI 参数（默认 = 原行为，不加参数零影响）：**
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `--poisson_depth` | 9 | Poisson 八叉树深度（大=细节细 / 小=面少更光滑）|
+| `--poisson_crop` | 0.1 | 密度裁剪分位（低=少裁，保留薄孔/翅片）|
+| `--smooth_iters` | -1 | 平滑次数；-1=按模式默认（poisson 2 / grid 0）|
+| `--smooth_lambda` | 0.5 | Laplacian 平滑强度 |
+| `--target_faces` | 0 | >0 时把最终 mesh quadric 降面到目标面数 |
+| `--fill_holes` | False | 输出前 trimesh 补洞 |
+
+### 验证（单样本 `20250423_1800_838505`，原版 VAE）
+
+| 版本 | v | f | CD | HD | NC |
+|---|---|---|---|---|---|
+| A 基线（poisson） | ~534k | ~1,050,000 | 0.0016 | ~0.098 | 0.62 |
+| B `--target_faces 100000` | 51,013 | **100,000** | **0.0016（不变）** | ~0.098 | 0.62 |
+
+- 第 2 样本（`20250603_*`）对照：f ~110 万 → 10 万，CD 0.0006 不变。
+- `--fill_holes` 对 Poisson 近水密输出仅补 ~8 面 → 可忽略，全量可不加。
+- 降面 10×，CD/HD/NC 完全不变 → **几何无损**。
+
+### 结论 / 局限
+
+| 目标 | 结果 |
+|---|---|
+| ✅ 面数可控（~105 万 → 10 万，几何无损）| 达成 |
+| ❌ **观感**（纸糊/粗糙/坑洼）| **不解决** —— 根因在 decode 层（L0=0 + ~40 万糊团点云），mesh 后处理摸不到；Poisson 只能把糊团蒙成纸 |
+
+**结论：改进1 是「面数/资源」层面，不是「观感」层面。** 观感若要提升需动 decode 层（方案1 已证伪）或重建去噪或数据层（见 v20/v21）。
+
+### 用法示例
+
+```bash
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" --slat_ckpt "$SLAT_CKPT" \
+    --slat_stats /data/huanghaoyang/3D/database_lato/lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata /data/huanghaoyang/3D/database_lato/test/metadata.csv \
+    --gt_meshes /data/huanghaoyang/3D/database_lato/meshes \
+    --output_dir outputs/eval_decim_full --mesh_mode poisson \
+    --target_faces 100000 \
+    --ss_threshold 2.0 --max_coords 30000 --save_meshes
+```
+
+### 待办 / 可选
+
+- 观感试验（进行中，零代码）：`--smooth_iters 10~15` 拉高平滑抹高频糙感（代价：薄孔/翅片磨平，HD 可能升到 ~0.11-0.13）。
+- 若平滑仍不足 → Poisson 前点云去噪/法线平滑（约 ~30 行代码，未实现）。
+- 全量 21 条未跑（参数定稿后再跑，~70 分钟）。
