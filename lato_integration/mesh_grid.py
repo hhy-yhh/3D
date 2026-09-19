@@ -633,7 +633,14 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
                           process=False)
     out.merge_vertices()
     out.remove_unreferenced_vertices()
-    out.remove_degenerate_faces()
+    # remove_degenerate_faces 只有较新 trimesh 才有；旧版走 update_faces(nondegenerate_faces())
+    try:
+        out.remove_degenerate_faces()
+    except AttributeError:
+        try:
+            out.update_faces(out.nondegenerate_faces())
+        except Exception as e:
+            print(f"[mesh_grid] 去退化面跳过: {e}")
     trimesh.repair.fix_normals(out)
 
     if smooth_iters > 0:
