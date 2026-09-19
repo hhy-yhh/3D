@@ -174,7 +174,14 @@ def main():
                 mesh = trimesh.load(f, force="mesh", process=True) if not is_npz else None
 
         if mesh is None:
-            print("  [ERROR] 没有可输出的 mesh", file=sys.stderr)
+            # 点云输入 + --rebuild none：直接把点云导成 PLY，用来肉眼判断
+            # 「镂空的壁在不在点云里」——这决定了换重建方式有没有用。
+            if is_npz and mode == "none":
+                out_path = (os.path.join(out_dir, os.path.splitext(name)[0] + ".ply")
+                            if out_dir else a.out)
+                pc = trimesh.PointCloud(pts)
+                pc.export(out_path)
+                print(f"  → 已写出点云 {out_path}（{len(pts)} 点，直接用mesh查看器打开看镂空在不在）")
             continue
 
         # ── 可选：补洞 / 降面 ──
