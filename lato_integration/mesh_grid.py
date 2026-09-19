@@ -98,8 +98,6 @@ def build_mesh_from_poisson(vertex_coords_int, device, last_res=512,
     Returns:
         trimesh.Trimesh（顶点归一化到 [-0.5,0.5]），失败返回 None。
     """
-    import open3d as o3d
-    import trimesh
     import numpy as np
 
     N = vertex_coords_int.shape[0]
@@ -109,6 +107,42 @@ def build_mesh_from_poisson(vertex_coords_int, device, last_res=512,
 
     coords_np = vertex_coords_int.cpu().numpy().astype(np.float64)
     pts = coords_np / float(last_res) - 0.5  # 归一化到 [-0.5, 0.5]
+    return poisson_from_points(
+        pts, depth=depth, knn=knn, crop_density_quantile=crop_density_quantile,
+        smooth_iterations=smooth_iterations, smooth_lambda=smooth_lambda,
+    )
+
+
+def poisson_from_points(pts, depth=9, knn=30, crop_density_quantile=0.1,
+                        smooth_iterations=2, smooth_lambda=0.5):
+    """直接从归一化点云（[-0.5, 0.5]）做 Poisson 重建。
+
+    与 build_mesh_from_poisson 的区别：那个从 512³ 整数格点坐标出发，这个收现成点云。
+    用途：拿已有的 Poisson 输出 mesh 的顶点当点云，换个 depth 重新重建——
+    不用重跑整条生成管线（十几分钟 → 一分钟），专门用于调 depth 拿「原生少面」。
+
+    depth 与面数的关系（实测同一样本）：9 → 1.05M 面, 8 → ~260k, 7 → ~65k, 6 → ~16k
+    （GT 是 22,892 面）。降 depth 天然得到少面，且 Poisson 输出**恒为闭合流形**，
+    没有洞可补——这是比「先 119 万面再砍到 10 万再补洞」正确得多的路径。
+
+    Args:
+        pts: [N,3] 归一化点云。
+        depth: 八叉树深度（小 = 面少 = 更光滑）。GT 量级用 6~7。
+        knn: 法线估计近邻数。
+        crop_density_quantile: 密度裁剪分位（低=少裁，保留薄孔/翅片）。
+        smooth_iterations / smooth_lambda: 重建后 Laplacian 平滑。
+    Returns:
+        trimesh.Trimesh（已归一化），失败返回 None。
+    """
+    import open3d as o3d
+    import trimesh
+    import numpy as np
+
+    pts = np.asarray(pts, dtype=np.float64)
+    N = len(pts)
+    if N < 10:
+        print("[mesh_grid] 点云过少，跳过 Poisson")
+        return None
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)

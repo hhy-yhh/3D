@@ -6,20 +6,23 @@
 拿已经跑出来的 mesh 当输入，秒级迭代。
 
 用法:
-    # 单个文件：补前 → 补后 指标对比
+    # ① 推荐：别降面，用低 depth 让 Poisson 原生出少面（输出恒为闭合流形，没有洞）
+    #    用降面前的 Poisson 原样当输入，拿它的顶点重做一遍
+    python lato_integration/repair_mesh.py \
+        outputs/eval_crop0_raw/meshes/20250423_1800_838505.obj \
+        --out outputs/poisson_d7/20250423_1800_838505.obj --poisson_depth 7
+
+    # ② 补洞（输入 → 输出 指标对比）。注意大洞会被平面投影撕出射线，见 README 说明
     python lato_integration/repair_mesh.py \
         outputs/eval_decim_single/meshes/20250423_1800_838505.obj \
         --out outputs/repair_test/20250423_1800_838505.obj
 
-    # 整个目录（批量补洞 + 汇总对比）
+    # 整个目录（批量 + 汇总对比）
     python lato_integration/repair_mesh.py outputs/eval_decim_single/meshes/ \
         --out_dir outputs/repair_test/
 
-    # 补完再平滑（抹降面造成的粗糙；先看补洞效果就别加）
-    python lato_integration/repair_mesh.py in.obj --out out.obj --smooth_iters 3
-
     # 只补小洞，防大洞被硬填成平板
-    python lato_integration/repair_mesh.py in.obj --out out.obj --max_loop 500
+    python lato_integration/repair_mesh.py in.obj --out out.obj --max_loop 200
 
 配合诊断工具看批量对比:
     python lato_integration/diag_mesh.py outputs/repair_test/ --json outputs/repair_compare.json
@@ -61,6 +64,12 @@ def main():
                     help="补完后 Laplacian 平滑次数（0=不平滑，先看补洞效果就用 0）")
     ap.add_argument("--decimate", type=int, default=0,
                     help=">0 时补洞前先降面到该面数（注意：降面本身会造洞）")
+    ap.add_argument("--poisson_depth", type=int, default=0,
+                    help=">0 时先用 mesh 的顶点当点云重新做一遍 Poisson 重建（换 depth "
+                         "= 换原生面数，且输出恒为闭合流形、没有洞）。"
+                         "实测 depth: 9→1.05M面, 8→~260k, 7→~65k, 6→~16k（GT 22.9k）")
+    ap.add_argument("--poisson_crop", type=float, default=0.1,
+                    help="[--poisson_depth] 密度裁剪分位（低=少裁，保留薄孔/翅片）")
     a = ap.parse_args()
 
     if os.path.isdir(a.input):
@@ -92,18 +101,33 @@ def main():
 
         name = os.path.basename(f)
         print(f"\n{'=' * 70}\n{name}  v={len(mesh.vertices)} f={len(mesh.faces)}\n{'=' * 70}")
-        before = mesh_stats_from_mesh(mesh, f"{name}:补前")
+        before = mesh_stats_from_mesh(mesh, f"{name}:输入")
         before_stats.append(before)
-        print("[补前]" + fmt(before))
+        print("[输入]" + fmt(before))
+
+        # 换 depth 重做 Poisson：原生少面 + 恒为闭合流形，不用补洞
+        if a.poisson_depth > 0:
+            from lato_integration.mesh_grid import poisson_from_points
+            print(f"[mesh_grid] 用 {len(mesh.vertices)} 个顶点重做 Poisson, "
+                  f"depth={a.poisson_depth}")
+            re = poisson_from_points(
+                mesh.vertices, depth=a.poisson_depth,
+                crop_density_quantile=a.poisson_crop,
+                smooth_iterations=max(a.smooth_iters, 0),
+            )
+            if re is None or len(re.faces) == 0:
+                print("  [WARN] Poisson 重建失败，保留原 mesh")
+            else:
+                mesh = re
 
         if a.decimate > 0:
             mesh = decimate_mesh(mesh, a.decimate)
 
         mesh, stats = repair_holes(mesh, max_loop_len=a.max_loop, smooth_iters=a.smooth_iters)
 
-        after = mesh_stats_from_mesh(mesh, f"{name}:补后")
+        after = mesh_stats_from_mesh(mesh, f"{name}:输出")
         after_stats.append(after)
-        print("[补后]" + fmt(after))
+        print("[输出]" + fmt(after))
 
         out_path = (os.path.join(out_dir, name) if out_dir else a.out)
         mesh.export(out_path)
