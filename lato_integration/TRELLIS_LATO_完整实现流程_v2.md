@@ -1755,3 +1755,167 @@ python lato_integration/evaluate_3d_metrics.py \
 - grid：`outputs/eval_grid_raw/meshes/`
 - MC：`outputs/mc_test/{occ,dist}.obj`
 - GT：`/data/huanghaoyang/3D/database/20250423_1800_838505.stl`
+
+---
+
+## v25 补洞排查与根因定论 (2026-09-19)
+
+> 本节对应外部优先级清单（reduced faces 但仍**有洞** → repair holes 达成闭合体积，HIGH）。
+> 排查结论：**补洞这条路走通了，但它治的不是真正的病**；真正的病在更上游。
+
+### 1. 优先级清单对照
+
+| 清单条目 | 优先级 | 状态 |
+|---|---|---|
+| reduce faces/vertices（1M→100k） | — | ✅ 已达成（v22 降面，几何无损） |
+| …but still **holes present** | — | ✅ 已解决：`boundary_edges 6,660 → 0`、`holes 256 → 0` |
+| repair holes + interpolating adjacent surfaces → **closed volume** | **HIGH** | ✅ 代码达成，❌ **但治不了镂空丢失**（见下） |
+| **embedding operative range 模块** | **HIGH** | ❌ **未做** |
+| LoGeM workflow patentability | — | ❌ 未动（非代码工作） |
+| Current performance status / Next improvements / Update criticalities / Most promising approach | — | ✅ 本节 |
+
+### 2. 根因定论：两个「洞」是两件事
+
+原以为「有洞」是一个问题，实测是**两个根因完全不同的现象**：
+
+| 现象 | 根因 | 证据 |
+|---|---|---|
+| **A. 镂空/内部空腔丢失** | **Poisson 解指示函数 → 数学上必然封闭**（v24 已写，本节实测确认）。与降面无关，与 decode 无关 | dump 出的解码点云**镂空在**；Poisson 输出里**镂空不在** |
+| **B. 表面 256 个缝隙** | **降面**（1.19M → 100k）砍出来的 | Poisson 原样 `boundary_edges=0` → 降面后 `6,660` |
+
+**关键判定实验**（`--dump_coords` → 导出点云肉眼检查）：
+
+```
+[dump_coords] 解码顶点 399308 个 → outputs/coords/20250423_1800_838505.npz (last_res=512)
+python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在不在点云里
+```
+
+→ **点云里镂空是完整的**，是 Poisson 把它桥接封死了。
+
+**⚠️ 推翻一条旧推断**：`[VAE L0] vertices=0` 此前被当作「decode 失效、点云缺东西」的证据（v20/v22 多处引用），
+**实测不成立** —— L0=0 时点云仍保留镂空结构。此后不应再用 L0=0 单独判定 decode 好坏。
+
+### 3. 补洞实现（v25 代码）
+
+第一版（平面投影 + 耳切 + **移动环顶点到拟合平面**）效果差：补面是从原网格上长出的**射线束**。
+根因三条：① 移动原顶点 = 位移原有曲面；② 2291 顶点的**非平面**大洞强行拟合成**一个**平面；
+③ 投影后自交。
+
+**改为推进前沿补洞（Liepa 式）**，`mesh_grid._fill_loop_advancing`：
+
+- **顶点一个都不动**（只加面）——射线从算法结构上消除
+- 每次在候选三角形里挑**与相邻面二面角最小**的那个 → 补面顺着周围曲面走向，
+  这正是清单要求的 **"interpolating adjacent surfaces"**
+- 权重 = 方向项（与相邻面法线夹角）+ 面积项 + 形状项（惩罚细长三角形）
+- 纯 3D 就地三角化，不做 2D 投影 → 无投影自交
+
+配套修的两个 bug：
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | `out` 只用补面建，**原面全丢**（100,000 面 → 5,929 面） | `concat(原面, 补面)` + 安全阀（面数变少就回滚） |
+| 2 | 环路按**顶点**游走，非流形分叉处走进死路 → 非闭合路径 → 游离补片（components +12） | 改**有向边追踪**（沿面绕向 + 分叉点选转弯最小）+ 只接受真正闭合的环 |
+
+本地几何验证（纯 numpy，4/4 通过）：边界边**全部恰好覆盖 1 次、漏 0**；非平面洞（抛物面）同样通过；
+**顶点 `moved=False`**。
+
+### 4. 实测结果（样本 `20250423_1800_838505`）
+
+**补洞 v2（推进前沿）在降面产物上：**
+
+| 指标 | 输入 | 输出 | |
+|---|---|---|---|
+| **v** | 50,529 | **50,529** | ✅ 一个顶点都没动 → 无射线 |
+| **boundary_edges** | 6,660 | **0** | ✅ 闭合 |
+| **holes** | 256 | **0** | ✅ |
+| winding_ok | True | True | ✅ |
+| components | 107 | 110 | ✅（修复前 +12，现 +3） |
+| non_manifold_edges | 46 | 56 | 降面遗留，非补洞引入 |
+| dihedral_mean | 38.0° | 37.9° | ✅ 无回退 |
+| faces | 100,000 | 106,116 | +6,116 全是补面 |
+| volume | （开放网格，无效） | 0.0470 | 对照 Poisson 原样 0.0553，**少 15%**（共面极限的固有取向，见 v25 风险） |
+
+### 5. 各重建方式实测汇总（本轮新增数据）
+
+| 方式 | faces | components | non_manifold | dihedral | 保镂空 | 结论 |
+|---|---|---|---|---|---|---|
+| **Poisson d9** | 1,194,190 | 770 | 847 | 13.0° | ❌ **必填死** | 表面最好，拓扑最差 |
+| Poisson d7 | 76,925 | 72 | 71 | 16.6° | ❌ 填得更狠 | volume 0.0553→0.0520，更差 |
+| **voxel**（占据格点边界） | 1,327,776 | 1,864 | **12,537** | 26.9° | 理论 ✅ | **崩**：假设点云是实心体，实际 1.59% 填充、332 连通块 → 海绵；NC 0.4478 |
+| grid（v24） | 1,022,674 | 295,639 | 421,042 | 24.9° | — | 崩（v24） |
+| MC occ / dist（v24） | 88 / 2,341,692 | 2 / 586,983 | 0 / 444,604 | — | — | 塌 / 碎（v24） |
+| **ball / alpha** | — | — | — | — | **待验证** | v25 已实现，**未跑** |
+
+**GT 基线**：faces 22,892；euler **−6**（4 通孔）；dihedral 6.4°/15.4°。
+
+**euler 对照**（越接近 −6 说明拓扑越对）：GT −6 ｜ Poisson d9 **−1979** ｜ Poisson d7 −96 ｜ 降面+补洞 −2473。
+
+> `voxel` 模式的教训：它假设「占据格点是实心体」。本管线的 decode 输出只占 bbox 的 1.59%、
+> 碎成 332 块，是**散点**不是实体 → 「集合的边界」不是曲面而是海绵。
+> 该模式仅在真正体素化的输入（如 `ss_occupancy_128_v2`）上才有意义。
+
+### 6. Update initial criticalities（修正原先判断）
+
+| 原先判断 | 修正后 |
+|---|---|
+| 瓶颈在 decode 层（`L0=0` + 40 万糊团点云） | ❌ **点云里镂空完整**，瓶颈在**重建方式**；L0=0 不能单独作为 decode 失效的判据 |
+| 补洞是 HIGH，补上就达成「闭合且正确的体积」 | ⚠️ 补洞可达闭合并已验证，**但镂空在更上游已丢**，补洞无法还原 |
+| 降面是「洞」的唯一来源 | ⚠️ 只对**表面缝隙**成立；**镂空丢失与降面无关** |
+
+### 7. Current performance status
+
+| 指标 | 值 | 说明 |
+|---|---|---|
+| CD | 0.0019 ~ 0.0027 | 几何正确（v19 修复度量后） |
+| HD | 0.098 ~ 0.159 | 局部特征（薄孔/翅片）偏差 |
+| NC | 0.4478（voxel）/ 0.66（Poisson） | 法线一致性 |
+| faces | 1.19M（原样）→ 100k（降面）→ 106k（补洞后） | GT 22,892 |
+| boundary_edges / holes | 6,660 / 256 → **0 / 0** | ✅ 闭合达成 |
+| dihedral_mean | 37.9°（GT 6.4°） | ❌ **粗糙度未治**（降面造） |
+| 镂空 | ❌ 丢失 | 根因 Poisson |
+
+### 8. Next improvements
+
+1. **跑 ball / alpha**（代码就绪，秒级迭代）→ 验证能否保住镂空
+   ```bash
+   python lato_integration/repair_mesh.py outputs/coords/<sha>.npz \
+       --rebuild ball  --out outputs/rebuild_ball/<sha>.obj
+   python lato_integration/repair_mesh.py outputs/coords/<sha>.npz \
+       --rebuild alpha --out outputs/rebuild_alpha/<sha>.obj
+   ```
+   判读：**只看镂空在不在 + euler 是否往 −6 靠**；`boundary_edges` 不为 0 是正常的（ball/alpha 不保证闭合）。
+2. 若 ball/alpha 保住镂空 → 再叠 `--repair` 补残留缝隙（补洞已验证不伤特征，v 不动）
+3. 治粗糙度（清单里 "refine generated geometries" 那一半，目前**未动**）：`dihedral 37.9° vs GT 6.4°`
+4. **embedding operative range 模块**（清单另一条 HIGH，**未做**）
+
+### 9. Identify / confirm the most promising approach
+
+```
+最可行：换重建方式（ball / alpha）—— 点云里特征完整，只是被 Poisson 桥接封死
+        ↓ 若成立
+        再叠已完成且验证过的补洞（闭合）+ 平滑（治糙）
+
+已排除：Poisson 调参（depth 越低填得越狠）、voxel、grid、MC、降面后补洞（治不了镂空）
+
+仍存疑：ball/alpha 在 1.59% 填充率的散点云上是否会碎成多块（需实测）
+```
+
+### 10. v25 代码改动清单（本地 `D:\code\TRELLIS_linux\3D\lato_integration\`，需同步服务器）
+
+| 文件 | 改动 |
+|---|---|
+| `mesh_grid.py` | `boundary_loops` 改**有向边追踪**；新增 `_edge_to_face_normal`、`_fill_loop_advancing`（推进前沿补洞）、`build_mesh_from_voxel`、`build_mesh_from_points`（ball/alpha）、`poisson_from_points`、`repair_holes` 多轮迭代 |
+| `diag_mesh.py` | 拆出 `mesh_stats_from_mesh`（内存 mesh 直接算，免落盘）+ `quality_summary` 聚合 |
+| `evaluate_3d_metrics.py` | 新增 `--mesh_mode {ball,alpha,voxel}`、`--cavity`、`--min_component_voxels`、`--ball_radii`、`--alpha`、`--repair_holes`、`--repair_max_loop`、`--report_quality`、`--dump_coords`、`--dump_coords_only`；**后处理顺序改为「降面 → 补洞」**（补洞必须最后做） |
+| `inference_lato.py` | 同步上述参数 |
+| **`repair_mesh.py`（新增）** | 秒级迭代工具：吃 mesh / 点云 npz，任选 rebuild（poisson/ball/alpha）+ 补洞 + 降面，并打印前后客观指标 |
+
+> 新增参数**默认全关，不加参数行为与 v22/v24 完全一致**。
+
+### 11. 待办
+
+- [ ] ball / alpha 实测（代码就绪）
+- [ ] 治粗糙度（`dihedral` 37.9° → GT 6.4°）
+- [ ] **embedding operative range 模块**（HIGH）
+- [ ] 全量 21 条测试集跑（参数定稿后）
+- [ ] 补洞的共面极限导致 volume −15%：若观感凹陷，需让补面能外鼓（要往洞里加内部顶点，是另一种变体）

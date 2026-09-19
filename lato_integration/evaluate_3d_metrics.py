@@ -891,6 +891,13 @@ def main():
     print("评估结果")
     print("=" * 60)
 
+    if not results and opt.dump_coords_only:
+        print(f"\n  --dump_coords_only 已启用：只导出点云，跳过重建和指标计算（这是预期行为）。")
+        print(f"  产物: {opt.dump_coords}")
+        print(f"  下一步: python lato_integration/repair_mesh.py {opt.dump_coords} "
+              f"--out <输出.ply>   # 导出点云肉眼检查")
+        return
+
     if results:
         cd_vals = [r["chamfer_distance"] for r in results]
         hd_vals = [r["hausdorff_distance"] for r in results]

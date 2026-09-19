@@ -99,7 +99,11 @@ def main():
                     help="[alpha] α 值（绝对单位）。0=按平均最近邻距 × 3 自动推")
 
     ap.add_argument("--repair", action="store_true", default=False,
-                    help="重建后用邻接面插值补洞（默认关。大洞会被平面投影撕出射线，慎用）")
+                    help="重建后用邻接面插值补洞（默认关）")
+    ap.add_argument("--list_loops", action="store_true", default=False,
+                    help="只列出所有边界环（顶点数 / 质心 / bbox），不补洞。"
+                         "用来区分「表面缝隙」（小环，该补）和「镂空开口」（大环，该留），"
+                         "然后据此定 --max_loop 阈值")
     ap.add_argument("--max_loop", type=int, default=0,
                     help="[--repair] >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）")
     ap.add_argument("--smooth_iters", type=int, default=0,
@@ -182,6 +186,23 @@ def main():
                 pc = trimesh.PointCloud(pts)
                 pc.export(out_path)
                 print(f"  → 已写出点云 {out_path}（{len(pts)} 点，直接用mesh查看器打开看镂空在不在）")
+            continue
+
+        # ── 只列边界环（不补）：区分「表面缝隙」和「镂空开口」──
+        if a.list_loops:
+            from lato_integration.mesh_grid import boundary_loops
+            loops = sorted(boundary_loops(mesh), key=len, reverse=True)
+            print(f"\n  边界环 {len(loops)} 个（按顶点数从大到小）——"
+                  f"小环=表面缝隙（该补），大环=镂空开口（该留）：")
+            print(f"  {'#':>4}  {'顶点数':>8}  {'质心 x,y,z':>30}  {'bbox dx,dy,dz':>24}")
+            for i, lp in enumerate(loops):
+                p = np.asarray(mesh.vertices, dtype=np.float64)[lp]
+                c, sz = p.mean(axis=0), p.max(axis=0) - p.min(axis=0)
+                print(f"  {i:>4}  {len(lp):>8}  "
+                      f"[{c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f}]".rjust(30)
+                      + f"  [{sz[0]:.3f},{sz[1]:.3f},{sz[2]:.3f}]".rjust(24))
+            print(f"\n  下一步：--max_loop 取一个介于「小环」和「大环」之间的值，"
+                  f"补洞时就只补小环、放过镂空开口")
             continue
 
         # ── 可选：补洞 / 降面 ──
