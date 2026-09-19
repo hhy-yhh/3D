@@ -628,10 +628,12 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
         print(f"[mesh_grid] 补洞: 边界环 {stats['loops']} 个，全部超过 max_loop_len={max_loop_len} 未补")
         return mesh, stats
 
+    # 原面 + 补面拼回去。漏掉这一步就会把整个原网格丢掉，只剩补丁。
+    all_faces = np.concatenate([tri_all, np.asarray(new_faces, dtype=np.int64)], axis=0)
     out = trimesh.Trimesh(vertices=np.asarray(new_verts, dtype=np.float64),
-                          faces=np.asarray(new_faces, dtype=np.int64),
-                          process=False)
-    out.merge_vertices()
+                          faces=all_faces, process=False)
+    # 不调 merge_vertices：V/tri_all 进函数时已经 merge 过，补面又按索引引用原顶点，
+    # 再 merge 一次只会把几何重合但拓扑不同的顶点并掉，反而制造新的非流形边。
     out.remove_unreferenced_vertices()
     # remove_degenerate_faces 只有较新 trimesh 才有；旧版走 update_faces(nondegenerate_faces())
     try:
@@ -642,6 +644,12 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
         except Exception as e:
             print(f"[mesh_grid] 去退化面跳过: {e}")
     trimesh.repair.fix_normals(out)
+
+    # 安全阀：补洞只该加面，不该减面。少了说明面索引错位 → 宁可原样返回。
+    if len(out.faces) < len(mesh.faces):
+        print(f"[mesh_grid] ⚠️ 补洞后 {len(out.faces)} 面 < 原 {len(mesh.faces)} 面，"
+              f"索引错位 → 回退原 mesh")
+        return mesh, stats
 
     if smooth_iters > 0:
         try:
