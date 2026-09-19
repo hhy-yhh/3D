@@ -104,6 +104,11 @@ def main():
                     help="只列出所有边界环（顶点数 / 质心 / bbox），不补洞。"
                          "用来区分「表面缝隙」（小环，该补）和「镂空开口」（大环，该留），"
                          "然后据此定 --max_loop 阈值")
+    ap.add_argument("--dump_loops", default=None,
+                    help="把最大的几个边界环导成点云 PLY 到这个目录，用 CloudCompare 叠在"
+                         "原 mesh 上看它们落在哪——判断某个大环是「镂空开口」还是「表面缺口」")
+    ap.add_argument("--dump_loops_top", type=int, default=5,
+                    help="[--dump_loops] 导出最大的几个环（默认 5）")
     ap.add_argument("--max_loop", type=int, default=0,
                     help="[--repair] >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）")
     ap.add_argument("--smooth_iters", type=int, default=0,
@@ -124,7 +129,7 @@ def main():
     else:
         files = [a.input]
         out_dir = None
-        if a.out is None and not a.list_loops:
+        if a.out is None and not (a.list_loops or a.dump_loops):
             print("[ERROR] 单个文件输入需要 --out（或改用 --out_dir）", file=sys.stderr)
             sys.exit(1)
         if a.out:
@@ -204,6 +209,25 @@ def main():
                       + f"  [{sz[0]:.3f},{sz[1]:.3f},{sz[2]:.3f}]".rjust(24))
             print(f"\n  下一步：--max_loop 取一个介于「小环」和「大环」之间的值，"
                   f"补洞时就只补小环、放过镂空开口")
+            continue
+
+        # ── 导出边界环点云：叠在原 mesh 上看大环落在哪 ──
+        if a.dump_loops:
+            from lato_integration.mesh_grid import boundary_loops
+            loops = sorted(boundary_loops(mesh), key=len, reverse=True)
+            os.makedirs(a.dump_loops, exist_ok=True)
+            V = np.asarray(mesh.vertices, dtype=np.float64)
+            n = min(len(loops), a.dump_loops_top)
+            print(f"\n  边界环 {len(loops)} 个，导出最大的 {n} 个到 {a.dump_loops}/：")
+            for i, lp in enumerate(loops[:n]):
+                p = V[lp]
+                c, sz = p.mean(axis=0), p.max(axis=0) - p.min(axis=0)
+                fn = f"loop_{i:02d}_n{len(lp)}.ply"
+                trimesh.PointCloud(p).export(os.path.join(a.dump_loops, fn))
+                print(f"    {fn:26s} 质心[{c[0]:+.3f},{c[1]:+.3f},{c[2]:+.3f}]  "
+                      f"bbox[{sz[0]:.3f},{sz[1]:.3f},{sz[2]:.3f}]")
+            print(f"  → 用 CloudCompare 把 mesh + 这些 .ply 一起打开，"
+                  f"看环是绕在镂空边缘（该留）还是横在表面缺块上（该补）")
             continue
 
         # ── 可选：补洞 / 降面 ──
