@@ -451,37 +451,77 @@ def _fill_cavities(solid):
 
 
 def boundary_loops(mesh):
-    """找出所有边界环（只属于 1 个面的边串成的环）。
+    """找出所有边界环，**沿面的绕向做有向边追踪**，保证每个环都闭合。
+
+    为什么不用「按顶点度数走」：网格有非流形边时，边界图上会出现度数 >2 的分叉点，
+    按顶点游走会在分叉处走进死路，产出**非闭合的路径**。这种路径被当多边形填充后
+    是一个对不上边界的游离补丁（表现为 components 变多、non_manifold 变多）。
+
+    这里改成在**有向边**上走：每条边界边取「沿它所属面的绕向」的方向 u→v，
+    下一步必须从 v 出发；分叉点（v 有多个出边）选**转弯最小**的那条（最直，
+    贴着真实孔洞边界走）。因为每步都消耗一条有向边且只消耗一次，环必然闭合。
+
+    另一个好处：环的方向天然就是「沿面绕向」，所以补面只要**反着绕**，
+    合成后的网格绕向自动一致（见 repair_holes）。
 
     Returns:
-        list[list[int]]：每个环的顶点索引（首尾不重复）。
+        list[list[int]]：每个环的顶点索引（首尾不重复，方向沿面绕向）。
     """
     import numpy as np
 
     if mesh is None or len(mesh.faces) == 0:
         return []
-    edges = mesh.edges_sorted
-    u, c = np.unique(edges, axis=0, return_counts=True)
-    bnd = u[c == 1]
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+
+    edges = np.asarray(mesh.edges_sorted, dtype=np.int64)
+    uniq, cnt = np.unique(edges, axis=0, return_counts=True)
+    bnd = uniq[cnt == 1]
     if len(bnd) == 0:
         return []
+    bset = set((int(a), int(b)) for a, b in bnd)  # 已排序的 (小,大)
 
-    adj = {}
-    for a, b in bnd:
-        adj.setdefault(int(a), []).append(int(b))
-        adj.setdefault(int(b), []).append(int(a))
+    # 每条边界边的有向形式：沿它所属面的绕向
+    directed = set()
+    for a, b, c in faces:
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            if key in bset:
+                directed.add((int(u), int(v)))
 
-    loops, seen = [], set()
-    for start in list(adj):
-        if start in seen:
+    out_map = {}
+    for u, v in directed:
+        out_map.setdefault(u, []).append((u, v))
+
+    loops = []
+    unused = set(directed)
+    for start in directed:
+        if start not in unused:
             continue
-        loop, prev, cur = [], None, start
-        while cur is not None and cur not in seen:
-            seen.add(cur)
-            loop.append(cur)
-            nxt = [x for x in adj[cur] if x != prev]
-            prev, cur = cur, (nxt[0] if nxt else None)
-        if len(loop) >= 3:
+        loop, cur = [], start
+        while cur in unused:
+            unused.discard(cur)
+            loop.append(cur[0])
+            v = cur[1]
+            cands = [e for e in out_map.get(v, []) if e in unused]
+            if not cands:
+                break
+            if len(cands) == 1:
+                cur = cands[0]
+            else:
+                # 分叉点：选与来向夹角最小（最直）的那条
+                d_in = V[v] - V[cur[0]]
+                n1 = float(np.linalg.norm(d_in))
+                best, best_cos = None, -2.0
+                for e in cands:
+                    d = V[e[1]] - V[v]
+                    n2 = float(np.linalg.norm(d))
+                    cos = -1.0 if (n1 < 1e-12 or n2 < 1e-12) else float(d_in @ d / (n1 * n2))
+                    if cos > best_cos:
+                        best_cos, best = cos, e
+                cur = best
+        # 只有真正回到起点的环才算闭合
+        if len(loop) >= 3 and (loop[-1], loop[0]) in directed:
             loops.append(loop)
     return loops
 
@@ -534,34 +574,14 @@ def _earclip(poly):
     return tris
 
 
-def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
-    """邻接面插值补洞：对每个边界环用相邻面的法线拟合平面，再在平面上插值补面。
+def _fill_loops_once(mesh, loops, max_loop_len=0):
+    """对给定的边界环做一轮邻接面插值填充，返回新的 Trimesh（原面 + 补面）。
 
-    与 trimesh.repair.fill_holes 的区别：后者用环的质心做扇形填充（不管相邻面的
-    走向），这里用**相邻面的面积加权法线**决定补面所在平面，环顶点先投影到该平面
-    再耳切三角化，补出来的面延续周围曲面的走向，不产生尖刺。
-
-    Args:
-        mesh: trimesh.Trimesh。
-        max_loop_len: >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）。
-        smooth_iters: 补完后对补出的顶点做几次 Laplacian 平滑（0=不做）。
-    Returns:
-        (mesh, stats dict)
+    补面的绕向与环的绕向**相反**：环是沿「所属面的绕向」走的，共享边要在两个面里
+    方向相反，合成后的网格绕向才一致（不然 winding_ok 会从 True 掉成 False）。
     """
     import numpy as np
     import trimesh
-
-    stats = {"loops": 0, "filled": 0, "skipped": 0, "added_faces": 0}
-    if mesh is None or len(mesh.faces) == 0:
-        return mesh, stats
-
-    mesh = mesh.copy()
-    mesh.merge_vertices()
-    loops = boundary_loops(mesh)
-    stats["loops"] = len(loops)
-    if not loops:
-        print("[mesh_grid] 补洞: 无边界环（已闭合）")
-        return mesh, stats
 
     fnorm = np.asarray(mesh.face_normals, dtype=np.float64)
     farea = np.asarray(mesh.area_faces, dtype=np.float64)
@@ -581,9 +601,10 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
 
     new_verts = list(V)
     new_faces = []
+    filled = skipped = 0
     for loop in loops:
         if max_loop_len and len(loop) > max_loop_len:
-            stats["skipped"] += 1
+            skipped += 1
             continue
         pts = V[loop]
         n = vnorm[loop].mean(axis=0)
@@ -596,9 +617,8 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
             n = n / ln
         c = pts.mean(axis=0)
 
-        # 环顶点投影到拟合平面
-        d = ((pts - c) @ n)[:, None]
-        proj = pts - d * n
+        # 环顶点投影到拟合平面（补面才会延续相邻曲面的走向）
+        proj = pts - (((pts - c) @ n)[:, None]) * n
 
         # 平面内 2D 基
         a = np.array([1.0, 0.0, 0.0])
@@ -613,22 +633,18 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
             # 耳切失败（非简单环）→ 用「投影到拟合平面的质心」扇形填充
             center_idx = len(new_verts)
             new_verts.append(c)
-            tris_abs = [(loop[i], loop[(i + 1) % len(loop)], center_idx)
+            tris_abs = [(loop[(i + 1) % len(loop)], loop[i], center_idx)
                         for i in range(len(loop))]
         else:
-            # 环顶点投影到拟合平面，补面才会延续相邻曲面的走向
             for i, vi in enumerate(loop):
                 new_verts[vi] = proj[i]
-            tris_abs = [(loop[i], loop[j], loop[k]) for (i, j, k) in tris]
-
+            tris_abs = [(loop[k], loop[j], loop[i]) for (i, j, k) in tris]
         new_faces.extend(tris_abs)
-        stats["filled"] += 1
+        filled += 1
 
     if not new_faces:
-        print(f"[mesh_grid] 补洞: 边界环 {stats['loops']} 个，全部超过 max_loop_len={max_loop_len} 未补")
-        return mesh, stats
+        return None, filled, skipped
 
-    # 原面 + 补面拼回去。漏掉这一步就会把整个原网格丢掉，只剩补丁。
     all_faces = np.concatenate([tri_all, np.asarray(new_faces, dtype=np.int64)], axis=0)
     out = trimesh.Trimesh(vertices=np.asarray(new_verts, dtype=np.float64),
                           faces=all_faces, process=False)
@@ -643,25 +659,81 @@ def repair_holes(mesh, max_loop_len=0, smooth_iters=0):
             out.update_faces(out.nondegenerate_faces())
         except Exception as e:
             print(f"[mesh_grid] 去退化面跳过: {e}")
-    trimesh.repair.fix_normals(out)
+    return out, filled, skipped
 
-    # 安全阀：补洞只该加面，不该减面。少了说明面索引错位 → 宁可原样返回。
-    if len(out.faces) < len(mesh.faces):
-        print(f"[mesh_grid] ⚠️ 补洞后 {len(out.faces)} 面 < 原 {len(mesh.faces)} 面，"
-              f"索引错位 → 回退原 mesh")
+
+def repair_holes(mesh, max_loop_len=0, smooth_iters=0, max_passes=3):
+    """邻接面插值补洞：对每个边界环用相邻面的法线拟合平面，再在平面上插值补面。
+
+    与 trimesh.repair.fill_holes 的区别：后者用环的质心做扇形填充（不管相邻面的
+    走向），这里用**相邻面的面积加权法线**决定补面所在平面，环顶点先投影到该平面
+    再耳切三角化，补出来的面延续周围曲面的走向，不产生尖刺。
+
+    多轮迭代：一轮补完后非流形分叉点常被邻接的补面消解，边界会重新串成干净的环，
+    所以补完重算边界再补，直到没有边界环 / 补不动 / 达到 max_passes。
+
+    Args:
+        mesh: trimesh.Trimesh。
+        max_loop_len: >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）。
+        smooth_iters: 补完后 Laplacian 平滑次数（0=不做）。
+        max_passes: 最多补几轮。
+    Returns:
+        (mesh, stats dict)
+    """
+    import numpy as np
+    import trimesh
+
+    stats = {"loops": 0, "filled": 0, "skipped": 0, "added_faces": 0, "passes": 0}
+    if mesh is None or len(mesh.faces) == 0:
         return mesh, stats
+
+    cur = mesh.copy()
+    cur.merge_vertices()
+    base_faces = len(cur.faces)
+
+    for p in range(max_passes):
+        loops = boundary_loops(cur)
+        stats["loops"] += len(loops)
+        if not loops:
+            break
+        nxt, filled, skipped = _fill_loops_once(cur, loops, max_loop_len)
+        stats["filled"] += filled
+        stats["skipped"] += skipped
+        stats["passes"] = p + 1
+        if nxt is None:
+            break
+        # 安全阀：补洞只该加面，不该减面。少了说明面索引错位 → 宁可停手。
+        if len(nxt.faces) <= len(cur.faces):
+            if len(nxt.faces) < len(cur.faces):
+                print("[mesh_grid] ⚠️ 补洞后反而少面，疑似索引错位 → 停手")
+            break
+        cur = nxt
+        if cur.is_watertight:
+            break
+
+    if cur is mesh or len(cur.faces) <= base_faces:
+        print(f"[mesh_grid] 补洞: 边界环 {stats['loops']} 个，未产生有效补面")
+        return mesh, stats
+
+    # 绕向只在真的不一致时才修（补面已按相反绕向生成，通常本来就一致；
+    # 无条件 fix_normals 会在非水密网格上把整块补丁翻转，反而破坏 winding）
+    if not cur.is_winding_consistent:
+        print("[mesh_grid] 补洞后绕向不一致 → fix_normals 修正")
+        trimesh.repair.fix_normals(cur)
 
     if smooth_iters > 0:
         try:
             from trimesh.smoothing import filter_laplacian
-            filter_laplacian(out, iterations=smooth_iters, lamb=0.5)
+            filter_laplacian(cur, iterations=smooth_iters, lamb=0.5)
         except Exception as e:
             print(f"[mesh_grid] 补洞平滑跳过: {e}")
 
-    stats["added_faces"] = len(out.faces) - len(mesh.faces)
-    print(f"[mesh_grid] 补洞: 环 {stats['loops']} 个（补 {stats['filled']} / 跳过 {stats['skipped']}），"
-          f"新增 {stats['added_faces']} 面 → watertight={out.is_watertight}")
-    return out, stats
+    stats["added_faces"] = len(cur.faces) - base_faces
+    print(f"[mesh_grid] 补洞: {stats['passes']} 轮, 边界环 {stats['loops']} 个"
+          f"（补 {stats['filled']} / 跳过 {stats['skipped']}），"
+          f"新增 {stats['added_faces']} 面 → watertight={cur.is_watertight} "
+          f"winding_ok={cur.is_winding_consistent}")
+    return cur, stats
 
 
 def decimate_mesh(mesh, target_faces):
