@@ -1692,3 +1692,66 @@ python lato_integration/evaluate_3d_metrics.py \
 - 观感试验（进行中，零代码）：`--smooth_iters 10~15` 拉高平滑抹高频糙感（代价：薄孔/翅片磨平，HD 可能升到 ~0.11-0.13）。
 - 若平滑仍不足 → Poisson 前点云去噪/法线平滑（约 ~30 行代码，未实现）。
 - 全量 21 条未跑（参数定稿后再跑，~70 分钟）。
+
+---
+
+## v24 重建路径专项排查：Poisson / grid / MC 全测 + 洞与糙的客观归因 (2026-09-10)
+
+### 背景
+
+用户反馈：生成 mesh **孔洞较多 + 表面粗糙**，且 **内部通孔/空腔被填充**（外部无洞但内部细节丢失）。
+先用客观指标诊断，再逐一试替代重建方式。
+
+### 新增诊断工具
+
+| 文件 | 作用 |
+|---|---|
+| `lato_integration/diag_mesh.py` | 网格客观诊断：`boundary_edges`（洞的边）/ `holes` + `largest_loops` / `components`（碎块）/ `non_manifold_edges` / `dihedral_deg`（相邻面二面角=粗糙度）/ `edge_len`。支持文件/目录/glob，可 `--json` 累加对比 |
+| `lato_integration/try_mc.py` | 独立 marching cubes 试验：`--mode occ`（occupancy→高斯→MC）/ `--mode dist`（点云→EDT→MC）；输入网格采样点云或 npz 点云 |
+
+**重要更正**：之前"`--fill_holes` 只补 8 面 ⇒ 无洞"的推断**错误**——trimesh 补不动大洞，不代表没有洞。GT 在 `/data/huanghaoyang/3D/database/<sha>.stl`（test CSV 的 `file_path` 列），**不在** `database_lato/meshes/`。
+
+### 客观数据（样本 `20250423_1800_838505`）
+
+| 网格 | faces | holes | boundary | components | non_manifold | dihedral mean/p90 | volume |
+|---|---|---|---|---|---|---|---|
+| **GT** | 22,892 | 0 | 0 | 1 | 0 | **6.4 / 15.4** | 2.33e6 (mm, euler=−6≈4 通孔) |
+| **Poisson 原样**（crop=0，**不降面**）| 1,194,190 | **0** | **0** | 770 | 847 | **13.0 / 30.4** | 0.0553 |
+| **降面版**（crop0.1 + `--target_faces 100000`）| 100,000 | **256** | 6,660 | 107 | 46 | **38.0 / 82.2** | 0.0600 |
+| grid 模式 | 1,022,674 | 16,102 | 97,131 | **295,639** | 421,042 | 24.9 / 90.0 | 0.0015 |
+| MC `occ` | 88 | 0 | 0 | 2 | 0 | 31.4 / 70.9 | ≈0（塌成小角）|
+| MC `dist` | 2,341,692 | 1,328 | 2,986 | **586,983** | 444,604 | 17.8 / 44.2 | 0.0185 |
+
+### 结论（含对 v22 的修正）
+
+1. **"洞"是后处理造出来的，不是生成缺陷**：Poisson 原样 `holes=0`；加 crop0.1 **且**降面到 10 万后 → `holes=256`。**降面（119 万→10 万，12×）是主嫌**，crop 为次嫌（两变量未隔离，需 `--poisson_crop 0.1 --target_faces 0` 判定）。
+2. **降面把粗糙度放大 3 倍**：dihedral 13.0°→38.0°（GT 6.4°）。**v22 的 `--target_faces 100000` 实际让网格更差**（洞↑、糙↑），此为修正。
+3. **Poisson 本质会填死内部通孔/空腔**：它解指示函数 → 必然封闭，外部无洞是"封死了"而非"做对了"；内部结构丢失无法靠调参解决。
+4. **原样 Poisson 另有 770 碎块 + 847 非流形边**（需去小块 + 拓扑修复）。
+5. **正确目标面数**：GT 仅 22,892 面 —— 应是"低分辨率原生少面"，而非"高分辨率暴力降面"。
+
+### 重建方式全测结果
+
+| 方式 | 保内部通孔 | 洞 | 连通性 | 结论 |
+|---|---|---|---|---|
+| **Poisson**（现用）| ❌ 必填死 | 0（假象）| 尚可（770 碎块）| 内部结构丢失 |
+| **grid**（格点+ConnectionHead）| 理论✅ | 极少四边形闭合 | ❌ 碎成 29.5 万块 | **崩，不可用** |
+| **MC `occ`** | ❌ 填死 | 0 | 塌成 88 面 | **崩** |
+| **MC `dist`** | 理论✅ | 1,328 | ❌ 碎成 58.7 万球 | **崩** |
+
+**MC 不适用于稀疏点云输入**（需稠密连续带符号隐式场；两种造场法一塌一碎）。**三条重建路都不满足"保内部结构 + 连通 + 不糙"。**
+
+### 下一步（未实现）
+
+- **Ball Pivoting**（首选）：直接从点连三角面、不填补空间 → 保内部通孔/凹腔，不碎成球。拟加 `--mesh_mode ball` + `--ball_radii`（`mesh_grid.py` 加 `build_mesh_from_ball`，~40 行，默认关闭）。
+- **Alpha Shape**（备选，`--alpha` 可调）——与 ball A/B 对比。
+- 若 ball 仍不能保住内部结构 ⇒ 说明**解码点云本身不含内部面点** → 回到 decode 层（需先 `--dump_coords` 验证点云层厚/内部点数）。
+
+### 产物路径
+
+- 诊断工具：`lato_integration/diag_mesh.py`、`lato_integration/try_mc.py`
+- Poisson 原样（crop=0）：`outputs/eval_crop0_raw/meshes/`
+- 降面版：`outputs/eval_decim_single/meshes/`
+- grid：`outputs/eval_grid_raw/meshes/`
+- MC：`outputs/mc_test/{occ,dist}.obj`
+- GT：`/data/huanghaoyang/3D/database/20250423_1800_838505.stl`

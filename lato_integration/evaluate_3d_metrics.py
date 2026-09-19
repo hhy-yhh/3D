@@ -395,14 +395,19 @@ def load_pipeline(opt, device):
 def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
                              edge_threshold=0.45, k_neighbors=32, mesh_mode="grid",
                              poisson_depth=9, poisson_crop=0.1,
-                             smooth_iters=None, smooth_lambda=0.5):
+                             smooth_iters=None, smooth_lambda=0.5,
+                             cavity="keep", min_component_voxels=0):
     """从 pipeline.run() 输出提取 trimesh 对象。
 
     mesh_mode:
+      - "voxel": 占据格点边界提取 → 闭合体积，且 cavity="keep" 时保住内部通孔/空腔。
+      - "poisson": open3d 光滑重建（观感最好，但必然填死内部结构）。
       - "grid": 格点 6-邻域连边 + 四边形化（LATO 拓扑，出完整面）。
                 失败/过稀时自动回退 KDTree。
       - "knn":  原 KDTree 32 近邻 + 公共邻居三角枚举。
-    smooth_iters: 覆盖平滑次数；None/-1 时按模式默认（poisson=2, grid=0）。
+    smooth_iters: 覆盖平滑次数；None/-1 时按模式默认（poisson=2, grid/voxel=0）。
+    cavity: 仅 voxel 模式。"keep"=保内部空腔；"fill"=填实（等价 Poisson 行为）。
+    min_component_voxels: 仅 voxel 模式，>0 时丢掉小于该体素数的连通碎块。
     """
     from lato_integration.inference_lato import predict_edges_batched, edges_to_mesh
 
@@ -424,6 +429,20 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
 
     if vertex_coords_int.numel() == 0:
         return None
+
+    # ── voxel 模式：占据格点边界提取（闭合体积 + 保内部空腔）──
+    if mesh_mode == "voxel":
+        from lato_integration.mesh_grid import build_mesh_from_voxel
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        _smooth = smooth_iters if (smooth_iters is not None and smooth_iters >= 0) else 0
+        mesh = build_mesh_from_voxel(
+            vertex_coords_int, last_res=last_res, cavity=cavity,
+            min_component_voxels=min_component_voxels,
+            smooth_iterations=_smooth, smooth_lambda=smooth_lambda,
+        )
+        if mesh is not None and len(mesh.faces) > 100:
+            return mesh
+        print(f"  [WARN] 体素边界提取失败/过稀 (f={len(mesh.faces) if mesh is not None else 0})，回退 grid/knn")
 
     # ── poisson 模式：open3d 光滑重建（观感最好）──
     if mesh_mode == "poisson":
@@ -520,21 +539,35 @@ def main():
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--mesh_mode", type=str, default="grid",
-                        choices=["grid", "knn", "poisson"],
+                        choices=["grid", "knn", "poisson", "voxel"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
-                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好）")
+                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好），"
+                             "voxel=占据格点边界提取（闭合体积 + 保内部空腔）")
     parser.add_argument("--poisson_depth", type=int, default=9,
-                        help="Poisson 重建八叉树深度（大=细节细，小=更光滑面少）")
+                        help="Poisson 重建八叉树深度（大=细节细，小=更光滑面少）。"
+                             "想「原生少面」而不靠降面，用 6~7：面数约 4^Δdepth 缩放")
     parser.add_argument("--poisson_crop", type=float, default=0.1,
                         help="Poisson 密度裁剪分位（低=少裁剪，保留薄孔/翅片）")
+    parser.add_argument("--cavity", type=str, default="keep", choices=["keep", "fill"],
+                        help="[voxel] keep=保留内部通孔/空腔（默认）；"
+                             "fill=填实空腔只留外表面（等价 Poisson 的封闭行为）")
+    parser.add_argument("--min_component_voxels", type=int, default=0,
+                        help="[voxel] >0 时丢掉小于该体素数的连通碎块（去散块）")
     parser.add_argument("--smooth_iters", type=int, default=-1,
-                        help="Laplacian 平滑次数；-1=按模式默认(poisson=2, grid=0)")
+                        help="Laplacian 平滑次数；-1=按模式默认(poisson=2, grid/voxel=0)")
     parser.add_argument("--smooth_lambda", type=float, default=0.5,
                         help="Laplacian 平滑强度")
     parser.add_argument("--target_faces", type=int, default=0,
                         help=">0 时把最终 mesh quadric 降面到目标面数（0=不降）")
     parser.add_argument("--fill_holes", action="store_true", default=False,
-                        help="输出前用 trimesh 填补孔洞")
+                        help="输出前用 trimesh 简单补洞（弱，建议改用 --repair_holes）")
+    parser.add_argument("--repair_holes", action="store_true", default=False,
+                        help="输出前用邻接面法线拟合 + 耳切插值补洞（P1：达成闭合体积）")
+    parser.add_argument("--repair_max_loop", type=int, default=0,
+                        help="[--repair_holes] >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）")
+    parser.add_argument("--report_quality", action="store_true", default=False,
+                        help="对每条样本算洞/边界边/碎块/二面角，汇总进 summary.json。"
+                             "若开了补洞/降面，会额外记一份后处理前的质量用于对照")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制评估条数（0=全部）")
     parser.add_argument("--save_meshes", action="store_true", default=False,
@@ -589,6 +622,8 @@ def main():
     # ── 逐条推理 + 评估 ──
     results = []
     failures = []
+    quality_stats = []        # 最终输出 mesh 的质量（洞/边界/碎块/二面角）
+    pre_quality_stats = []    # 后处理（降面/补洞）之前的质量，用于对照
     captions_col = "captions" if "captions" in test_samples[0] else None
 
     print("\n" + "=" * 60)
@@ -697,6 +732,8 @@ def main():
                 poisson_depth=opt.poisson_depth, poisson_crop=opt.poisson_crop,
                 smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
                 smooth_lambda=opt.smooth_lambda,
+                cavity=opt.cavity,
+                min_component_voxels=opt.min_component_voxels,
             )
 
             # 清理 VAE decode 中间张量
@@ -729,13 +766,37 @@ def main():
                 else:
                     print("  [WARN] --refine_lato 已开启但未加载 voxel_encoder/vae，跳过精化")
 
-            # ── 后处理（可选，作用于最终 mesh）：补洞 → 目标面数降面 ──
-            if pred_mesh is not None and opt.fill_holes:
-                from lato_integration.mesh_grid import fill_mesh_holes
-                pred_mesh = fill_mesh_holes(pred_mesh)
+            # ── 后处理（可选，作用于最终 mesh）：降面 → 补洞 ──
+            # 顺序很关键：先降面再补洞，补洞才是最后一步，才能保证输出闭合。
+            # （v24 实测：先 Poisson 后降面 → 水密输出被砍出 256 个洞）
+            _pre_quality = None
+            if opt.report_quality and (opt.target_faces > 0 or opt.repair_holes or opt.fill_holes):
+                from lato_integration.diag_mesh import mesh_stats_from_mesh
+                _pre_quality = mesh_stats_from_mesh(pred_mesh, f"{sha}:pre")
+
             if pred_mesh is not None and opt.target_faces > 0:
                 from lato_integration.mesh_grid import decimate_mesh
                 pred_mesh = decimate_mesh(pred_mesh, opt.target_faces)
+            if pred_mesh is not None and opt.fill_holes:
+                from lato_integration.mesh_grid import fill_mesh_holes
+                pred_mesh = fill_mesh_holes(pred_mesh)
+            if pred_mesh is not None and opt.repair_holes:
+                from lato_integration.mesh_grid import repair_holes
+                pred_mesh, _ = repair_holes(pred_mesh, max_loop_len=opt.repair_max_loop)
+
+            # ── 质量指标（洞/边界边/碎块/二面角）──
+            _quality = None
+            if opt.report_quality and pred_mesh is not None:
+                from lato_integration.diag_mesh import mesh_stats_from_mesh
+                _quality = mesh_stats_from_mesh(pred_mesh, sha)
+                if "error" not in _quality:
+                    print(f"  [质量] watertight={_quality['watertight']} "
+                          f"holes={_quality['holes']} boundary={_quality['boundary_edges']} "
+                          f"components={_quality['components']} "
+                          f"dihedral_mean={_quality['dihedral_mean']:.1f}°")
+                quality_stats.append(_quality)
+                if _pre_quality is not None:
+                    pre_quality_stats.append(_pre_quality)
 
             # 保存生成 mesh
             if opt.save_meshes:
@@ -762,6 +823,8 @@ def main():
                 "num_vertices": len(pred_mesh.vertices),
                 "num_faces": len(pred_mesh.faces),
                 **metrics,
+                **({"quality": _quality} if _quality is not None else {}),
+                **({"quality_pre_postprocess": _pre_quality} if _pre_quality is not None else {}),
             })
             print(f"    v={len(pred_mesh.vertices)} f={len(pred_mesh.faces)} CD={metrics['chamfer_distance']:.4f}")
 
@@ -804,6 +867,25 @@ def main():
                 "median": float(np.median(nc_vals)),
             },
         }
+
+        # ── 质量汇总（洞/边界边/碎块/二面角）──
+        if quality_stats:
+            from lato_integration.diag_mesh import quality_summary
+            summary["quality"] = quality_summary(quality_stats)
+            q = summary["quality"]
+            print(f"\n  质量 (mesh 客观指标):")
+            print(f"    watertight={q['watertight_rate'] * 100:.0f}%  "
+                  f"holes mean={q['holes']['mean']:.1f} max={q['holes']['max']:.0f}  "
+                  f"boundary_edges mean={q['boundary_edges']['mean']:.0f}")
+            print(f"    components mean={q['components']['mean']:.1f}  "
+                  f"non_manifold mean={q['non_manifold_edges']['mean']:.0f}  "
+                  f"dihedral mean={q['dihedral_mean']['mean']:.1f}° p90={q['dihedral_p90']['mean']:.1f}°")
+            if pre_quality_stats:
+                pre = quality_summary(pre_quality_stats)
+                summary["quality_pre_postprocess"] = pre
+                print(f"    后处理前对照: watertight={pre['watertight_rate'] * 100:.0f}%  "
+                      f"holes mean={pre['holes']['mean']:.1f}  "
+                      f"dihedral mean={pre['dihedral_mean']['mean']:.1f}°")
 
         print(f"\n  成功: {summary['num_success']}, 失败: {summary['num_failures']}")
         print(f"\n  Chamfer Distance (↓):")

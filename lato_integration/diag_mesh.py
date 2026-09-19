@@ -61,6 +61,22 @@ def mesh_stats(path):
         return {"file": path, "error": f"load failed: {e}"}
     if m is None or len(getattr(m, "faces", [])) == 0:
         return {"file": path, "error": "empty mesh"}
+    return mesh_stats_from_mesh(m, path)
+
+
+def mesh_stats_from_mesh(m, name="<in-memory>"):
+    """对内存中的 trimesh 算同一套指标（评估主流程直接调用，免落盘）。
+
+    Args:
+        m: trimesh.Trimesh。
+        name: 结果里的标识（文件路径或样本 sha）。
+    Returns:
+        dict，键与 mesh_stats 一致；失败时含 "error"。
+    """
+    path = name
+    if m is None or len(getattr(m, "faces", [])) == 0:
+        return {"file": path, "error": "empty mesh"}
+    m = m.copy()  # merge_vertices 会就地改，不能污染调用方的 mesh
     try:
         m.merge_vertices()
     except Exception:
@@ -139,6 +155,30 @@ def fmt(r):
         f"  edge_len: mean={r['edge_len_mean']:.4f} std={r['edge_len_std']:.4f}\n"
         f"  volume={r['volume']:.4f} bounds={r['bounds']}"
     )
+
+
+QUALITY_KEYS = ("holes", "boundary_edges", "non_manifold_edges", "components",
+                "dihedral_mean", "dihedral_p90")
+
+
+def quality_summary(stats_list):
+    """把逐样本的 mesh_stats 结果聚合成可直接写进 summary.json 的字典。
+
+    Args:
+        stats_list: list[dict]，mesh_stats / mesh_stats_from_mesh 的输出（含 error 项会被跳过）。
+    Returns:
+        dict：watertight_rate + 每个指标的 mean/min/max/median。全失败时返回 {}。
+    """
+    ok = [s for s in stats_list if s and "error" not in s]
+    if not ok:
+        return {}
+    out = {"num_evaluated": len(ok),
+           "watertight_rate": float(np.mean([bool(s["watertight"]) for s in ok]))}
+    for k in QUALITY_KEYS:
+        v = np.array([s[k] for s in ok], dtype=float)
+        out[k] = {"mean": float(v.mean()), "min": float(v.min()),
+                  "max": float(v.max()), "median": float(np.median(v))}
+    return out
 
 
 def main():

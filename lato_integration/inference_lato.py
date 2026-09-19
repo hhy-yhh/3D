@@ -433,9 +433,21 @@ def main():
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--mesh_mode", type=str, default="grid",
-                        choices=["grid", "knn", "poisson"],
+                        choices=["grid", "knn", "poisson", "voxel"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
-                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好）")
+                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好），"
+                             "voxel=占据格点边界提取（闭合体积 + 保内部空腔）")
+    parser.add_argument("--cavity", type=str, default="keep", choices=["keep", "fill"],
+                        help="[voxel] keep=保留内部通孔/空腔（默认）；"
+                             "fill=填实空腔只留外表面（等价 Poisson 的封闭行为）")
+    parser.add_argument("--min_component_voxels", type=int, default=0,
+                        help="[voxel] >0 时丢掉小于该体素数的连通碎块（去散块）")
+    parser.add_argument("--repair_holes", action="store_true", default=False,
+                        help="输出前用邻接面法线拟合 + 耳切插值补洞（P1：达成闭合体积）")
+    parser.add_argument("--repair_max_loop", type=int, default=0,
+                        help="[--repair_holes] >0 时只补顶点数 ≤ 该值的环（防大洞被硬填成平板）")
+    parser.add_argument("--target_faces", type=int, default=0,
+                        help=">0 时把最终 mesh quadric 降面到目标面数（0=不降）")
 
     # ── 设备 & 精度 ──
     parser.add_argument("--device", type=str, default="cuda")
@@ -788,9 +800,23 @@ def main():
     print(f"  顶点数: {len(vertex_coords_3d)}")
     print(f"  特征维度: {vertex_feats.shape[-1]}")
 
-    # ── 建 mesh：poisson（光滑重建）→ grid（格点四边形化）→ knn（KDTree 三角汤）──
+    # ── 建 mesh：voxel（闭合体积）→ poisson（光滑重建）→ grid（四边形化）→ knn ──
     mesh = None
-    if opt.mesh_mode == "poisson":
+    if opt.mesh_mode == "voxel":
+        from lato_integration.mesh_grid import build_mesh_from_voxel
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        mesh = build_mesh_from_voxel(
+            vertex_coords_int, last_res=last_res, cavity=opt.cavity,
+            min_component_voxels=opt.min_component_voxels,
+        )
+        if mesh is not None and len(mesh.faces) > 100:
+            print(f"  体素边界重建完成: v={len(mesh.vertices)} f={len(mesh.faces)} "
+                  f"watertight={mesh.is_watertight}")
+        else:
+            print(f"  [WARN] 体素边界提取失败/过稀，回退 grid/knn")
+            mesh = None
+
+    if mesh is None and opt.mesh_mode == "poisson":
         from lato_integration.mesh_grid import build_mesh_from_poisson
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
         mesh = build_mesh_from_poisson(vertex_coords_int, device, last_res=last_res)
@@ -864,12 +890,21 @@ def main():
         else:
             print("  精化失败，保留草稿 mesh")
 
+    # ── 后处理：降面 → 补洞（补洞必须最后做，才能保证输出闭合）──
+    if opt.target_faces > 0:
+        from lato_integration.mesh_grid import decimate_mesh
+        mesh = decimate_mesh(mesh, opt.target_faces)
+    if opt.repair_holes:
+        from lato_integration.mesh_grid import repair_holes
+        mesh, _stats = repair_holes(mesh, max_loop_len=opt.repair_max_loop)
+
     # 保存
     os.makedirs(os.path.dirname(opt.output) or ".", exist_ok=True)
     mesh.export(opt.output)
     print(f"\n{'='*60}")
     print(f"  ✅ 完成! Mesh 已保存到: {opt.output}")
-    print(f"  顶点: {len(mesh.vertices)}, 面: {len(mesh.faces)}")
+    print(f"  顶点: {len(mesh.vertices)}, 面: {len(mesh.faces)}, "
+          f"watertight={mesh.is_watertight}")
     print(f"{'='*60}")
 
 
