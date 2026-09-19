@@ -124,10 +124,11 @@ def main():
     else:
         files = [a.input]
         out_dir = None
-        if a.out is None:
+        if a.out is None and not a.list_loops:
             print("[ERROR] 单个文件输入需要 --out（或改用 --out_dir）", file=sys.stderr)
             sys.exit(1)
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
+        if a.out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
 
     mode = a.rebuild
     radii = [float(x) for x in a.radii.split(",") if x.strip()] if a.radii else None
