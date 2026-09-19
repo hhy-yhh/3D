@@ -179,6 +179,109 @@ def poisson_from_points(pts, depth=9, knn=30, crop_density_quantile=0.1,
     return mesh
 
 
+def _pcd_with_normals(pts, knn=30):
+    """建 open3d 点云 + PCA 估法线 + 统一朝外（远离质心）。
+
+    Ball Pivoting / Alpha Shape 都要法线；统一朝外这一步对凹腔形状只是近似
+    （凹腔处的点其实该朝内），但 open3d 的法线定向器在没有扫描视角时也只有这种
+    粗略办法，试过 orient_normals_consistent_tangent_plane（对 40 万点太慢）。
+    """
+    import open3d as o3d
+    import numpy as np
+
+    pts = np.asarray(pts, dtype=np.float64)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    k = min(knn, len(pts) - 1)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k))
+    center = pts.mean(axis=0)
+    norms = np.asarray(pcd.normals).copy()
+    dot = np.sum(norms * (pts - center), axis=1)
+    norms[dot < 0] *= -1
+    pcd.normals = o3d.utility.Vector3dVector(norms)
+    return pcd, k
+
+
+def _auto_scale_multiplier(pcd, mult):
+    """按点云平均最近邻距把「倍率」换算成绝对半径列表。"""
+    import open3d as o3d
+    import numpy as np
+
+    try:
+        mean_nn = float(pcd.compute_nearest_neighbor_distance().mean())
+    except Exception:
+        mean_nn = None
+    if not mean_nn or mean_nn <= 0:
+        # 退化：用 bbox 对角线的千分之一兜底
+        bb = np.asarray(pcd.points)
+        mean_nn = float(np.linalg.norm(bb.max(0) - bb.min(0))) / 1000.0
+    return mean_nn, [mean_nn * m for m in mult]
+
+
+def build_mesh_from_points(pts, mode="ball", radii=None, alpha=None, knn=30,
+                           smooth_iterations=0, smooth_lambda=0.5, target_faces=0):
+    """从归一化点云 [-0.5,0.5] 重建：ball（球旋转）/ alpha（α 形状）。
+
+    为什么需要这两条：Poisson 解指示函数 → 必然封死内部通孔；而「占据格点边界提取」
+    假设点云是实心体，对**散点**（本管线的 decode 输出只占 bbox 的 ~1.6%、碎成几百块）
+    会产出海绵状曲面。这两条都只连「该连的点」，不填补空间，所以能保住内部凹腔。
+
+    Args:
+        pts: [N,3] 归一化点云。
+        mode: "ball" 或 "alpha"。
+        radii: [ball] 球半径列表（绝对单位）。None → 按平均最近邻距 × [1.5, 3, 6] 自动推。
+        alpha: [alpha] α 值（绝对单位）。None → 平均最近邻距 × 3。
+        knn: 法线估计近邻数。
+        smooth_iterations / smooth_lambda: 重建后 Laplacian 平滑（0=不做）。
+        target_faces: >0 时降面到目标面数。
+    Returns:
+        (trimesh.Trimesh 或 None, info dict)
+    """
+    import open3d as o3d
+    import trimesh
+    import numpy as np
+
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 10:
+        print("[mesh_grid] 点云过少")
+        return None, {}
+
+    pcd, k = _pcd_with_normals(pts, knn)
+    mean_nn, auto_radii = _auto_scale_multiplier(pcd, [1.5, 3.0, 6.0])
+    info = {"mean_nn": mean_nn, "knn": k, "mode": mode}
+
+    if mode == "ball":
+        use_radii = [float(r) for r in radii] if radii else auto_radii
+        print(f"[mesh_grid] BallPivoting: {len(pts)} 点, 平均间距={mean_nn:.5f}, "
+              f"radii={[round(r, 5) for r in use_radii]}")
+        mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+            pcd, o3d.utility.DoubleVector(use_radii))
+        info["radii"] = use_radii
+    elif mode == "alpha":
+        use_alpha = float(alpha) if alpha else mean_nn * 3.0
+        print(f"[mesh_grid] AlphaShape: {len(pts)} 点, 平均间距={mean_nn:.5f}, alpha={use_alpha:.5f}")
+        mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, use_alpha)
+        info["alpha"] = use_alpha
+    else:
+        raise ValueError(f"未知 mode: {mode}")
+
+    tris = np.asarray(mesh_o3d.triangles)
+    if len(tris) == 0:
+        print(f"[mesh_grid] {mode} 输出空面（半径/α 不合适，调 --ball_radii / --alpha）")
+        return None, info
+
+    verts = np.asarray(mesh_o3d.vertices)
+    mesh = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    mesh.remove_unreferenced_vertices()
+    print(f"[mesh_grid] {mode} 重建: v={len(mesh.vertices)} f={len(mesh.faces)}")
+
+    mesh = _postprocess_mesh(mesh, smooth_iterations=smooth_iterations,
+                             smooth_lambda=smooth_lambda)
+    if target_faces and target_faces > 0:
+        mesh = decimate_mesh(mesh, target_faces)
+    return mesh, info
+
+
 def _postprocess_mesh(mesh, smooth_iterations=2, smooth_lambda=0.5):
     """修复法线 + 轻量 Laplacian 平滑。
 
@@ -560,52 +663,99 @@ def boundary_loops(mesh):
     return loops
 
 
-def _earclip(poly):
-    """简单多边形耳切三角化。poly: [M,2]；返回 [(i,j,k)] 索引三角形。"""
+def _edge_to_face_normal(mesh):
+    """{排序后的边 (u,v) → 该边所属面的法线}，只用于查边界边的相邻面走向。"""
     import numpy as np
 
-    n = len(poly)
-    if n < 3:
-        return []
-    idx = list(range(n))
-    # 保证逆时针
-    area = 0.0
-    for i in range(n):
-        x1, y1 = poly[i]
-        x2, y2 = poly[(i + 1) % n]
-        area += x1 * y2 - x2 * y1
-    if area < 0:
-        idx.reverse()
+    es = np.asarray(mesh.edges_sorted, dtype=np.int64)      # [3F,2]
+    fn = np.asarray(mesh.face_normals, dtype=np.float64)    # [F,3]
+    face_of_row = np.repeat(np.arange(len(mesh.faces)), 3)
+    uniq, first = np.unique(es, axis=0, return_index=True)
+    face_of_uniq = face_of_row[first]
+    return {(int(a), int(b)): fn[fi] for (a, b), fi in zip(uniq, face_of_uniq)}
 
-    def cross(a, b, c):
-        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
-    def inside(p, a, b, c):
-        d1 = cross(a, b, p)
-        d2 = cross(b, c, p)
-        d3 = cross(c, a, p)
-        return (d1 >= 0 and d2 >= 0 and d3 >= 0)
+def _fill_loop_advancing(V, loop, edge_normals, w_dir=1.0, w_area=0.3, w_shape=0.2):
+    """推进前沿补洞（Liepa 式）：从边界往里逐个长三角形。
 
-    tris, guard = [], 0
-    while len(idx) > 3 and guard < 4 * n * n:
-        guard += 1
-        ear = False
-        for k in range(len(idx)):
-            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
-            a, b, c = poly[i0], poly[i1], poly[i2]
-            if cross(a, b, c) <= 0:  # 凹顶点
-                continue
-            if any(m not in (i0, i1, i2) and inside(poly[m], a, b, c) for m in idx):
-                continue
-            tris.append((i0, i1, i2))
-            idx.pop(k)
-            ear = True
+    与「拟合平面 + 投影 + 耳切」的区别，正是它不喷射线的原因：
+      · **顶点一个都不动**——投影法会把环上的原顶点搬到拟合平面上，
+        等于位移了原有曲面，射线就是从那儿长出来的；
+      · 每次在所有候选三角形里挑**与相邻面二面角最小**的那个，
+        补出来的面顺着周围曲面的走向，而不是硬糊一块平板；
+      · 纯 3D 就地三角化，不做 2D 投影 → 不存在投影自交。
+
+    权重 = 方向项（与相邻面法线的夹角）+ 面积项 + 形状项（惩罚细长三角形）。
+
+    Args:
+        V: [N,3] 顶点坐标。
+        loop: 边界环顶点索引（方向沿面绕向）。
+        edge_normals: [len(loop),3]，edge_normals[j] = 边 (loop[j-1], loop[j])
+                      的相邻面法线；无相邻面（新生成的边）用 NaN。
+        w_dir / w_area / w_shape: 三项权重。
+    Returns:
+        list[(i,j,k)] 新三角形（已按与原面相反的绕向生成，合成后 winding 一致）。
+    """
+    import numpy as np
+
+    V = np.asarray(V, dtype=np.float64)
+    A = [int(x) for x in loop]
+    nrm = np.asarray(edge_normals, dtype=np.float64).copy()  # [m,3]
+    faces = []
+
+    while len(A) > 3:
+        m = len(A)
+        idx = np.arange(m)
+        A_np = np.asarray(A, dtype=np.int64)
+        a = A_np[(idx - 1) % m]
+        b = A_np
+        c = A_np[(idx + 1) % m]
+
+        Va, Vb, Vc = V[a], V[b], V[c]
+        # 将要添加的三角形是 (a, c, b)（反向绕），法线按这个绕向算
+        tn = np.cross(Vc - Va, Vb - Va)
+        ln = np.linalg.norm(tn, axis=1)
+        bad = ln < 1e-14
+        ln = np.where(bad, 1.0, ln)
+        tn = tn / ln[:, None]
+        area = 0.5 * ln
+
+        # 方向项：候选面法线 vs 相邻两面法线（NaN 表示无边相邻 → 不计）
+        n_next = np.roll(nrm, -1, axis=0)
+        d1 = np.arccos(np.clip(np.sum(tn * nrm, axis=1), -1.0, 1.0))
+        d2 = np.arccos(np.clip(np.sum(tn * n_next, axis=1), -1.0, 1.0))
+        dev = np.nanmax(np.stack([d1, d2], axis=1), axis=1)
+        dev = np.where(np.isnan(dev), 0.0, dev)
+
+        # 形状项：周长²/面积，越大越细长
+        per = (np.linalg.norm(Vb - Va, axis=1) + np.linalg.norm(Vc - Vb, axis=1)
+               + np.linalg.norm(Va - Vc, axis=1))
+        shape = per ** 2 / np.maximum(area, 1e-14)
+
+        def _nz(x):
+            mx = np.max(x)
+            return x / mx if mx > 0 else x
+
+        W = (w_dir * _nz(dev / np.pi) + w_area * _nz(area) + w_shape * _nz(shape))
+        W = np.where(bad, np.inf, W)   # 退化三角形永不选
+        if not np.isfinite(W).any():
             break
-        if not ear:
-            return []  # 非简单多边形 → 交给调用方回退
-    if len(idx) == 3:
-        tris.append(tuple(idx))
-    return tris
+        i = int(np.argmin(W))
+
+        ia, ib, ic = (i - 1) % m, i, (i + 1) % m
+        faces.append((int(A_np[ia]), int(A_np[ic]), int(A_np[ib])))  # 反向绕
+
+        new_n = tn[i]
+        A = [A_np[k] for k in range(m) if k != ib]
+        # nrm[j] 记的是边 (A[j-1], A[j]) 的相邻面法线。删掉顶点 ib 后：
+        # 索引 < ib 的边不变，> ib 的整体前移一位（np.delete 正好做到），
+        # 新边 (A[ib-1], A[ib+1]) 落到索引 ib % (m-1) 上，法线就是刚加的这个面。
+        nrm = np.delete(nrm, ib, axis=0)
+        nrm[ib % (m - 1)] = new_n
+
+    if len(A) == 3:  # 最后收口
+        faces.append((A[2], A[1], A[0]))
+    return faces
 
 
 def _fill_loops_once(mesh, loops, max_loop_len=0):
@@ -617,71 +767,34 @@ def _fill_loops_once(mesh, loops, max_loop_len=0):
     import numpy as np
     import trimesh
 
-    fnorm = np.asarray(mesh.face_normals, dtype=np.float64)
-    farea = np.asarray(mesh.area_faces, dtype=np.float64)
     V = np.asarray(mesh.vertices, dtype=np.float64)
     tri_all = np.asarray(mesh.faces, dtype=np.int64)
 
-    # 顶点 → 相邻面的面积加权法线（bincount 向量化；百万面用 Python 循环要几分钟）
-    contrib = farea[:, None] * fnorm  # [F,3]
-    nv = len(V)
-    vnorm = np.zeros((nv, 3), dtype=np.float64)
-    for c in range(3):
-        for k in range(3):
-            vnorm[:, k] += np.bincount(tri_all[:, c], weights=contrib[:, k], minlength=nv)
-    nz = np.linalg.norm(vnorm, axis=1)
-    nz[nz == 0] = 1.0
-    vnorm /= nz[:, None]
+    # 边界边 → 相邻面法线（推进前沿的方向项要它）
+    e2n = _edge_to_face_normal(mesh)
 
-    new_verts = list(V)
     new_faces = []
     filled = skipped = 0
     for loop in loops:
         if max_loop_len and len(loop) > max_loop_len:
             skipped += 1
             continue
-        pts = V[loop]
-        n = vnorm[loop].mean(axis=0)
-        ln = np.linalg.norm(n)
-        if ln < 1e-8:  # 法线互相抵消 → 用环的最小二乘平面
-            c = pts.mean(axis=0)
-            _, _, vt = np.linalg.svd(pts - c)
-            n = vt[-1]
-        else:
-            n = n / ln
-        c = pts.mean(axis=0)
-
-        # 环顶点投影到拟合平面（补面才会延续相邻曲面的走向）
-        proj = pts - (((pts - c) @ n)[:, None]) * n
-
-        # 平面内 2D 基
-        a = np.array([1.0, 0.0, 0.0])
-        if abs(n @ a) > 0.9:
-            a = np.array([0.0, 1.0, 0.0])
-        u = np.cross(n, a); u /= np.linalg.norm(u)
-        v = np.cross(n, u)
-        poly = np.stack([(proj - c) @ u, (proj - c) @ v], axis=1)
-
-        tris = _earclip(poly)
-        if len(tris) != len(loop) - 2:
-            # 耳切失败（非简单环）→ 用「投影到拟合平面的质心」扇形填充
-            center_idx = len(new_verts)
-            new_verts.append(c)
-            tris_abs = [(loop[(i + 1) % len(loop)], loop[i], center_idx)
-                        for i in range(len(loop))]
-        else:
-            for i, vi in enumerate(loop):
-                new_verts[vi] = proj[i]
-            tris_abs = [(loop[k], loop[j], loop[i]) for (i, j, k) in tris]
-        new_faces.extend(tris_abs)
+        m = len(loop)
+        en = np.full((m, 3), np.nan, dtype=np.float64)
+        for j in range(m):
+            u, v = loop[j - 1], loop[j]
+            fn_ = e2n.get((u, v) if u < v else (v, u))
+            if fn_ is not None:
+                en[j] = fn_
+        new_faces.extend(_fill_loop_advancing(V, loop, en))
         filled += 1
 
     if not new_faces:
         return None, filled, skipped
 
     all_faces = np.concatenate([tri_all, np.asarray(new_faces, dtype=np.int64)], axis=0)
-    out = trimesh.Trimesh(vertices=np.asarray(new_verts, dtype=np.float64),
-                          faces=all_faces, process=False)
+    # 顶点原封不动（推进前沿不移动任何顶点），直接复用 V
+    out = trimesh.Trimesh(vertices=V, faces=all_faces, process=False)
     # 不调 merge_vertices：V/tri_all 进函数时已经 merge 过，补面又按索引引用原顶点，
     # 再 merge 一次只会把几何重合但拓扑不同的顶点并掉，反而制造新的非流形边。
     out.remove_unreferenced_vertices()

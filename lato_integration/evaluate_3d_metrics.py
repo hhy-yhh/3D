@@ -396,10 +396,12 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
                              edge_threshold=0.45, k_neighbors=32, mesh_mode="grid",
                              poisson_depth=9, poisson_crop=0.1,
                              smooth_iters=None, smooth_lambda=0.5,
-                             cavity="keep", min_component_voxels=0):
+                             cavity="keep", min_component_voxels=0,
+                             ball_radii=None, alpha=None):
     """从 pipeline.run() 输出提取 trimesh 对象。
 
     mesh_mode:
+      - "ball" / "alpha": 球旋转 / α 形状——只连该连的点、不填补空间，保内部凹腔。
       - "voxel": 占据格点边界提取 → 闭合体积，且 cavity="keep" 时保住内部通孔/空腔。
       - "poisson": open3d 光滑重建（观感最好，但必然填死内部结构）。
       - "grid": 格点 6-邻域连边 + 四边形化（LATO 拓扑，出完整面）。
@@ -429,6 +431,20 @@ def extract_mesh_from_output(outputs, connection_head, model_cfg, device,
 
     if vertex_coords_int.numel() == 0:
         return None
+
+    # ── ball / alpha 模式：只连该连的点，不填补空间（保内部通孔）──
+    if mesh_mode in ("ball", "alpha"):
+        from lato_integration.mesh_grid import build_mesh_from_points
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        pts = vertex_coords_int.detach().cpu().numpy().astype(np.float64) / float(last_res) - 0.5
+        _smooth = smooth_iters if (smooth_iters is not None and smooth_iters >= 0) else 0
+        mesh, _info = build_mesh_from_points(
+            pts, mode=mesh_mode, radii=(ball_radii or None), alpha=alpha,
+            smooth_iterations=_smooth, smooth_lambda=smooth_lambda,
+        )
+        if mesh is not None and len(mesh.faces) > 100:
+            return mesh
+        print(f"  [WARN] {mesh_mode} 重建失败/过稀 (f={len(mesh.faces) if mesh is not None else 0})，回退 grid/knn")
 
     # ── voxel 模式：占据格点边界提取（闭合体积 + 保内部空腔）──
     if mesh_mode == "voxel":
@@ -539,10 +555,22 @@ def main():
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--mesh_mode", type=str, default="grid",
-                        choices=["grid", "knn", "poisson", "voxel"],
+                        choices=["grid", "knn", "poisson", "voxel", "ball", "alpha"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
-                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好），"
-                             "voxel=占据格点边界提取（闭合体积 + 保内部空腔）")
+                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（会填死内部空腔），"
+                             "voxel=占据格点边界提取（闭合但要求点云是实心体），"
+                             "ball=球旋转 / alpha=α形状（只连该连的点，保内部通孔）")
+    parser.add_argument("--ball_radii", type=str, default="",
+                        help="[ball] 球半径列表，逗号分隔（绝对单位，归一化坐标）。"
+                             "留空=按平均最近邻距 × 1.5,3,6 自动推")
+    parser.add_argument("--alpha", type=float, default=0.0,
+                        help="[alpha] α 值（绝对单位，归一化坐标）。0=按平均最近邻距 × 3 自动推")
+    parser.add_argument("--dump_coords", type=str, default=None,
+                        help="把 decode 出的顶点坐标存成 npz（含 coords）。存一次之后"
+                             "各种重建方式都能用 repair_mesh.py 秒级迭代，不用重跑管线")
+    parser.add_argument("--dump_coords_only", action="store_true", default=False,
+                        help="[--dump_coords] 只 dump 点云就退出，跳过重建和指标计算"
+                             "（约 2~3 分钟而不是 14 分钟）")
     parser.add_argument("--poisson_depth", type=int, default=9,
                         help="Poisson 重建八叉树深度（大=细节细，小=更光滑面少）。"
                              "想「原生少面」而不靠降面，用 6~7：面数约 4^Δdepth 缩放")
@@ -573,6 +601,12 @@ def main():
     parser.add_argument("--save_meshes", action="store_true", default=False,
                         help="保存生成的 mesh 文件到 output_dir/meshes/")
     opt = parser.parse_args()
+
+    # ball 半径：逗号分隔 → float 列表；空 → None（走自动推算）
+    opt.ball_radii_list = ([float(x) for x in opt.ball_radii.split(",") if x.strip()]
+                           if opt.ball_radii else None)
+    if opt.dump_coords:
+        os.makedirs(os.path.dirname(os.path.abspath(opt.dump_coords)) or ".", exist_ok=True)
 
     device = torch.device(opt.device if torch.cuda.is_available() else "cpu")
     os.makedirs(opt.output_dir, exist_ok=True)
@@ -726,6 +760,25 @@ def main():
                     nv = vc.shape[0] if vc is not None else 0
                     print(f"  [VAE L{i}] vertices={nv}")
 
+            # ── dump 解码顶点坐标：存一次之后各种重建方式都能秒级迭代 ──
+            if opt.dump_coords:
+                _vr = None
+                _dec = outputs.get("lato_decoded", [])
+                if _dec:
+                    _vr = _dec[-1].get("vertex")
+                if _vr is not None and _vr.get("coords") is not None:
+                    _c = _vr["coords"]
+                    _c = _c[:, 1:] if _c.shape[-1] == 4 else _c
+                    _last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+                    np.savez(opt.dump_coords,
+                             coords=_c.cpu().numpy().astype(np.int32),
+                             last_res=np.int32(_last_res),
+                             sha=str(sha))
+                    print(f"  [dump_coords] 解码顶点 {len(_c)} 个 → {opt.dump_coords} "
+                          f"(last_res={_last_res})")
+                if opt.dump_coords_only:
+                    continue  # 只要点云，跳过重建 + 指标
+
             pred_mesh = extract_mesh_from_output(
                 outputs, connection_head, model_cfg, device,
                 opt.edge_threshold, opt.k_neighbors, opt.mesh_mode,
@@ -734,6 +787,7 @@ def main():
                 smooth_lambda=opt.smooth_lambda,
                 cavity=opt.cavity,
                 min_component_voxels=opt.min_component_voxels,
+                ball_radii=opt.ball_radii_list, alpha=(opt.alpha or None),
             )
 
             # 清理 VAE decode 中间张量

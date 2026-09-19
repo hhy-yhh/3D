@@ -433,10 +433,15 @@ def main():
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--mesh_mode", type=str, default="grid",
-                        choices=["grid", "knn", "poisson", "voxel"],
+                        choices=["grid", "knn", "poisson", "voxel", "ball", "alpha"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
-                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（观感最好），"
-                             "voxel=占据格点边界提取（闭合体积 + 保内部空腔）")
+                             "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（会填死内部空腔），"
+                             "voxel=占据格点边界提取（闭合但要求点云是实心体），"
+                             "ball=球旋转 / alpha=α形状（只连该连的点，保内部通孔）")
+    parser.add_argument("--ball_radii", type=str, default="",
+                        help="[ball] 球半径列表，逗号分隔（绝对单位）。留空=按平均最近邻距自动推")
+    parser.add_argument("--alpha", type=float, default=0.0,
+                        help="[alpha] α 值（绝对单位）。0=按平均最近邻距 × 3 自动推")
     parser.add_argument("--cavity", type=str, default="keep", choices=["keep", "fill"],
                         help="[voxel] keep=保留内部通孔/空腔（默认）；"
                              "fill=填实空腔只留外表面（等价 Poisson 的封闭行为）")
@@ -800,9 +805,23 @@ def main():
     print(f"  顶点数: {len(vertex_coords_3d)}")
     print(f"  特征维度: {vertex_feats.shape[-1]}")
 
-    # ── 建 mesh：voxel（闭合体积）→ poisson（光滑重建）→ grid（四边形化）→ knn ──
+    # ── 建 mesh：ball/alpha（保内部通孔）→ voxel（闭合）→ poisson → grid → knn ──
     mesh = None
-    if opt.mesh_mode == "voxel":
+    if opt.mesh_mode in ("ball", "alpha"):
+        from lato_integration.mesh_grid import build_mesh_from_points
+        last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+        _pts = vertex_coords_int.detach().cpu().numpy().astype(np.float64) / float(last_res) - 0.5
+        _radii = [float(x) for x in opt.ball_radii.split(",") if x.strip()] if opt.ball_radii else None
+        mesh, _info = build_mesh_from_points(
+            _pts, mode=opt.mesh_mode, radii=_radii, alpha=(opt.alpha or None),
+        )
+        if mesh is not None and len(mesh.faces) > 100:
+            print(f"  {opt.mesh_mode} 重建完成: v={len(mesh.vertices)} f={len(mesh.faces)}")
+        else:
+            print(f"  [WARN] {opt.mesh_mode} 重建失败/过稀，回退 grid/knn")
+            mesh = None
+
+    if mesh is None and opt.mesh_mode == "voxel":
         from lato_integration.mesh_grid import build_mesh_from_voxel
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
         mesh = build_mesh_from_voxel(
