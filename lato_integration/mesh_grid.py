@@ -480,7 +480,7 @@ def _voxel_boundary_faces(solid, lo):
 
 
 def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
-                        smooth_lambda=0.5):
+                        smooth_lambda=0.5, morph_close=0, morph_open=0):
     """从 occupancy logits 直接 marching cubes 建面（跳过 Poisson 和 VAE decode）。
 
     为什么需要这条：Poisson 拟合连续指示函数 → 数学上必然封闭 → 内部镂空被桥接填死；
@@ -512,6 +512,26 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
     if occ.ndim != 3:
         print(f"[mesh_grid] occupancy 形状异常（期望 3D）: {occ.shape}")
         return None
+
+    # ── 形态学清理：把「多孔海绵」压成「连续壳」──
+    # 实测（样本 20250423_1800_838505，th=3.0）：生成 occupancy 原始有 51 个连通分量
+    # （GT 只有 1 个）——它是「51 块拼起来的壳」而不是一个壳，MC 直接建面会出 230 个组件、
+    # euler −289。闭 x2 + 开 x1 之后连通分量降到 1，MC 出 1 个组件、euler −80、
+    # dihedral 15.0°→10.8°（上限 9.3°），面数还减半。
+    if morph_close > 0 or morph_open > 0:
+        from scipy import ndimage
+        _st = np.ones((3, 3, 3), bool)          # 26-邻域
+        b = occ > float(threshold)
+        n_before = ndimage.label(b, structure=_st)[1]
+        if morph_close > 0:
+            b = ndimage.binary_closing(b, _st, iterations=int(morph_close))
+        if morph_open > 0:
+            b = ndimage.binary_opening(b, _st, iterations=int(morph_open))
+        n_after = ndimage.label(b, structure=_st)[1]
+        print(f"[mesh_grid] 形态学清理: 闭x{morph_close} 开x{morph_open} | "
+              f"连通分量 {n_before} → {n_after} | voxel {int((occ > threshold).sum())} → {int(b.sum())}")
+        occ = b.astype(np.float32)
+        threshold = 0.5                          # 已二值化，等值面固定取 0.5
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=float(threshold))
     if len(faces) == 0:
