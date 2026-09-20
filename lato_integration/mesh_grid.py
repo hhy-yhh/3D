@@ -480,7 +480,8 @@ def _voxel_boundary_faces(solid, lo):
 
 
 def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
-                        smooth_lambda=0.5, morph_close=0, morph_open=0):
+                        smooth_lambda=0.5, morph_close=0, morph_open=0,
+                        upsample=1, blur_sigma=0.0):
     """从 occupancy logits 直接 marching cubes 建面（跳过 Poisson 和 VAE decode）。
 
     为什么需要这条：Poisson 拟合连续指示函数 → 数学上必然封闭 → 内部镂空被桥接填死；
@@ -513,25 +514,43 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
         print(f"[mesh_grid] occupancy 形状异常（期望 3D）: {occ.shape}")
         return None
 
-    # ── 形态学清理：把「多孔海绵」压成「连续壳」──
-    # 实测（样本 20250423_1800_838505，th=3.0）：生成 occupancy 原始有 51 个连通分量
-    # （GT 只有 1 个）——它是「51 块拼起来的壳」而不是一个壳，MC 直接建面会出 230 个组件、
-    # euler −289。闭 x2 + 开 x1 之后连通分量降到 1，MC 出 1 个组件、euler −80、
-    # dihedral 15.0°→10.8°（上限 9.3°），面数还减半。
-    if morph_close > 0 or morph_open > 0:
+    # ── 三条场层面的预处理（都走「先二值化」这条路）──
+    # ① 形态学清理：把「多孔海绵」压成「连续壳」
+    #    实测（样本 20250423_1800_838505，th=3.0）：生成 occupancy 原始有 51 个连通分量
+    #    （GT 只有 1 个）——它是「51 块拼起来的壳」而不是一个壳，MC 直接建面会出 230 个组件、
+    #    euler −289。闭 x2 + 开 x1 之后连通分量降到 1，MC 出 1 个组件、euler −80、
+    #    dihedral 15.0°→10.8°，面数还减半。
+    # ② 上采样：128³ 的 MC 在镂空这类小特征上会有体素级方块感，先插值到更高分辨率再取等值面，
+    #    台阶会细密得多。
+    # ③ 高斯模糊：在「场」上模糊（而不是在网格上做 Laplacian）——直角自然变圆角，
+    #    且不会有网格平滑那种「磨掉特征」的副作用。这是消除方块镂空的主要手段。
+    if (morph_close > 0 or morph_open > 0 or upsample > 1 or blur_sigma > 0):
         from scipy import ndimage
-        _st = np.ones((3, 3, 3), bool)          # 26-邻域
-        b = occ > float(threshold)
-        n_before = ndimage.label(b, structure=_st)[1]
-        if morph_close > 0:
-            b = ndimage.binary_closing(b, _st, iterations=int(morph_close))
-        if morph_open > 0:
-            b = ndimage.binary_opening(b, _st, iterations=int(morph_open))
-        n_after = ndimage.label(b, structure=_st)[1]
-        print(f"[mesh_grid] 形态学清理: 闭x{morph_close} 开x{morph_open} | "
-              f"连通分量 {n_before} → {n_after} | voxel {int((occ > threshold).sum())} → {int(b.sum())}")
-        occ = b.astype(np.float32)
-        threshold = 0.5                          # 已二值化，等值面固定取 0.5
+        _vox0 = int((occ > float(threshold)).sum())
+        b = (occ > float(threshold))
+        if morph_close > 0 or morph_open > 0:
+            _st = np.ones((3, 3, 3), bool)          # 26-邻域
+            n_before = ndimage.label(b, structure=_st)[1]
+            if morph_close > 0:
+                b = ndimage.binary_closing(b, _st, iterations=int(morph_close))
+            if morph_open > 0:
+                b = ndimage.binary_opening(b, _st, iterations=int(morph_open))
+            n_after = ndimage.label(b, structure=_st)[1]
+            print(f"[mesh_grid] 形态学清理: 闭x{morph_close} 开x{morph_open} | "
+                  f"连通分量 {n_before} → {n_after} | voxel {_vox0} → {int(b.sum())}")
+        f = b.astype(np.float32)
+        if upsample > 1:
+            f = ndimage.zoom(f, float(upsample), order=1)   # 三线性插值
+            print(f"[mesh_grid] 上采样 x{upsample}: {occ.shape} → {f.shape}")
+        if blur_sigma > 0:
+            _sig = float(blur_sigma) * max(int(upsample), 1)
+            f = ndimage.gaussian_filter(f, _sig)
+            print(f"[mesh_grid] 场高斯模糊: σ={_sig:.2f}（{f.shape[0]}³ 网格）")
+        occ = f
+        threshold = 0.5                             # 已是 [0,1] 场，等值面固定取 0.5
+        mesh_res = occ.shape[0]                     # 归一化要按新分辨率
+    else:
+        mesh_res = occ.shape[0]
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=float(threshold))
     if len(faces) == 0:
@@ -539,7 +558,7 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
         return None
 
     # MC 的顶点列顺序与 occupancy 轴序一致（x, y, z），除以分辨率归一到 [-0.5, 0.5]
-    verts = verts / float(occ.shape[0]) - 0.5
+    verts = verts / float(mesh_res) - 0.5
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
     print(f"[mesh_grid] MC 重建: v={len(mesh.vertices)} f={len(mesh.faces)}")
     # MC 输出是闭合流形（watertight），平滑安全 —— 复用与 poisson/ball/voxel 同一套后处理

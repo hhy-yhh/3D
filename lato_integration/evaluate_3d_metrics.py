@@ -591,6 +591,12 @@ def main():
                         help="[mc] MC 前对 occupancy 做闭运算（填细小穿孔，把「多孔海绵」压成"
                              "连续壳）。实测：生成 occupancy 有 51 个连通分量（GT 只有 1 个），"
                              "闭x2 后降到 3、MC 组件 230→3")
+    parser.add_argument("--mc_upsample", type=int, default=1,
+                        help="[mc] MC 前把 occupancy 三线性上采样 N 倍（默认 1）。"
+                             "128³ 的 MC 在镂空这类小特征上会有体素级方块感，上采样后台阶更细")
+    parser.add_argument("--mc_blur_sigma", type=float, default=0.0,
+                        help="[mc] MC 前对 occupancy 场做高斯模糊（σ，按原始 128³ 计，默认 0=不模糊）。"
+                             "在『场』上模糊能把体素直角变圆角 —— 消除方块镂空的主要手段")
     parser.add_argument("--morph_open", type=int, default=0,
                         help="[mc] MC 前对 occupancy 做开运算（去孤立小团）。"
                              "闭x2+开x1 → 连通分量 1、euler −289→−80、dihedral 15.0°→10.8°")
@@ -774,6 +780,7 @@ def main():
                         smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
                         smooth_lambda=opt.smooth_lambda,
                         morph_close=opt.morph_close, morph_open=opt.morph_open,
+                        upsample=opt.mc_upsample, blur_sigma=opt.mc_blur_sigma,
                     )
                     if _mc_mesh is not None:
                         print(f"  [MC] occupancy → mesh: v={len(_mc_mesh.vertices)} "
