@@ -567,6 +567,10 @@ def main():
                              "留空=按平均最近邻距 × 1.5,3,6 自动推")
     parser.add_argument("--alpha", type=float, default=0.0,
                         help="[alpha] α 值（绝对单位，归一化坐标）。0=按平均最近邻距 × 3 自动推")
+    parser.add_argument("--dump_ss_occupancy", type=str, default=None,
+                        help="把 StructureHead 输出的 occupancy logits 存成 npz"
+                             "（float16 [128,128,128] + threshold）。用于在 MC 之前"
+                             "做形态学清理等离线实验，不用重跑管线")
     parser.add_argument("--dump_coords", type=str, default=None,
                         help="把 decode 出的顶点坐标存成 npz（含 coords）。存一次之后"
                              "各种重建方式都能用 repair_mesh.py 秒级迭代，不用重跑管线")
@@ -739,6 +743,19 @@ def main():
                     print(f"  [SS] coords truncated: {coords.shape[0]} (top-{opt.max_coords} by confidence)")
 
                 print(f"  [SS] coords={coords.shape[0]}")
+
+                # ── dump occupancy logits：供离线做形态学清理 / 换阈值实验，不用重跑管线 ──
+                if opt.dump_ss_occupancy:
+                    import os as _os
+                    _occ_dump = np.squeeze(occ_logits.detach().float().cpu().numpy()).astype(np.float16)
+                    _os.makedirs(_os.path.dirname(_os.path.abspath(opt.dump_ss_occupancy)) or ".", exist_ok=True)
+                    np.savez_compressed(opt.dump_ss_occupancy,
+                                        occupancy=_occ_dump,
+                                        threshold=np.float32(opt.ss_threshold),
+                                        sha=str(sha))
+                    print(f"  [dump_ss_occupancy] {_occ_dump.shape} → {opt.dump_ss_occupancy} "
+                          f"(threshold={opt.ss_threshold}, "
+                          f"active={int((_occ_dump > opt.ss_threshold).sum())})")
 
                 # ── mesh_mode=mc：直接从 occupancy 建面，跳过 SLat Flow + VAE decode ──
                 # 理由：Poisson 拟合指示函数必填死内部镂空；ball/grid 等在 decode 出的
