@@ -30,6 +30,13 @@ Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
 | ConnectionHead | LATO 预训练边预测器 | 冻结（③ 仅 grid/knn 重建分支调用） |
 | 重建层 | `mesh_grid.py` + `diag_mesh.py` | **无参数**（③ 后处理，v22~v26 新增） |
 
+> 🆕 **2026-09-20 新增替代路径（见文末 v27）**：上图 ④ SLat Flow + ⑤ VoxelVAE.decode + ③ 重建
+> 这三段，可由**「从 SS occupancy 直接 marching cubes 建面」**整体替代 ——
+> **跳过 SLat Flow、VoxelVAE、Poisson、降面、补洞**，只用 ① CLIP + ② SS Flow + ③ StructureHead。
+> 单样本实测首次同时拿到「**保镂空 + 0 洞 + 光滑（dihedral 7.7°，GT 6.4°）**」，
+> 耗时 8 秒/条（原管线 12 分钟）。代价是分辨率锁死 128³（有方块镂空，见 v27 §6）。
+> 命令：`--mesh_mode mc --ss_threshold 3.0 --morph_close 2 --morph_open 1 --smooth_iters 3`
+
 > ② **VoxelVAE 状态更正（2026-09-20，核对代码）**：本表原写「**微调**（冻结 encoder，微调 decoder 末 2 层）」，**已过时**。
 > 代码事实（`evaluate_3d_metrics.py:357-363`、`inference_lato.py:661-670`）：
 > `--vae_ft_ckpt` **默认 `None`**，默认路径恒为 `load_pretrained_woself(opt.lato_ckpt, ...)` → **原版 `vae_128to512.pt`**；
@@ -2069,3 +2076,177 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 2. **embedding operative range 模块**（清单另一条 HIGH，0%）
 3. 治粗糙度 / 保特征降面（未动）
 4. **LogitSharpener**（⚠️ 本节原缺，2026-09-19 核对补入）—— v20 §4 曾判「可行，~20 分钟」，但截至核对仍**未实现**（`logit_sharpener.py` / `train_logit_sharpener.py` / `--sharpener_ckpt` 全都不存在），v22~v26 一路未推进。它是目前唯一还挂着的「不动主模型、只锐化 occupancy」方案，设计见《提升方案_2026-09-01》方案2
+
+---
+
+## v27 MC 路径：从 SS occupancy 直接建面（保镂空方案）(2026-09-20)
+
+> **状态：单样本验证通过，方案定型；全量 21 条未跑。**
+> **一句话：跳过 SLat Flow + VAE.decode + Poisson + 降面 + 补洞 整条链路，
+> 直接从 StructureHead 的 occupancy 取等值面（marching cubes），
+> 用形态学清理把「多孔海绵」压成「连续壳」—— 首次同时拿到「保镂空 + 无洞 + 光滑」。**
+
+### 1. 动机：v26 的死结
+
+v25/v26 已定论：**重建方式全部穷尽**——Poisson 必填死镂空，而 ball/grid/alpha/MC/voxel 在
+decode 出的「糊团点云」上全崩。死结在于：
+
+```
+点云 = 0 厚度采样 → 只描述「表面在哪」，不含「内部在哪」
+建面唯一可行的内外判断 = 拟合隐式函数（Poisson）
+→ 「跨过点云空隙」和「跨过镂空」几何上是同一个动作 → 必然填死镂空
+```
+
+**突破口**：不要点云。`StructureHead` 输出的 occupancy 本身就已经说明了「哪里实、哪里空」，
+**MC 对已知 occupancy 取等值面，不存在「跨过空隙」这个动作** → 空腔天然保留。
+
+### 2. 流程
+
+```
+文本 prompt
+    │
+    ▼
+① CLIP [冻结] → cond
+    │
+    ▼
+② SS Flow [训练·fp32]  EnhancedSSFlowModel (512ch×24)
+   噪声 [1,8,16³] ── 20 步 Euler ──→ dense latent [1,8,16³]
+    │
+    ▼
+③ LatoStructureHead [训练]  16³ → 128³（3 级 PixelShuffle）
+   → occ_logits [1,1,128³]        ← 贯穿全程的中间量
+    │
+    │   ╔═══════════════ ④ 场后处理链（纯 CPU，全在「场」上做）═══════════════╗
+    │   ║                                                                      ║
+    └──▶║  二值化        logits > --ss_threshold                              ║
+        ║      ↓                                                               ║
+        ║  形态学清理    闭运算 x2 + 开运算 x1   ⭐ 关键：把「51 块拼成的海绵」 ║
+        ║      ↓                                 ⭐ 压成「1 个连续壳」          ║
+        ║  上采样 ×N     （可选，实测收益低）                                    ║
+        ║      ↓                                                               ║
+        ║  场高斯模糊 σ  （可选，实测 σ>1 反而有害）                             ║
+        ║      ↓                                                               ║
+        ║  Marching Cubes  level=0.5    ⭐ 保镂空的关键（不「跨过空隙」）        ║
+        ║      ↓                                                               ║
+        ║  fix_normals + Laplacian ×3                                          ║
+        ╚══════════════════════════════════════════════════════════════════════╝
+    │
+    ▼
+ Mesh (.obj)
+
+⚠️ 跳过的环节（按原管线顺序）：
+   SLat Flow → VAE.decode → Poisson 重建 → 降面 → 补洞
+   连同 ConnectionHead（只服务 grid/knn 分支）也一并跳过
+```
+
+**跳过的每一步都曾是问题来源**：SLat Flow 的 MSE 0.2 → decode 出糊团点云；
+Poisson 必填死镂空；降面砍出 256 洞 + 粗糙度 ×3；补洞治不了镂空。
+
+### 3. 诊断链（怎么一步步定位到「海绵」的）
+
+| # | 实验 | 结果 | 结论 |
+|---|---|---|---|
+| 1 | A 组（GT latent 直通 decode）+ ball | v=390,460 f=527,505 CD=0.0002 | 表面看着成了（⚠️ 但**没测 components**，见 #2） |
+| 2 | 四组对照 A/B/C/D 的点云结构 | NN 中位**全是 0.00195(=1/512)**；平面性 0.23~0.31，差别微小且 B 组最低 | **局部几何指标区分不了**，「糊团 vs 薄壳」不在局部几何上 |
+| 3 | GT occupancy 直通 MC（能力验证） | components=**3**、euler=−30、watertight、dihedral 9.3° | MC 本身没问题 |
+| 4 | 生成 occupancy 直通 MC | components=**341**、euler=+184、dihedral 14.8° | 存在严重问题 |
+| 5 | 阈值扫描 th=2.0/2.5/3.0/3.5（voxel 97,969→45,987） | components **始终 213~341**，euler 在 +184~−354 间乱跳 | ❌ **否定「壳太厚」假设** |
+| 6 | 连通分量分析 | 生成 occupancy = **51 个分量**（GT = **1 个**） | ✅ **确认：occupancy 是「51 块拼成的海绵」，不是「厚壳」** |
+| 7 | 形态学清理（闭x2+开x1） | 连通分量 **51→1**；MC 后 components=1、euler −80、dihedral 7.7° | ✅ **解决** |
+| 8 | 上采样 ×2 + 场高斯模糊 σ=1.0 / 3.0 | σ=1.0 面数 80k→321k 但观感变化不大；σ=3.0 指标全面退化（CD +28%） | ❌ **无效**（见 §6 限制） |
+
+### 4. 结果数据（单样本 `20250423_1800_838505`）
+
+| 方案 | components | euler | **dihedral** | CD ↓ | HD ↓ | NC ↑ | 保镂空 |
+|---|---|---|---|---|---|---|---|
+| GT（原始 STL） | 1 | −6 | **6.4°** | — | — | — | — |
+| Poisson d9 | 770 | −1979 | 13.0° | 0.0016 | 0.0984 | 0.6226 | ❌ |
+| Poisson d7 | 72 | −96 | 16.6° | — | — | — | ❌ |
+| 降面版（eval_decim_100k） | 107 | −2473 | 38.0° | 0.0016 | 0.0984 | 0.6226 | ❌ |
+| MC 原始（无形态学） | 230 | −289 | 15.0° | 0.0011 | **0.0758** | **0.6757** | ✅ |
+| **MC + 形态学（本方案）** | **1** | **−80** | **7.7°** | 0.0013 | 0.0948 | 0.6726 | ✅ |
+| MC + 形态学 + u2 σ3.0 ❌ | — | — | — | 0.0018 | 0.1087 | 0.6584 | ✅ |
+
+**耗时：单条 8~17 秒（原管线 12 分钟，快约 50~90×）**
+
+### 5. 最终配置
+
+```bash
+python lato_integration/evaluate_3d_metrics.py \
+    --ss_ckpt "$SS_CKPT" --slat_ckpt "$SLAT_CKPT" \
+    --slat_stats .../lato_latents_v2/latents/lato_vae_16dim_128/stats.json \
+    --lato_ckpt /data/huanghaoyang/3D/LATO/checkpoints/128to512/vae/vae_128to512.pt \
+    --lato_config /data/huanghaoyang/3D/LATO/configs/infer_vae_512.yaml \
+    --test_metadata .../database_lato/test/metadata.csv \
+    --gt_meshes .../database_lato/meshes \
+    --output_dir outputs/eval_mc_morph \
+    --mesh_mode mc \
+    --ss_threshold 3.0 \
+    --morph_close 2 --morph_open 1 \
+    --smooth_iters 3 \
+    --save_meshes
+```
+
+| 参数 | 值 | 依据 |
+|---|---|---|
+| `--ss_threshold` | 3.0 | voxel 61,473，对齐 GT 的 52,416 量级（th=2.0 给 97,969） |
+| `--morph_close` | 2 | 闭运算填穿孔：连通分量 51→3 |
+| `--morph_open` | 1 | 开运算去小团：连通分量 →1 |
+| `--mc_upsample` | **1（关）** | 实测收益低 |
+| `--mc_blur_sigma` | **0（关）** | 实测 σ>1 全面退化 |
+| `--smooth_iters` | 3 | 抹高频糙感 |
+
+### 6. 已知限制
+
+**① 方块状镂空 —— 128³ 的天花板（当前最大短板）**
+
+```
+GT mesh（原始）              dihedral mean 6.4°  p90 15.4°
+GT occupancy(52,416) → MC    dihedral mean 9.3°  p90 45.0°   ← 干净的 occupancy 也有台阶
+生成 occupancy      → MC     dihedral mean 7.7°  p90 20.4°
+```
+
+**连 GT 的 occupancy 自己做 MC 也带 45° 台阶** —— 因为 128³ 的 occupancy 里，
+一个圆孔的边界就是「方块拼出的圆」。**方块有两个来源**：
+
+| 来源 | 上采样+模糊能治吗 |
+|---|---|
+| MC 在体素边界上的折线台阶 | ✅ 能（实测面数 80k→321k 确实变细了） |
+| **occupancy 本身把圆孔表示成方块** | ❌ **不能**（σ=3.0 只把整体糊掉，CD 反而恶化 28%） |
+
+**根治只能提高 occupancy 分辨率** → 即 v20 §4 的「32³ SS Flow」：
+当前只有 16³ SS encoder（`ss_enc_conv3d_16l8_fp16`），无 32³ 版，
+**需先造 encoder + 重新生成 latent + 重训 SS Flow/StructureHead**（数天工程量）。
+
+**② SLat Flow 与 VoxelVAE 在本方案中完全不参与**
+
+```
+SS Flow + StructureHead  →  决定「形状在哪」  → occupancy（空间结构）
+SLat Flow + VAE.decode   →  决定「细节长啥样」→ feats → 512³ 精细顶点
+```
+
+MC 只用 occupancy，不需要 feats → **SLat Flow v10 与 VoxelVAE 在这条路上被完整绕过**。
+代价是分辨率锁死 128³（失去 VAE 的 512³ 细节增益），换来拓扑正确。
+**若最终采用本方案，SLat Flow 的投入在这条路上不产生回报。**
+
+**③ 尚未验证**
+- 全量 21 条未跑（只有单样本）
+- GT occupancy 对照组用的是**训练集样本**（`ss_occupancy_128_v2` 只含 234 个训练集），
+  与测试集样本**不是同一个零件** → §4 表里它的数据只能当「MC 能力展示」，不是该零件的上限
+- 形态学的闭运算**分不清「海绵穿孔」与「真实功能孔」**（当前 euler=−80 vs GT −6，
+  意味着仍有约 37 个多余隧道）—— 加大闭运算能压得更低，但可能吃真孔，**需肉眼验收**
+
+### 7. 代码改动清单（本地 `D:\code\TRELLIS_linux\3D\lato_integration\`，需同步服务器）
+
+| 文件 | 改动 |
+|---|---|
+| `mesh_grid.py` | **新增 `mesh_from_occupancy()`**：logits → 二值化 → [形态学] → [上采样] → [场高斯模糊] → MC → 归一化 → `_postprocess_mesh()`（复用已有的 fix_normals + Laplacian） |
+| `evaluate_3d_metrics.py` | `--mesh_mode` 加 **`mc`**（SS 后直接建面，跳过 SLat Flow + VAE decode）；新增 `--morph_close` / `--morph_open` / `--mc_upsample` / `--mc_blur_sigma` / `--dump_ss_occupancy` |
+| `experiment_coords_vs_feats.py` | `--mesh_mode` 加 `ball`/`alpha`；新增 `--dump_coords` / `--dump_coords_only` / `--ball_radii` / `--alpha`；ball/alpha 分支补 try/except（open3d 在退化点云上抛 `invalid tetra` 会挂掉整个脚本） |
+
+### 8. 下一步
+
+1. **跑全量 21 条**（去掉 `--limit 1`，约 6 分钟）—— 看整体分布，确认不是单样本侥幸
+2. 肉眼验收形态学是否吃掉了真实功能孔（调 `--morph_close` 1↔2 权衡）
+3. 若方块镂空不可接受 → 评估「32³ SS encoder」的工程量（治本）
+4. 可选：两路结合（VAE 出 512³ 细节 + occupancy 提供拓扑骨架约束）—— 研究性，不保证成

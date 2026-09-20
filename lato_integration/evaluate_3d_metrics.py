@@ -600,6 +600,10 @@ def main():
     parser.add_argument("--morph_open", type=int, default=0,
                         help="[mc] MC 前对 occupancy 做开运算（去孤立小团）。"
                              "闭x2+开x1 → 连通分量 1、euler −289→−80、dihedral 15.0°→10.8°")
+    parser.add_argument("--morph_before_slat", action="store_true", default=False,
+                        help="方案5：形态学清理 occupancy 后**重新提取 coords** 再喂 SLat Flow，"
+                             "后续流程完全不变。用于验证「糊团点云」是否源于「海绵状 coords」"
+                             "（需配合 --morph_close/--morph_open）")
     parser.add_argument("--smooth_iters", type=int, default=-1,
                         help="Laplacian 平滑次数；-1=按模式默认(poisson=2, grid/voxel=0)")
     parser.add_argument("--smooth_lambda", type=float, default=0.5,
@@ -747,6 +751,25 @@ def main():
                 print(f"  [SS] occ_logits mean={occ_logits.mean():.2f} min={occ_logits.min():.2f} max={occ_logits.max():.2f} active(>{opt.ss_threshold})={n_active}")
 
                 coords = torch.argwhere(occ_logits > opt.ss_threshold)[:, [0, 2, 3, 4]].int()
+
+                # ── 方案5：形态学清理 occupancy 后重新提取 coords，再喂 SLat Flow ──
+                # 动机：生成 occupancy 是「51 块拼成的海绵」（GT 是 1 块连续壳，实测
+                # 样本 20250423_1800_838505 / th=3.0），「糊团点云」很可能是它的下游症状。
+                # 清理成连续壳后重新取 coords —— 之后的 SLat Flow / VAE.decode / 建面流程完全不变。
+                if opt.morph_before_slat:
+                    from lato_integration.mesh_grid import clean_occupancy
+                    _occ_np = np.squeeze(occ_logits.detach().float().cpu().numpy()).astype(np.float32)
+                    _clean, _ = clean_occupancy(
+                        _occ_np, opt.ss_threshold,
+                        morph_close=opt.morph_close, morph_open=opt.morph_open,
+                    )
+                    _idx = np.argwhere(_clean > 0.5)        # [N,3] 按 (D,H,W) 顺序
+                    coords = torch.cat([
+                        torch.zeros(len(_idx), 1, dtype=torch.int32),
+                        torch.from_numpy(_idx).int(),
+                    ], dim=1).to(device)
+                    print(f"  [SS+morph] coords 经形态学清理: {n_active} → {len(coords)}"
+                          f"（后面走原流程：SLat Flow → VAE.decode）")
 
                 # 截断：只保留置信度最高的 K 个 voxel（防止 spconv int32 溢出）
                 if opt.max_coords > 0 and coords.shape[0] > opt.max_coords:

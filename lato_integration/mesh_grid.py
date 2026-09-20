@@ -479,6 +479,51 @@ def _voxel_boundary_faces(solid, lo):
     return verts, faces
 
 
+def clean_occupancy(occ, threshold=0.0, morph_close=0, morph_open=0,
+                    upsample=1, blur_sigma=0.0):
+    """把 occupancy 处理成一个干净的概率场 —— 「MC 建面」和「清理后喂 SLat」共用。
+
+    存在的理由：生成的 occupancy 是「51 块拼成的海绵」（GT 是 1 块连续壳，
+    实测样本 20250423_1800_838505 / th=3.0），这既是 MC 出 230 个组件的原因，
+    也很可能是下游「糊团点云」的成因。形态学清理把它压回连续壳（51 → 1）。
+
+    Args:
+        occ: [D,H,W] numpy 数组（logits 或已是 [0,1] 场）。
+        threshold: 二值化阈值（logits 用 --ss_threshold；已是概率场则用 0.5）。
+        morph_close / morph_open: 闭/开运算次数（26-邻域立方体结构元）。0=不做。
+        upsample / blur_sigma: 上采样倍数 / 高斯模糊 σ（按原始分辨率计）。实测收益低。
+    Returns:
+        (场, 阈值)：处理后的 [0,1] float32 场，以及应对它用的等值面阈值。
+        未做任何处理时原样返回 (occ, threshold)。
+    """
+    if not (morph_close > 0 or morph_open > 0 or upsample > 1 or blur_sigma > 0):
+        return occ, float(threshold)
+
+    from scipy import ndimage
+    vox0 = int((occ > float(threshold)).sum())
+    b = occ > float(threshold)
+    if morph_close > 0 or morph_open > 0:
+        st = np.ones((3, 3, 3), bool)               # 26-邻域
+        n_before = ndimage.label(b, structure=st)[1]
+        if morph_close > 0:
+            b = ndimage.binary_closing(b, st, iterations=int(morph_close))
+        if morph_open > 0:
+            b = ndimage.binary_opening(b, st, iterations=int(morph_open))
+        n_after = ndimage.label(b, structure=st)[1]
+        print(f"[mesh_grid] 形态学清理: 闭x{morph_close} 开x{morph_open} | "
+              f"连通分量 {n_before} → {n_after} | voxel {vox0} → {int(b.sum())}")
+
+    f = b.astype(np.float32)
+    if upsample > 1:
+        f = ndimage.zoom(f, float(upsample), order=1)     # 三线性插值
+        print(f"[mesh_grid] 上采样 x{upsample}: {occ.shape} → {f.shape}")
+    if blur_sigma > 0:
+        sig = float(blur_sigma) * max(int(upsample), 1)
+        f = ndimage.gaussian_filter(f, sig)
+        print(f"[mesh_grid] 场高斯模糊: σ={sig:.2f}（{f.shape[0]}³ 网格）")
+    return f, 0.5
+
+
 def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
                         smooth_lambda=0.5, morph_close=0, morph_open=0,
                         upsample=1, blur_sigma=0.0):
@@ -514,43 +559,12 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
         print(f"[mesh_grid] occupancy 形状异常（期望 3D）: {occ.shape}")
         return None
 
-    # ── 三条场层面的预处理（都走「先二值化」这条路）──
-    # ① 形态学清理：把「多孔海绵」压成「连续壳」
-    #    实测（样本 20250423_1800_838505，th=3.0）：生成 occupancy 原始有 51 个连通分量
-    #    （GT 只有 1 个）——它是「51 块拼起来的壳」而不是一个壳，MC 直接建面会出 230 个组件、
-    #    euler −289。闭 x2 + 开 x1 之后连通分量降到 1，MC 出 1 个组件、euler −80、
-    #    dihedral 15.0°→10.8°，面数还减半。
-    # ② 上采样：128³ 的 MC 在镂空这类小特征上会有体素级方块感，先插值到更高分辨率再取等值面，
-    #    台阶会细密得多。
-    # ③ 高斯模糊：在「场」上模糊（而不是在网格上做 Laplacian）——直角自然变圆角，
-    #    且不会有网格平滑那种「磨掉特征」的副作用。这是消除方块镂空的主要手段。
-    if (morph_close > 0 or morph_open > 0 or upsample > 1 or blur_sigma > 0):
-        from scipy import ndimage
-        _vox0 = int((occ > float(threshold)).sum())
-        b = (occ > float(threshold))
-        if morph_close > 0 or morph_open > 0:
-            _st = np.ones((3, 3, 3), bool)          # 26-邻域
-            n_before = ndimage.label(b, structure=_st)[1]
-            if morph_close > 0:
-                b = ndimage.binary_closing(b, _st, iterations=int(morph_close))
-            if morph_open > 0:
-                b = ndimage.binary_opening(b, _st, iterations=int(morph_open))
-            n_after = ndimage.label(b, structure=_st)[1]
-            print(f"[mesh_grid] 形态学清理: 闭x{morph_close} 开x{morph_open} | "
-                  f"连通分量 {n_before} → {n_after} | voxel {_vox0} → {int(b.sum())}")
-        f = b.astype(np.float32)
-        if upsample > 1:
-            f = ndimage.zoom(f, float(upsample), order=1)   # 三线性插值
-            print(f"[mesh_grid] 上采样 x{upsample}: {occ.shape} → {f.shape}")
-        if blur_sigma > 0:
-            _sig = float(blur_sigma) * max(int(upsample), 1)
-            f = ndimage.gaussian_filter(f, _sig)
-            print(f"[mesh_grid] 场高斯模糊: σ={_sig:.2f}（{f.shape[0]}³ 网格）")
-        occ = f
-        threshold = 0.5                             # 已是 [0,1] 场，等值面固定取 0.5
-        mesh_res = occ.shape[0]                     # 归一化要按新分辨率
-    else:
-        mesh_res = occ.shape[0]
+    # 场层面的预处理（形态学 / 上采样 / 高斯模糊）—— 与「清理后喂 SLat」共用同一套逻辑
+    occ, threshold = clean_occupancy(
+        occ, threshold, morph_close=morph_close, morph_open=morph_open,
+        upsample=upsample, blur_sigma=blur_sigma,
+    )
+    mesh_res = occ.shape[0]
 
     verts, faces, _, _ = measure.marching_cubes(occ, level=float(threshold))
     if len(faces) == 0:
