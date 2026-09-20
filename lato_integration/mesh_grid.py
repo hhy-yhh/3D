@@ -583,20 +583,27 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
     return mesh
 
 
-def refine_mesh_with_points(mesh, pts, max_move=None, verbose=True):
+def refine_mesh_with_points(mesh, pts, max_move=None, mode="normal", verbose=True):
     """用高精度点云精修网格顶点位置 —— **拓扑（连接关系）完全不变**。
 
     为什么需要：MC 网格的拓扑是对的（保镂空、单连通、watertight），但它的顶点只能落在
     occupancy 的 128³ 格点上，所以有体素级方块感。而 VAE.decode 出的点云是 512³ 精度的。
-    把每个 MC 顶点移到点云里的最近点，方块感就没了，而拓扑保护完整保留 ——
-    这是「MC 出拓扑 + VAE 出精度」的结合点，比在场层面做高斯模糊更根本
-    （模糊只是把方块磨圆，这个是把顶点拉到真实表面上）。
+    把 MC 顶点朝点云表面挪，方块感就减轻 —— 这是「MC 出拓扑 + VAE 出精度」的结合点，
+    比在场层面做高斯模糊更根本（模糊只是把方块磨圆，这个是把顶点拉向真实表面）。
+
+    ⚠️ **mode="nearest" 是错的，别用**：让每个顶点各自找「最近点」，多个顶点会找到**同一个**
+    点、被拉到同一位置 → 边长为 0 → 三角形退化 → trimesh 合并重复顶点 → 拓扑崩坏。
+    实测（样本 20250423_1800_838505）：v 40262→27583、components 1→22532、
+    non_manifold 0→17524、watertight True→False。
 
     Args:
         mesh: trimesh.Trimesh（MC 输出，归一化坐标 [-0.5, 0.5]）
         pts: [N,3] 归一化点云（512³ 精度，同一个坐标空间）
-        max_move: 最大位移限制（归一化单位）。**建议设**：糊团点云有厚度带，
-                  最近邻可能落在别的「层」上，超过此距离的顶点保持原位，防止拉乱。
+        max_move: 最大位移（归一化单位），沿移动方向钳制。建议设。
+        mode: 移动方向
+              "normal"（默认，安全）= **只沿顶点法线**移动：取到最近点的向量在法线上的
+                                    投影并钳制 —— 相邻顶点各走各的法线，不会横向碰撞
+              "nearest"           = 直接移到最近点（**会崩拓扑，仅留作对照**）
     Returns:
         (mesh, stats dict)
     """
@@ -607,18 +614,38 @@ def refine_mesh_with_points(mesh, pts, max_move=None, verbose=True):
     if len(P) == 0:
         return mesh, {"error": "空点云"}
 
+    n0 = len(V)
     dd, idx = cKDTree(P).query(V)
-    V_new = P[idx].copy()
-    n_clamped = 0
-    if max_move is not None and float(max_move) > 0:
-        keep = dd <= float(max_move)
-        n_clamped = int((~keep).sum())
-        V_new[~keep] = V[~keep]
+    D = P[idx] - V                                  # 到最近点的向量
+
+    if mode == "nearest":
+        t = np.linalg.norm(D, axis=1)
+        if max_move is not None and float(max_move) > 0:
+            keep = t <= float(max_move)
+            D[~keep] = 0.0
+            n_clamped = int((~keep).sum())
+        else:
+            n_clamped = 0
+        V_new = V + D
+    else:                                            # "normal"：只沿法线走
+        N = np.asarray(mesh.vertex_normals, dtype=np.float64)
+        tn = (D * N).sum(axis=1)                     # 在法线上的投影分量
+        n_clamped = 0
+        if max_move is not None and float(max_move) > 0:
+            m = float(max_move)
+            n_clamped = int((np.abs(tn) > m).sum())
+            tn = np.clip(tn, -m, m)
+        V_new = V + N * tn[:, None]
 
     moved = np.linalg.norm(V_new - V, axis=1)
     mesh.vertices = V_new
+    # 安全检查：顶点数不能变（变了说明发生了合并 → 拓扑已崩）
+    n1 = len(mesh.vertices)
+    if n1 != n0:
+        print(f"  ⚠️ 精修后顶点数 {n0} → {n1}（发生了合并！拓扑可能已损坏，"
+              f"请用 mode='normal' 且调小 max_move）")
     stats = {
-        "n_verts": int(len(V)),
+        "n_verts": n0,
         "n_clamped": n_clamped,
         "move_mean": float(moved.mean()),
         "move_p95": float(np.percentile(moved, 95)),
@@ -626,9 +653,9 @@ def refine_mesh_with_points(mesh, pts, max_move=None, verbose=True):
         "nn_mean": float(dd.mean()),
     }
     if verbose:
-        print(f"[mesh_grid] 点云精修顶点: {len(V)} 个顶点 | "
+        print(f"[mesh_grid] 点云精修顶点(mode={mode}): {n0} 个顶点 | "
               f"位移 mean={stats['move_mean']:.5f} p95={stats['move_p95']:.5f} "
-              f"max={stats['move_max']:.5f} | 被限制未动 {n_clamped} 个"
+              f"max={stats['move_max']:.5f} | 被钳制 {n_clamped} 个"
               + (f"（max_move={max_move}）" if max_move else ""))
     return mesh, stats
 
