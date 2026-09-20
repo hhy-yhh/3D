@@ -521,19 +521,12 @@ def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
     # MC 的顶点列顺序与 occupancy 轴序一致（x, y, z），除以分辨率归一到 [-0.5, 0.5]
     verts = verts / float(occ.shape[0]) - 0.5
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-    mesh.fix_normals()          # MC 的绕向可能整体朝内（volume 为负）
-
-    if smooth_iters and smooth_iters > 0:
-        try:
-            mesh = mesh.filter_laplacian(lamb=float(smooth_lambda),
-                                         iterations=int(smooth_iters))
-            print(f"[mesh_grid] MC 后处理: fix_normals + Laplacian"
-                  f"({smooth_iters}次, λ={smooth_lambda})")
-        except Exception as e:
-            print(f"[mesh_grid] MC 平滑失败（保留未平滑结果）: {e}")
-    else:
-        print("[mesh_grid] MC 后处理: fix_normals（未平滑）")
-
+    print(f"[mesh_grid] MC 重建: v={len(mesh.vertices)} f={len(mesh.faces)}")
+    # MC 输出是闭合流形（watertight），平滑安全 —— 复用与 poisson/ball/voxel 同一套后处理
+    # （fix_normals 修 MC 绕向可能整体朝内的问题 + Laplacian 抹体素阶梯）
+    mesh = _postprocess_mesh(mesh,
+                             smooth_iterations=(smooth_iters or 0),
+                             smooth_lambda=smooth_lambda)
     return mesh
 
 
