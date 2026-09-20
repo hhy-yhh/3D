@@ -555,11 +555,13 @@ def main():
                         help="生成草稿 mesh 后用 LATO 完整 encoder/decoder 精化"
                              "（voxel_encoder→VAE.encode→VAE.decode→ConnectionHead）")
     parser.add_argument("--mesh_mode", type=str, default="grid",
-                        choices=["grid", "knn", "poisson", "voxel", "ball", "alpha"],
+                        choices=["grid", "knn", "poisson", "voxel", "ball", "alpha", "mc"],
                         help="建 mesh 方式: grid=格点四边形化（出完整面），"
                              "knn=KDTree 三角汤（旧），poisson=open3d 光滑重建（会填死内部空腔），"
                              "voxel=占据格点边界提取（闭合但要求点云是实心体），"
-                             "ball=球旋转 / alpha=α形状（只连该连的点，保内部通孔）")
+                             "ball=球旋转 / alpha=α形状（只连该连的点，保内部通孔），"
+                             "mc=从 SS occupancy 直接 marching cubes（保镂空，"
+                             "跳过 SLat Flow 和 VAE decode，分辨率锁 128³）")
     parser.add_argument("--ball_radii", type=str, default="",
                         help="[ball] 球半径列表，逗号分隔（绝对单位，归一化坐标）。"
                              "留空=按平均最近邻距 × 1.5,3,6 自动推")
@@ -691,6 +693,7 @@ def main():
 
             with torch.no_grad():
                 _mem("初始")
+                _mc_mesh = None          # mesh_mode=mc 时在 SS 之后填充
                 cond = pipeline.get_cond([prompt])
                 torch.manual_seed(opt.seed)
                 _mem("CLIP后")
@@ -737,31 +740,49 @@ def main():
 
                 print(f"  [SS] coords={coords.shape[0]}")
 
+                # ── mesh_mode=mc：直接从 occupancy 建面，跳过 SLat Flow + VAE decode ──
+                # 理由：Poisson 拟合指示函数必填死内部镂空；ball/grid 等在 decode 出的
+                #      「糊团点云」上全崩。MC 对已知 occupancy 取等值面，两者都绕开。
+                if opt.mesh_mode == "mc":
+                    from lato_integration.mesh_grid import mesh_from_occupancy
+                    _mc_mesh = mesh_from_occupancy(
+                        occ_logits, opt.ss_threshold,
+                        smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
+                        smooth_lambda=opt.smooth_lambda,
+                    )
+                    if _mc_mesh is not None:
+                        print(f"  [MC] occupancy → mesh: v={len(_mc_mesh.vertices)} "
+                              f"f={len(_mc_mesh.faces)}")
+
                 # 释放 SS 阶段中间张量
                 del z_s, occ_logits
                 torch.cuda.empty_cache()
                 _mem("SS后")
 
-                # 2) SLat Flow
-                slat = pipeline.sample_slat(cond, coords,
-                    sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
-                print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f} feats_std={slat.feats.std():.4f}")
+                if _mc_mesh is None:
+                    # 2) SLat Flow
+                    slat = pipeline.sample_slat(cond, coords,
+                        sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
+                    print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f} feats_std={slat.feats.std():.4f}")
 
-                # 清理 SLat 采样中间激活
-                torch.cuda.empty_cache()
-                _mem("SLat后")
+                    # 清理 SLat 采样中间激活
+                    torch.cuda.empty_cache()
+                    _mem("SLat后")
 
-                # 3) LATO VoxelVAE decode（spconv 需要额外 workspace，此处是显存峰值）
-                outputs = pipeline.decode_slat(slat, formats=["mesh"])
-                dec = outputs.get("lato_decoded", [])
-                for i, level in enumerate(dec):
-                    vr = level.get("vertex", {})
-                    vc = vr.get("coords")
-                    nv = vc.shape[0] if vc is not None else 0
-                    print(f"  [VAE L{i}] vertices={nv}")
+                    # 3) LATO VoxelVAE decode（spconv 需要额外 workspace，此处是显存峰值）
+                    outputs = pipeline.decode_slat(slat, formats=["mesh"])
+                    dec = outputs.get("lato_decoded", [])
+                    for i, level in enumerate(dec):
+                        vr = level.get("vertex", {})
+                        vc = vr.get("coords")
+                        nv = vc.shape[0] if vc is not None else 0
+                        print(f"  [VAE L{i}] vertices={nv}")
+                else:
+                    slat = outputs = dec = None
 
             # ── dump 解码顶点坐标：存一次之后各种重建方式都能秒级迭代 ──
-            if opt.dump_coords:
+            # （mesh_mode=mc 时没有 decode 结果，跳过）
+            if opt.dump_coords and outputs is not None:
                 _vr = None
                 _dec = outputs.get("lato_decoded", [])
                 if _dec:
@@ -779,16 +800,19 @@ def main():
                 if opt.dump_coords_only:
                     continue  # 只要点云，跳过重建 + 指标
 
-            pred_mesh = extract_mesh_from_output(
-                outputs, connection_head, model_cfg, device,
-                opt.edge_threshold, opt.k_neighbors, opt.mesh_mode,
-                poisson_depth=opt.poisson_depth, poisson_crop=opt.poisson_crop,
-                smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
-                smooth_lambda=opt.smooth_lambda,
-                cavity=opt.cavity,
-                min_component_voxels=opt.min_component_voxels,
-                ball_radii=opt.ball_radii_list, alpha=(opt.alpha or None),
-            )
+            if _mc_mesh is not None:
+                pred_mesh = _mc_mesh       # mesh_mode=mc：occupancy 直接建面，无需 decode 结果
+            else:
+                pred_mesh = extract_mesh_from_output(
+                    outputs, connection_head, model_cfg, device,
+                    opt.edge_threshold, opt.k_neighbors, opt.mesh_mode,
+                    poisson_depth=opt.poisson_depth, poisson_crop=opt.poisson_crop,
+                    smooth_iters=(None if opt.smooth_iters < 0 else opt.smooth_iters),
+                    smooth_lambda=opt.smooth_lambda,
+                    cavity=opt.cavity,
+                    min_component_voxels=opt.min_component_voxels,
+                    ball_radii=opt.ball_radii_list, alpha=(opt.alpha or None),
+                )
 
             # 清理 VAE decode 中间张量
             del outputs, dec, slat

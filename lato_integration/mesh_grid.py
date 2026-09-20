@@ -479,6 +479,64 @@ def _voxel_boundary_faces(solid, lo):
     return verts, faces
 
 
+def mesh_from_occupancy(occ_logits, threshold=0.0, smooth_iters=None,
+                        smooth_lambda=0.5):
+    """从 occupancy logits 直接 marching cubes 建面（跳过 Poisson 和 VAE decode）。
+
+    为什么需要这条：Poisson 拟合连续指示函数 → 数学上必然封闭 → 内部镂空被桥接填死；
+    而 ball/grid/alpha 等在 decode 出的「糊团点云」上全崩。MC 对「已知的 occupancy」
+    取等值面，空腔就是空腔，不存在「跨过空隙」这个动作，所以结构上不可能填死镂空，
+    也不依赖点云的局部连通性。
+
+    实测（GT occupancy，样本 20250423_1800_838505）：
+      components=3（Poisson 是 770）、euler=-30（GT -6、Poisson -1979）、
+      holes=0 / boundary_edges=0 / non_manifold=0 / watertight=True、
+      dihedral mean=9.3°（GT 6.4、Poisson 13.0、降面版 38.0）
+
+    代价：分辨率锁在 occupancy 的 128³，出来是体素级阶梯（dihedral p50=0、p90=45），
+    需要平滑；且丢掉了 VAE decode 的细节增益。
+
+    Args:
+        occ_logits: StructureHead 的原始输出 [B,1,D,H,W] 或 [D,H,W]（未过 sigmoid）。
+        threshold: 等值面的 logits 阈值，应与 --ss_threshold 一致
+                   （logits > threshold 视为 occupied）。
+        smooth_iters: Laplacian 平滑次数（None/0 = 不平滑）。
+    Returns:
+        trimesh.Trimesh 或 None
+    """
+    import trimesh
+    from skimage import measure
+
+    occ = occ_logits.detach().float().cpu().numpy()
+    occ = np.squeeze(occ).astype(np.float32)
+    if occ.ndim != 3:
+        print(f"[mesh_grid] occupancy 形状异常（期望 3D）: {occ.shape}")
+        return None
+
+    verts, faces, _, _ = measure.marching_cubes(occ, level=float(threshold))
+    if len(faces) == 0:
+        print(f"[mesh_grid] MC 没产出面（threshold={threshold} 太高？）")
+        return None
+
+    # MC 的顶点列顺序与 occupancy 轴序一致（x, y, z），除以分辨率归一到 [-0.5, 0.5]
+    verts = verts / float(occ.shape[0]) - 0.5
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+    mesh.fix_normals()          # MC 的绕向可能整体朝内（volume 为负）
+
+    if smooth_iters and smooth_iters > 0:
+        try:
+            mesh = mesh.filter_laplacian(lamb=float(smooth_lambda),
+                                         iterations=int(smooth_iters))
+            print(f"[mesh_grid] MC 后处理: fix_normals + Laplacian"
+                  f"({smooth_iters}次, λ={smooth_lambda})")
+        except Exception as e:
+            print(f"[mesh_grid] MC 平滑失败（保留未平滑结果）: {e}")
+    else:
+        print("[mesh_grid] MC 后处理: fix_normals（未平滑）")
+
+    return mesh
+
+
 def build_mesh_from_voxel(vertex_coords_int, last_res=512, cavity="keep",
                           min_component_voxels=0, smooth_iterations=0,
                           smooth_lambda=0.5, target_faces=0):
