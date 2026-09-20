@@ -600,6 +600,15 @@ def main():
     parser.add_argument("--morph_open", type=int, default=0,
                         help="[mc] MC 前对 occupancy 做开运算（去孤立小团）。"
                              "闭x2+开x1 → 连通分量 1、euler −289→−80、dihedral 15.0°→10.8°")
+    parser.add_argument("--refine_with_points", action="store_true", default=False,
+                        help="[mc] **结合模式**：MC 出拓扑 + VAE decode 的 512³ 点云精修顶点位置"
+                             "（连接关系一个不动，只挪顶点）→ 消除方块感。"
+                             "需要跑完整 SLat Flow + decode，耗时回到 ~12 分钟。"
+                             "不加此参数 = 纯 MC 路径（8 秒，行为完全不变）")
+    parser.add_argument("--refine_max_move", type=float, default=0.02,
+                        help="[--refine_with_points] 顶点最大位移（归一化单位，默认 0.02 ≈ 2.5 个"
+                             "128³ 格点）。糊团点云有厚度带，最近邻可能落在别的层上，"
+                             "超限的顶点保持原位以防拉乱")
     parser.add_argument("--morph_before_slat", action="store_true", default=False,
                         help="方案5：形态学清理 occupancy 后**重新提取 coords** 再喂 SLat Flow，"
                              "后续流程完全不变。用于验证「糊团点云」是否源于「海绵状 coords」"
@@ -814,8 +823,8 @@ def main():
                 torch.cuda.empty_cache()
                 _mem("SS后")
 
-                if _mc_mesh is None:
-                    # 2) SLat Flow
+                if _mc_mesh is None or opt.refine_with_points:
+                    # 2) SLat Flow（结合模式 --refine_with_points 也需要它来产出精修点云）
                     slat = pipeline.sample_slat(cond, coords,
                         sampler_params={"steps": opt.slat_steps, "cfg_strength": opt.cfg_strength})
                     print(f"  [SLat] voxels={slat.coords.shape[0]} feats_mean={slat.feats.mean():.4f} feats_std={slat.feats.std():.4f}")
@@ -856,7 +865,22 @@ def main():
                     continue  # 只要点云，跳过重建 + 指标
 
             if _mc_mesh is not None:
-                pred_mesh = _mc_mesh       # mesh_mode=mc：occupancy 直接建面，无需 decode 结果
+                pred_mesh = _mc_mesh       # mesh_mode=mc：occupancy 直接建面（拓扑骨架）
+                # ── 结合模式：用 512³ 的 decode 点云精修顶点位置（连接关系不变）──
+                # MC 顶点只能落在 128³ 格点上 → 方块感；点云是 512³ 精度 → 把顶点拉过去
+                if opt.refine_with_points:
+                    from lato_integration.mesh_grid import refine_mesh_with_points
+                    _dec = outputs.get("lato_decoded", []) if outputs else []
+                    _vr = _dec[-1].get("vertex") if _dec else None
+                    if _vr is not None and _vr.get("coords") is not None:
+                        _c = _vr["coords"]
+                        _c = _c[:, 1:] if _c.shape[-1] == 4 else _c
+                        _res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+                        _pts = _c.detach().float().cpu().numpy() / float(_res) - 0.5
+                        pred_mesh, _ = refine_mesh_with_points(
+                            pred_mesh, _pts, max_move=(opt.refine_max_move or None))
+                    else:
+                        print("  [WARN] refine_with_points: 拿不到 decode 点云，跳过精修")
             else:
                 pred_mesh = extract_mesh_from_output(
                     outputs, connection_head, model_cfg, device,
