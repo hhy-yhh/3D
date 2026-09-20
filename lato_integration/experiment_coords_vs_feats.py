@@ -214,7 +214,6 @@ def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh
         except Exception as e:
             parts.append(f"CD=ERR({e})")
         if save_path:
-            import os
             os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
             mesh.export(save_path)
             parts.append(f"saved={save_path}")
