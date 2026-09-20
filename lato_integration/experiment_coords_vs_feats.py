@@ -69,10 +69,13 @@ def to_4d(coords):
 
 
 def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
-                            edge_threshold=0.45, k_neighbors=32, mesh_mode="grid"):
+                            edge_threshold=0.45, k_neighbors=32, mesh_mode="grid",
+                            radii=None, alpha=None):
     """从 VAE decode 输出构建 trimesh（逻辑同 evaluate_3d_metrics.extract_mesh_from_output）。
 
-    mesh_mode: "grid"=格点相邻+四边形化（默认，出完整面）；"knn"=旧 KDTree 三角汤。
+    mesh_mode: "grid"=格点相邻+四边形化（默认，出完整面）；"knn"=旧 KDTree 三角汤；
+               "poisson"=open3d 光滑重建（表面最干净但必填死镂空）；
+               "ball"/"alpha"=只连该连的点、不填补空间 → 用于验证「干净点云能否保住镂空」。
     """
     vertex_result = decoded[-1].get("vertex")
     if vertex_result is None:
@@ -105,6 +108,28 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
             return mesh
         print(f"  [WARN] 格点建 mesh 过稀/失败 (f={len(mesh.faces) if mesh is not None else 0})，回退 KDTree")
 
+    if mesh_mode in ("ball", "alpha"):
+        # 必须包 try/except：open3d 的 alpha shape 在退化点云上会抛
+        # "invalid tetra"（Qhull 错），不做保护会让整个实验脚本挂掉。
+        try:
+            from lato_integration.mesh_grid import build_mesh_from_points
+            last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+            pts = vertex_coords_int.float() / float(last_res) - 0.5
+            print(f"  [mesh_grid] {mesh_mode} 重建, {len(pts)} 点"
+                  + (f", radii={radii}" if radii else "")
+                  + (f", alpha={alpha}" if alpha else ""))
+            mesh, _info = build_mesh_from_points(
+                pts.cpu().numpy().astype(np.float64), mode=mesh_mode,
+                radii=radii, alpha=alpha,
+            )
+            if mesh is not None and len(mesh.faces) > 0:
+                return mesh
+            print(f"  [WARN] {mesh_mode} 重建失败/过稀 "
+                  f"(f={len(mesh.faces) if mesh is not None else 0})，回退网格/KDTree")
+        except Exception as e:
+            print(f"  [WARN] {mesh_mode} 重建抛异常: {type(e).__name__}: {e}"
+                  f" —— 回退网格/KDTree")
+
     vertex_coords_3d = vertex_coords_int.float()
     if vertex_coords_3d.max() > 1.0:
         last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
@@ -123,8 +148,13 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
 def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
                       device, label, threshold=0.2, edge_threshold=0.45,
                       k_neighbors=32, n_points=20000, use_fp16=False, mesh_mode="grid",
-                      save_path=None):
-    """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。save_path 非空则导出 mesh。"""
+                      save_path=None, dump_coords=None, radii=None, alpha=None):
+    """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。
+
+    save_path 非空则导出 mesh（多组会互相覆盖，配 --only 单跑）。
+    dump_coords 非空则把解码点云导成 npz，**文件名自动加组名后缀**（xxx_A.npz），
+    格式与 evaluate_3d_metrics.py --dump_coords 一致，可直接喂 repair_mesh.py。
+    """
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
     torch.cuda.empty_cache()
@@ -149,10 +179,27 @@ def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh
         nv = vc.shape[0] if vc is not None else 0
         parts.append(f"L{i}={nv}")
 
+    # ── dump 解码顶点云（最细一级 = decoded[-1]）──
+    if dump_coords:
+        vr = decoded[-1].get("vertex")
+        if vr is not None and vr.get("coords") is not None:
+            c = vr["coords"]
+            c = c[:, 1:] if c.shape[-1] == 4 else c
+            last_res = model_cfg["decoder_blocks_vtx"][-1]["resolution"] * 2
+            root, ext = os.path.splitext(dump_coords)
+            tag = label.split(":")[0].strip()
+            path = f"{root}_{tag}{ext or '.npz'}"
+            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+            np.savez(path, coords=c.cpu().numpy().astype(np.int32),
+                     last_res=np.int32(last_res))
+            print(f"  [dump_coords] {tag} 组解码顶点 {len(c)} 个 → {path} "
+                  f"(last_res={last_res})")
+
     # 建 mesh（grid 模式快；knn 模式慢，~2-5 min，主要花在 KDTree 边候选）
     mesh = build_mesh_from_decoded(
         decoded, connection_head, model_cfg, device,
         edge_threshold=edge_threshold, k_neighbors=k_neighbors, mesh_mode=mesh_mode,
+        radii=radii, alpha=alpha,
     )
     del decoded
     torch.cuda.empty_cache()
@@ -204,11 +251,20 @@ def main():
                     help="VAE decode 用 fp16（int32 上限翻倍，可喂更多 voxel）")
     ap.add_argument("--use_fp16", action="store_true", default=False)
     ap.add_argument("--mesh_mode", type=str, default="grid",
-                    choices=["grid", "knn", "poisson"],
+                    choices=["grid", "knn", "poisson", "ball", "alpha"],
                     help="建 mesh 方式: grid=格点四边形化（默认），knn=旧 KDTree 三角汤，"
-                         "poisson=open3d 光滑重建")
+                         "poisson=open3d 光滑重建（表面最干净但必填死镂空），"
+                         "ball/alpha=只连该连的点、不填补空间（验证干净点云能否保住镂空）")
+    ap.add_argument("--ball_radii", default="",
+                    help="[ball] 球半径，逗号分隔（绝对单位）。留空=按平均最近邻距自动推")
+    ap.add_argument("--alpha", type=float, default=0.0,
+                    help="[alpha] α 值（绝对单位）。0=按平均最近邻距 × 3 自动推")
     ap.add_argument("--save_mesh", type=str, default=None,
-                    help="把实验组的解码 mesh 导出到此 .obj 路径（如 outputs/a_mesh.obj）")
+                    help="把实验组的解码 mesh 导出到此 .obj 路径（如 outputs/a_mesh.obj）。"
+                         "多组会互相覆盖 —— 想分组留存请配合 --only 单组跑")
+    ap.add_argument("--dump_coords", type=str, default=None,
+                    help="把每组解码点云导成 npz，**文件名自动加组名后缀**（如 xxx_A.npz）。"
+                         "格式同 evaluate_3d_metrics.py --dump_coords，可直接喂 repair_mesh.py")
     opt = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -336,13 +392,16 @@ def main():
     else:
         print("每组含建 mesh + CD，预计共 ~8-20 分钟 ...")
     print("=" * 64)
+    radii = ([float(x) for x in opt.ball_radii.split(",") if x.strip()]
+             if opt.ball_radii else None)
     for k in keys:
         coords, feats, label = experiments[k]
         feed_vae_and_eval(vae, connection_head, model_cfg, coords, feats,
                           gt_mesh, device, label,
                           opt.lato_threshold, opt.edge_threshold, opt.k_neighbors,
                           use_fp16=opt.vae_fp16, mesh_mode=opt.mesh_mode,
-                          save_path=opt.save_mesh)
+                          save_path=opt.save_mesh, dump_coords=opt.dump_coords,
+                          radii=radii, alpha=(opt.alpha or None))
     print("=" * 64)
 
     # ── 8. 判读提示 ──

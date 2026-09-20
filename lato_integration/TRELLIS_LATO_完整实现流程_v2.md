@@ -13,9 +13,11 @@ Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
               (训练)       (训练, 16³→128³)     ① PixelShuffle 可学习上采样
                                 │
                                 ▼
-              SLat Flow ──→ LATO VoxelVAE.decode() → ConnectionHead → Mesh
-              (训练)         (微调 decoder 末2层)     (冻结预训练)
-                             ② 原"冻结"→现"微调"
+              SLat Flow ──→ LATO VoxelVAE.decode() → 顶点云 @512³
+              (训练)         (冻结, 原版预训练)         │
+                             ② 原"微调"→现"原版冻结"    ▼
+                                        ③ 重建 → 降面 → 补洞 → Mesh
+                                          poisson / grid+ConnectionHead / ball / alpha / voxel
 ```
 
 | 组件 | 来源 | 状态 |
@@ -24,8 +26,18 @@ Text → CLIP → SS Flow ──→ LatoStructureHead → coords@128³
 | SS Flow | `EnhancedSSFlowModel` (512ch × 24 blocks) | **训练** |
 | LatoStructureHead | 3D CNN 16³→128³ | **训练**（① nearest → PixelShuffle） |
 | SLat Flow | `EnhancedSLatFlowModel` (384ch × 12 blocks, Swin) | **训练** |
-| LATO VoxelVAE | 预训练 128→512 | **微调**（② 冻结 encoder，微调 decoder 末 2 层） |
-| ConnectionHead | LATO 预训练边预测器 | 冻结 |
+| LATO VoxelVAE | 预训练 `vae_128to512.pt` | **冻结**（② 原版权重，未用任何微调——见下方注） |
+| ConnectionHead | LATO 预训练边预测器 | 冻结（③ 仅 grid/knn 重建分支调用） |
+| 重建层 | `mesh_grid.py` + `diag_mesh.py` | **无参数**（③ 后处理，v22~v26 新增） |
+
+> ② **VoxelVAE 状态更正（2026-09-20，核对代码）**：本表原写「**微调**（冻结 encoder，微调 decoder 末 2 层）」，**已过时**。
+> 代码事实（`evaluate_3d_metrics.py:357-363`、`inference_lato.py:661-670`）：
+> `--vae_ft_ckpt` **默认 `None`**，默认路径恒为 `load_pretrained_woself(opt.lato_ckpt, ...)` → **原版 `vae_128to512.pt`**；
+> 仅当显式传 `--vae_ft_ckpt` 且文件存在时才 `load_state_dict(strict=False)` 覆盖。
+> 而**文档中所有推理/评估命令均未传该参数** → 当前实际使用的是**原版预训练权重**。
+> 微调机制（参数）仍在，但两代方案都已证伪，**当前无可用产物**：
+> - v16「decoder 末 2 层 + feats-L1 加噪自蒸馏」→ **v17 判定无效**（只对齐顶点特征，不监督顶点选择，且未解冻 `vtx_head_64`）
+> - v17「剪枝头 BCE 微调」→ **v22 废弃**（评估时 decode 在测试集 5/5 spconv int32 溢出；原版 VAE 同参数全部正常）
 
 ---
 
@@ -1254,6 +1266,11 @@ GPU 7: SLat Flow v10 从零训 ────────────── 3-4 �
 
 > 相对 v13 旧图，仅改两处模块内部实现，数据流/连线/分辨率均不变。
 
+> ⚠️ **本节是 v16 成文时的记录，其中「② VoxelVAE 微调」已作废**（2026-09-20 核对代码）：
+> 该微调 **v17 判定无效**；v17 改做的剪枝头微调又在 **v22 废弃**（5/5 spconv int32 溢出）。
+> **当前 VoxelVAE 用原版 `vae_128to512.pt`，不做任何微调**（`--vae_ft_ckpt` 默认 `None`）——详见文档开头「② VoxelVAE 状态更正」。
+> 本节下方流程图、组件表、主要改进总表中的「微调 decoder 末 2 层」「② 原'冻结'→现'微调'」等字样，**均按此更正理解**；① PixelShuffle 那半仍然有效。
+
 ### 当前流程图
 
 ```
@@ -1576,8 +1593,13 @@ v19 修复了 CD 度量 + 三角汤，几何正确（CD 0.002）。但**观感�
 |---|---|
 | SS 16³→32³ | **被阻塞**——当前只有 16³ SS encoder（`ss_enc_conv3d_16l8_fp16`），无 32³ 版，需先造 encoder + 重新生成 latent |
 | SLat 重训（不加数据） | **无法降低 MSE**——MSE 0.2 已对数收敛，是「234 数据 + prompt 信息量」极限；prompt 只描述 ~15 参数、latent 编码完整几何，信息论上推不出细节 |
-| VAE 剪枝头微调（v17 `finetune_vae.py`） | 可行——v17 评估时 CD 是坏的，修复 CD 后需**重新评估**，可能改善表面粗糙 |
-| LogitSharpener（v2 文档 plan F） | 可行——锐化 occupancy，不动主模型，~20 分钟 |
+| VAE 剪枝头微调（v17 `finetune_vae.py`） | ~~可行~~ → ⚠️ **已废弃（v22）**：微调后 decode 在测试集 **5/5 spconv int32 溢出**（`--max_coords 30000`，原版 VAE 同参数全部正常）→ 溢出系微调补丁引起。**不要再跑这条** |
+| LogitSharpener（v2 文档 plan F） | ~~可行，~20 分钟~~ → ⚠️ **仍未实现**：截至 2026-09-19，`logit_sharpener.py` / `train_logit_sharpener.py` 均不存在、`evaluate_3d_metrics.py` 也没有 `--sharpener_ckpt` 参数（已核对代码）。方案设计见《提升方案_2026-09-01》方案2，**未被 v22~v26 推进，也未列入 v26 的下一步** |
+
+> ⚠️ **本表（v20 成文时）的两条「可行」结论均已过时**：
+> - 剪枝头微调 → v22 实测废弃；
+> - LogitSharpener → 从未落地，**目前是唯一还挂着的「不动主模型」方案**（见《提升方案_2026-09-01》方案2 的成功判据：`[SS diag] active(>2.0)` 从 ~97,969 降向 GT 38,577）。
+> v26 的「下一步」只列了点云对照 / embedding operative range / 治粗糙度，**没提 LogitSharpener** —— 两者需对齐（若仍要做，应补进待办）。
 
 ### 5. 模块一致性审计（对照流程图官方）
 
@@ -1614,6 +1636,7 @@ v19 修复了 CD 度量 + 三角汤，几何正确（CD 0.002）。但**观感�
    - 16384→30000：CD **-22%**（16384 截断过度）；30000→40000 只 -11%（**饱和**）；**60000 触发 spconv int32 溢出**（fp32 上限 ~40-60K）。
    - **数量是局部瓶颈，30-40K 即饱和**；fp16 突破 int32 无收益，不必上。
    - 建议 `--max_coords` 默认 30000~40000。剩余瓶颈（HD 0.098 / NC 0.44）来自重建层 + 结构 16³ + latent 误差，与数量无关。
+   - ⚠️ **这只是建议，代码里没改**：`evaluate_3d_metrics.py:546` 的 `--max_coords` **默认值仍是 0（不限制）** —— 不显式传参就是「不截断」，会 OOM。跑评估**必须手动传** `--max_coords 30000`。
 
 ---
 
@@ -1639,7 +1662,7 @@ Poisson(depth=9) → f ≈ 1,050,000   ← 每条样本 ~105 万面
 | 文件 | 改动 |
 |---|---|
 | `mesh_grid.py` | 新增 `fill_mesh_holes()`（trimesh 补洞，兼容新旧版：`max_hole_size` kwarg 不存在时降级）、`decimate_mesh()`（open3d quadric 降面，`target≥当前面数` 自动跳过、异常回退原 mesh） |
-| `evaluate_3d_metrics.py` | 新增 6 个 CLI 参数；`extract_mesh_from_output()` 加形参透传 `depth/crop/smooth`；`main` 在 `refine_lato` 之后、保存之前插 `补洞 → 降面`，作用于**最终** mesh |
+| `evaluate_3d_metrics.py` | 新增 6 个 CLI 参数；`extract_mesh_from_output()` 加形参透传 `depth/crop/smooth`；`main` 在 `refine_lato` 之后、保存之前插 ~~`补洞 → 降面`~~ **`降面 → 补洞`**（⚠️ 本行原写「补洞 → 降面」，v25 已按实测改为**补洞必须最后做**，见下方注），作用于**最终** mesh |
 
 **新增 CLI 参数（默认 = 原行为，不加参数零影响）：**
 
@@ -1650,7 +1673,12 @@ Poisson(depth=9) → f ≈ 1,050,000   ← 每条样本 ~105 万面
 | `--smooth_iters` | -1 | 平滑次数；-1=按模式默认（poisson 2 / grid 0）|
 | `--smooth_lambda` | 0.5 | Laplacian 平滑强度 |
 | `--target_faces` | 0 | >0 时把最终 mesh quadric 降面到目标面数 |
-| `--fill_holes` | False | 输出前 trimesh 补洞 |
+| `--fill_holes` | False | 输出前 trimesh 补洞（弱，建议改用 `--repair_holes`）|
+
+> ⚠️ **后处理顺序以 v25 为准：降面 → 补洞（补洞必须最后做）。**
+> 本节成文时写的是「补洞 → 降面」，**已被 v25 修正** —— 降面本身会砍出洞（v24 实测 1.19M→100k 砍出 256 个洞），所以补洞必须排在降面**之后**，否则补了也白补。
+> 现有代码核对（2026-09-19）：`evaluate_3d_metrics.py:831-839` = `decimate_mesh → fill_mesh_holes → repair_holes`；`inference_lato.py:913-918` = `decimate_mesh → repair_holes` ✅ 均为「降面 → 补洞」。
+> ⚠️ **例外**：独立工具 `repair_mesh.py:234-238` 仍是 `repair_holes → decimate_mesh`（补洞 → 降面），与该工具自身 `--decimate` 的 help 文本「最后降面」一致，但**与主流程相反** —— 用该工具调参时注意此差异（待统一）。
 
 ### 验证（单样本 `20250423_1800_838505`，原版 VAE）
 
@@ -1658,6 +1686,17 @@ Poisson(depth=9) → f ≈ 1,050,000   ← 每条样本 ~105 万面
 |---|---|---|---|---|---|
 | A 基线（poisson） | ~534k | ~1,050,000 | 0.0016 | ~0.098 | 0.62 |
 | B `--target_faces 100000` | 51,013 | **100,000** | **0.0016（不变）** | ~0.098 | 0.62 |
+
+> 📌 **B 行 = 服务器 `outputs/eval_decim_100k/`**，**观感经人工验收「还行」**，当前可用基线。命令见本节上方「用法示例」。
+>
+> ✅ **2026-09-20 复现确认**（`--limit 1` 单样本，命令即本节上方「用法示例」那条）：
+> 降面前 `v=534,514 / f=1,050,847` → 降面后 **`v=51,025 / f=99,999`**；
+> **`CD 0.001639 / HD 0.098419 / NC 0.6226`**。
+> 与 B 行（51,013 / 100,000 / 0.0016 / ~0.098 / 0.62）**逐项吻合**（顶点差 12 = 0.02%，quadric 降面舍入）
+> → **确认 `eval_decim_100k` 即此命令的产物**（文档原先只记了 `eval_decim_full` 这个名字，两者参数相同、仅输出目录名不同）。
+>
+> 日志旁证（均与历史记录对得上）：`[SS diag] active(>2.0)=97,969`（= v21 记录）、`[VAE L1]=63,576 / L2=399,307`（= v22 记录）、`[SS] coords truncated: 30000`（97,969→30,000，丢 69%，即《提升方案_2026-09-01》给「空隙」定的根因）。
+> 注意此配置**不含补洞**（无 `--repair_holes`），降面留下的 ~256 洞仍在 —— 需闭合见 v25。
 
 - 第 2 样本（`20250603_*`）对照：f ~110 万 → 10 万，CD 0.0006 不变。
 - `--fill_holes` 对 Poisson 近水密输出仅补 ~8 面 → 可忽略，全量可不加。
@@ -1686,6 +1725,16 @@ python lato_integration/evaluate_3d_metrics.py \
     --target_faces 100000 \
     --ss_threshold 2.0 --max_coords 30000 --save_meshes
 ```
+
+> ✅ **这条命令就是服务器 `outputs/eval_decim_100k/` 的生成方式。**
+> 本示例的 `--output_dir` 当时写作 `outputs/eval_decim_full`，与 `eval_decim_100k` **只差目录名，参数完全相同**。
+> 该产物**观感经人工验收「还行」**，是当前已知可用的生成基线 —— 对应下方「验证」表的 **B 行**：
+> `v 51,013 / f 100,000 / CD 0.0016 / HD ~0.098 / NC 0.62`（降面 10× 后 CD/HD/NC 与 A 基线完全一致）。
+>
+> ⚠️ **已知代价（不推翻上面的验收结论，但做后续处理时必须知道）：**
+> `--target_faces 100000` 的降面会**留下洞、并把表面粗糙度放大约 3 倍** —— v24 实测：
+> Poisson 原样 `holes=0 / boundary=0 / dihedral 13.0°` → 降面到 10 万后 `holes=256 / boundary=6,660 / dihedral 38.0°`（GT 6.4°）。
+> 所以若要补洞，加 `--repair_holes`（配合 `--repair_max_loop`），且**必须排在降面之后**（v25 定的顺序：**降面 → 补洞**，补洞必须最后做）。
 
 ### 待办 / 可选
 
@@ -1730,6 +1779,18 @@ python lato_integration/evaluate_3d_metrics.py \
 4. **原样 Poisson 另有 770 碎块 + 847 非流形边**（需去小块 + 拓扑修复）。
 5. **正确目标面数**：GT 仅 22,892 面 —— 应是"低分辨率原生少面"，而非"高分辨率暴力降面"。
 
+> 📌 **与 `outputs/eval_decim_100k` 的关系（2026-09-20 补，勿当成矛盾）**
+>
+> 上面 1/2 两条是**客观指标**层面的结论（`holes`、`boundary_edges`、`dihedral`），数据成立。
+> 而 **`--target_faces 100000` 这条配置的实际产物 `eval_decim_100k` 观感经人工验收「还行」** —— 即：
+>
+> ```
+> 「指标上更差」≠「观感不可用」
+> ```
+>
+> 两个层面并存：客观指标上降面确有代价（洞↑、糙↑），主观观感上该配置**可接受** → **因此它仍是当前可用基线**（命令见 v22「用法示例」，指标见 v22「验证」表 B 行）。
+> 本节结论 5 的推论方向不变（`--poisson_depth 7` 原生 ~77k 面更"正"），但**该路线尚未做观感验收**，故**不替换当前基线**。
+
 ### 重建方式全测结果
 
 | 方式 | 保内部通孔 | 洞 | 连通性 | 结论 |
@@ -1741,11 +1802,16 @@ python lato_integration/evaluate_3d_metrics.py \
 
 **MC 不适用于稀疏点云输入**（需稠密连续带符号隐式场；两种造场法一塌一碎）。**三条重建路都不满足"保内部结构 + 连通 + 不糙"。**
 
-### 下一步（未实现）
+### ~~下一步（未实现）~~ → 已完成并排除（v25/v26）
 
-- **Ball Pivoting**（首选）：直接从点连三角面、不填补空间 → 保内部通孔/凹腔，不碎成球。拟加 `--mesh_mode ball` + `--ball_radii`（`mesh_grid.py` 加 `build_mesh_from_ball`，~40 行，默认关闭）。
-- **Alpha Shape**（备选，`--alpha` 可调）——与 ball A/B 对比。
-- 若 ball 仍不能保住内部结构 ⇒ 说明**解码点云本身不含内部面点** → 回到 decode 层（需先 `--dump_coords` 验证点云层厚/内部点数）。
+> ⚠️ **本节的「下一步」已全部执行完毕，结论见下**（保留原文备查）。
+> - **Ball Pivoting** ~~（首选）~~ → ✅ 已实现（v25 §10：`mesh_grid.build_mesh_from_points` + `--mesh_mode ball` / `--ball_radii` 与 `repair_mesh.py --rebuild ball`），**实测失败**：碎成 32,708 块（v26）。
+> - **Alpha Shape** ~~（备选）~~ → ✅ 已实现，**实测崩**：open3d 在 40 万点上 `invalid tetra`（v26）。
+> - **「若 ball 仍不能保住内部结构 ⇒ 回到 decode 层」** → 前提**部分不成立**：`--dump_coords` 已经做了（v25 §2），结论是**点云里镂空是完整的**——镂空丢失的锅在 Poisson，不在 decode。但点云**质量**（糊团/不规则）仍指向 decode 输入 → 这正是 v26 列为第 1 优先级的「GT latent vs 生成 latent 点云对照」。
+
+- ~~**Ball Pivoting**（首选）：直接从点连三角面、不填补空间 → 保内部通孔/凹腔，不碎成球。拟加 `--mesh_mode ball` + `--ball_radii`（`mesh_grid.py` 加 `build_mesh_from_ball`，~40 行，默认关闭）。~~
+- ~~**Alpha Shape**（备选，`--alpha` 可调）——与 ball A/B 对比。~~
+- ~~若 ball 仍不能保住内部结构 ⇒ 说明**解码点云本身不含内部面点** → 回到 decode 层（需先 `--dump_coords` 验证点云层厚/内部点数）。~~
 
 ### 产物路径
 
@@ -1826,14 +1892,19 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 | 指标 | 输入 | 输出 | |
 |---|---|---|---|
 | **v** | 50,529 | **50,529** | ✅ 一个顶点都没动 → 无射线 |
-| **boundary_edges** | 6,660 | **0** | ✅ 闭合 |
-| **holes** | 256 | **0** | ✅ |
+| **boundary_edges** | 6,660 ⚠️ | **0** | ✅ 闭合 |
+| **holes** | 256 ⚠️ | **0** | ✅ |
 | winding_ok | True | True | ✅ |
 | components | 107 | 110 | ✅（修复前 +12，现 +3） |
 | non_manifold_edges | 46 | 56 | 降面遗留，非补洞引入 |
 | dihedral_mean | 38.0° | 37.9° | ✅ 无回退 |
 | faces | 100,000 | 106,116 | +6,116 全是补面 |
 | volume | （开放网格，无效） | 0.0470 | 对照 Poisson 原样 0.0553，**少 15%**（共面极限的固有取向，见 v25 风险） |
+
+> ⚠️ **上表与 v26 记载不一致**：v26 记为 `boundary_edges 6,646 / holes 261 / v 50,523`（本表为 6,660 / 256 / 50,529）。
+> 两处都落在同一档（降面 ~100k 面产物），差异 <1%，**不影响「补洞可闭合」的结论**，但数字口径待核对。
+> 另注：本表是**不限 `--repair_max_loop` 全补**的结果（所以 holes→0，补面 **+6,116**）；v26 用 `--repair_max_loop 250` 刻意放过镂空开口 → `6,646 → 2,743`（剩下的**全是镂空**）、补面只 **+3,361**。
+> 两节口径不同（全补 vs 限长），**补面数 6,116 ≠ 3,361 不是矛盾**，勿混用。
 
 ### 5. 各重建方式实测汇总（本轮新增数据）
 
@@ -1844,7 +1915,8 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 | **voxel**（占据格点边界） | 1,327,776 | 1,864 | **12,537** | 26.9° | 理论 ✅ | **崩**：假设点云是实心体，实际 1.59% 填充、332 连通块 → 海绵；NC 0.4478 |
 | grid（v24） | 1,022,674 | 295,639 | 421,042 | 24.9° | — | 崩（v24） |
 | MC occ / dist（v24） | 88 / 2,341,692 | 2 / 586,983 | 0 / 444,604 | — | — | 塌 / 碎（v24） |
-| **ball / alpha** | — | — | — | — | **待验证** | v25 已实现，**未跑** |
+| **ball** | — | **32,708** | — | p50 0.0 / p90 90.0 | ❌ **崩** | ✅ 已实测（v26）：碎成 3.27 万块，三角形全贴格点平面 |
+| **alpha** | — | — | — | — | ❌ **崩** | ✅ 已实测（v26）：open3d 在 40 万点上崩（`invalid tetra`） |
 
 **GT 基线**：faces 22,892；euler **−6**（4 通孔）；dihedral 6.4°/15.4°。
 
@@ -1870,34 +1942,42 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 | HD | 0.098 ~ 0.159 | 局部特征（薄孔/翅片）偏差 |
 | NC | 0.4478（voxel）/ 0.66（Poisson） | 法线一致性 |
 | faces | 1.19M（原样）→ 100k（降面）→ 106k（补洞后） | GT 22,892 |
-| boundary_edges / holes | 6,660 / 256 → **0 / 0** | ✅ 闭合达成 |
+| boundary_edges / holes | 6,660 / 256 → **0 / 0** | ✅ 闭合达成（**不限 `--repair_max_loop` 全补**的口径；v26 改用 `--repair_max_loop 250` 故意放过镂空开口 → 6,646 → 2,743，两者**不矛盾，是参数不同**） |
 | dihedral_mean | 37.9°（GT 6.4°） | ❌ **粗糙度未治**（降面造） |
 | 镂空 | ❌ 丢失 | 根因 Poisson |
 
 ### 8. Next improvements
 
-1. **跑 ball / alpha**（代码就绪，秒级迭代）→ 验证能否保住镂空
+1. ~~**跑 ball / alpha**（代码就绪，秒级迭代）→ 验证能否保住镂空~~
+   > ✅ **已完成（见 v26）**：`ball` 碎成 32,708 块、`alpha` 在 40 万点上 `invalid tetra` 崩 **→ 两条路均已排除**，不是「待验证」。
+   > 原命令保留备查：
    ```bash
    python lato_integration/repair_mesh.py outputs/coords/<sha>.npz \
        --rebuild ball  --out outputs/rebuild_ball/<sha>.obj
    python lato_integration/repair_mesh.py outputs/coords/<sha>.npz \
        --rebuild alpha --out outputs/rebuild_alpha/<sha>.obj
    ```
-   判读：**只看镂空在不在 + euler 是否往 −6 靠**；`boundary_edges` 不为 0 是正常的（ball/alpha 不保证闭合）。
-2. 若 ball/alpha 保住镂空 → 再叠 `--repair` 补残留缝隙（补洞已验证不伤特征，v 不动）
+2. ~~若 ball/alpha 保住镂空 → 再叠 `--repair` 补残留缝隙~~ **前提不成立**（ball/alpha 已排除）。补洞本身仍可用，但只能在已有网格上补，救不回被 Poisson 封死的镂空 → 见 v26「补洞：可用，但收益有上限」
 3. 治粗糙度（清单里 "refine generated geometries" 那一半，目前**未动**）：`dihedral 37.9° vs GT 6.4°`
 4. **embedding operative range 模块**（清单另一条 HIGH，**未做**）
+5. **GT latent vs 生成 latent 的点云对照** ← **当前最高优先级的前置步骤**（v26 定的第 1 条）：确证 SLat 误差是否为点云质量主因，做完才能决定「该不该继续在重建层使劲」
 
 ### 9. Identify / confirm the most promising approach
 
+> ⚠️ **本节的「ball / alpha」推荐已被 v26 推翻，下面的 ASCII 图保留原文并加注。**
+
 ```
-最可行：换重建方式（ball / alpha）—— 点云里特征完整，只是被 Poisson 桥接封死
-        ↓ 若成立
-        再叠已完成且验证过的补洞（闭合）+ 平滑（治糙）
+~~最可行：换重建方式（ball / alpha）—— 点云里特征完整，只是被 Poisson 桥接封死~~
+        ↓ ❌ v26 实测：ball 碎成 32,708 块、alpha open3d 崩 → 此路不通
+        ~~再叠已完成且验证过的补洞（闭合）+ 平滑（治糙）~~
 
-已排除：Poisson 调参（depth 越低填得越狠）、voxel、grid、MC、降面后补洞（治不了镂空）
+已排除：Poisson 调参（depth 越低填得越狠）、voxel、grid、MC、ball、alpha、降面后补洞（治不了镂空）
 
-仍存疑：ball/alpha 在 1.59% 填充率的散点云上是否会碎成多块（需实测）
+~~仍存疑：ball/alpha 在 1.59% 填充率的散点云上是否会碎成多块（需实测）~~
+        ↓ ✅ v26 已解答：会碎（见上）
+
+当前最可行（v26 定）：**先做 GT latent vs 生成 latent 的点云对照** —— 重建方式已穷尽，
+                        下一步的决策点已移到 decode 输入（SLat 误差）这一侧
 ```
 
 ### 10. v25 代码改动清单（本地 `D:\code\TRELLIS_linux\3D\lato_integration\`，需同步服务器）
@@ -1907,14 +1987,15 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 | `mesh_grid.py` | `boundary_loops` 改**有向边追踪**；新增 `_edge_to_face_normal`、`_fill_loop_advancing`（推进前沿补洞）、`build_mesh_from_voxel`、`build_mesh_from_points`（ball/alpha）、`poisson_from_points`、`repair_holes` 多轮迭代 |
 | `diag_mesh.py` | 拆出 `mesh_stats_from_mesh`（内存 mesh 直接算，免落盘）+ `quality_summary` 聚合 |
 | `evaluate_3d_metrics.py` | 新增 `--mesh_mode {ball,alpha,voxel}`、`--cavity`、`--min_component_voxels`、`--ball_radii`、`--alpha`、`--repair_holes`、`--repair_max_loop`、`--report_quality`、`--dump_coords`、`--dump_coords_only`；**后处理顺序改为「降面 → 补洞」**（补洞必须最后做） |
-| `inference_lato.py` | 同步上述参数 |
+| `inference_lato.py` | **部分**同步：`--mesh_mode` / `--ball_radii` / `--alpha` / `--cavity` / `--min_component_voxels` / `--repair_holes` / `--repair_max_loop` / `--target_faces`（核对 `inference_lato.py:435-457`）。**未**同步 `--dump_coords` / `--dump_coords_only` / `--report_quality` / `--poisson_depth` / `--poisson_crop` / `--smooth_iters` / `--smooth_lambda` / `--fill_holes` —— 这些只在 `evaluate_3d_metrics.py` 有 |
 | **`repair_mesh.py`（新增）** | 秒级迭代工具：吃 mesh / 点云 npz，任选 rebuild（poisson/ball/alpha）+ 补洞 + 降面，并打印前后客观指标 |
 
 > 新增参数**默认全关，不加参数行为与 v22/v24 完全一致**。
 
 ### 11. 待办
 
-- [ ] ball / alpha 实测（代码就绪）
+- [x] ~~ball / alpha 实测~~ → **已完成（v26）**：ball 碎成 32,708 块、alpha open3d 崩，**两条路均已排除**
+- [ ] **GT latent vs 生成 latent 的点云对照**（v26 定的最高优先级前置步骤）
 - [ ] 治粗糙度（`dihedral` 37.9° → GT 6.4°）
 - [ ] **embedding operative range 模块**（HIGH）
 - [ ] 全量 21 条测试集跑（参数定稿后）
@@ -1933,8 +2014,18 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 | **镂空丢失** | 点云里镂空**完整**，Poisson 输出里**没有** | **Poisson 解指示函数 → 必然封闭** | 无关（已证明） |
 | 表面 6,646 条边界边 / 261 个洞 | Poisson 原样 `boundary=0` → 降面后 `6,646` | **降面**（1.19M→100k） | 无关 |
 | **粗糙 dihedral 38.0°**（GT 6.4°） | 降面前 13.0° → 降面后 38.0° | **降面** | 无关 |
+
+> 📌 上表「粗糙 / 边界边 / 洞」三行是**客观指标**结论；对应配置的产物 `eval_decim_100k` **观感经验收可用**（见 v22 用法示例 / v24 结论后注）——**指标差 ≠ 观感不可用**，两者并存。
 | 镂空边缘锯齿 | 最大边界环 2,025 顶点，周长约 **11× 模型对角线** | **降面把边缘 collapse 坏了** | 无关 |
 | 点云是「糊团」/ `L0=0` / ball 碎成 32,708 块 | GT latent 直通 **57.3 万顶点、0% 稀疏**；生成 latent **39.9 万、不规则** | **decode 输出质量** | **有关，嫌疑最大** |
+
+> ⚠️ **本行的判据是右列那组对照数字，不是 `L0=0`。**（v25 §2 已推翻「用 L0=0 判定 decode 失效」：实测 L0=0 时点云里镂空仍**完整**。）`L0=0` 在此只是并列的观察现象，不可单独引用为 decode 出问题的证据。
+>
+> ⚠️ **与 v25 §6 的关系（勿当矛盾）**：v25 §6 说「瓶颈在**重建方式**」，本节说「**decode 输出质量**嫌疑最大」——两者**针对的症状不同**：
+> - v25 §6 = 「**镂空丢失**」这一症状 → 瓶颈在重建方式（Poisson 必填死），与 decode 无关 ✅
+> - 本节本行 = 「**点云糊团/不规则**」这一症状 → 嫌疑在 decode 输入（SLat 误差）
+>
+> 即：decode 点云本身质量存疑（本行），但**镂空在点云里是好的**（v25 §2/§6），是 Poisson 把它封死的。两者并存，不互斥。
 
 ### 为什么点云「看着好」却建不出好面
 
@@ -1977,3 +2068,4 @@ python lato_integration/repair_mesh.py <npz> --out <ply>    # 直接看镂空在
 1. **GT latent vs 生成 latent 的点云对照** —— 确证 SLat 误差是不是点云质量的主因。做完这步才能确定「该不该继续在重建层使劲」
 2. **embedding operative range 模块**（清单另一条 HIGH，0%）
 3. 治粗糙度 / 保特征降面（未动）
+4. **LogitSharpener**（⚠️ 本节原缺，2026-09-19 核对补入）—— v20 §4 曾判「可行，~20 分钟」，但截至核对仍**未实现**（`logit_sharpener.py` / `train_logit_sharpener.py` / `--sharpener_ckpt` 全都不存在），v22~v26 一路未推进。它是目前唯一还挂着的「不动主模型、只锐化 occupancy」方案，设计见《提升方案_2026-09-01》方案2
