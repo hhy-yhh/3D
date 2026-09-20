@@ -148,12 +148,15 @@ def build_mesh_from_decoded(decoded, connection_head, model_cfg, device,
 def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh,
                       device, label, threshold=0.2, edge_threshold=0.45,
                       k_neighbors=32, n_points=20000, use_fp16=False, mesh_mode="grid",
-                      save_path=None, dump_coords=None, radii=None, alpha=None):
+                      save_path=None, dump_coords=None, radii=None, alpha=None,
+                      dump_coords_only=False):
     """decode → 建 mesh → 算 CD，打印 L0/L1/L2 + CD。
 
     save_path 非空则导出 mesh（多组会互相覆盖，配 --only 单跑）。
     dump_coords 非空则把解码点云导成 npz，**文件名自动加组名后缀**（xxx_A.npz），
     格式与 evaluate_3d_metrics.py --dump_coords 一致，可直接喂 repair_mesh.py。
+    dump_coords_only=True 则在 dump 之后直接返回，**跳过建 mesh 和 CD** ——
+    四组对照时用它快速拿到点云，再对每份点云单独建面（糊团点云建面极慢，这是主要耗时）。
     """
     from lato.modules.sparse import SparseTensor as LATOSparseTensor
 
@@ -194,6 +197,10 @@ def feed_vae_and_eval(vae, connection_head, model_cfg, coords_4d, feats, gt_mesh
                      last_res=np.int32(last_res))
             print(f"  [dump_coords] {tag} 组解码顶点 {len(c)} 个 → {path} "
                   f"(last_res={last_res})")
+
+    if dump_coords_only:
+        print("  ".join(parts) + "  [dump-only：跳过建 mesh/CD]")
+        return
 
     # 建 mesh（grid 模式快；knn 模式慢，~2-5 min，主要花在 KDTree 边候选）
     mesh = build_mesh_from_decoded(
@@ -264,6 +271,9 @@ def main():
     ap.add_argument("--dump_coords", type=str, default=None,
                     help="把每组解码点云导成 npz，**文件名自动加组名后缀**（如 xxx_A.npz）。"
                          "格式同 evaluate_3d_metrics.py --dump_coords，可直接喂 repair_mesh.py")
+    ap.add_argument("--dump_coords_only", action="store_true", default=False,
+                    help="只 dump 点云，跳过建 mesh 和 CD —— 四组对照时用，"
+                         "跑完后对每份 npz 单独建面（糊团点云建面极慢，这是主要耗时）")
     opt = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -400,7 +410,8 @@ def main():
                           opt.lato_threshold, opt.edge_threshold, opt.k_neighbors,
                           use_fp16=opt.vae_fp16, mesh_mode=opt.mesh_mode,
                           save_path=opt.save_mesh, dump_coords=opt.dump_coords,
-                          radii=radii, alpha=(opt.alpha or None))
+                          radii=radii, alpha=(opt.alpha or None),
+                          dump_coords_only=opt.dump_coords_only)
     print("=" * 64)
 
     # ── 8. 判读提示 ──
